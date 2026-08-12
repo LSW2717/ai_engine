@@ -20,6 +20,7 @@ use crate::kernels::common::{epilogue, gemm_tile, sv4_alias};
 const TEMPLATE_TILED: &str = include_str!("shaders/gemm_pw_tiled.wgsl");
 const TEMPLATE_SMALL: &str = include_str!("shaders/gemm_pw_small.wgsl");
 const TEMPLATE_GEMV: &str = include_str!("shaders/gemm_pw_gemv.wgsl");
+const TEMPLATE_SPLITK: &str = include_str!("shaders/gemm_pw_splitk.wgsl");
 
 /// 타일 파라미터 (tiled 변형)
 pub const TM: u32 = 32; // 픽셀 타일
@@ -33,16 +34,49 @@ pub enum GemmVariant {
     /// 워크그룹 협조 리덕션 GEMV — 셀 수(M×NG)가 극소하고 K가 큰 SE 경로.
     /// 워크그룹(256스레드)이 셀 하나의 K 합을 나눠 든다 (스레드 기아 해소).
     Gemv,
+    /// 워크그룹 내 split-K — M 중간(심층 9×16 등) + K 큼.
+    /// 워크그룹 = CPW셀 × SPLIT청크, 공유메모리 청크 리덕션 (단일 디스패치).
+    Splitk,
+}
+
+/// Splitk의 (SPLIT, CPW) — 셀이 적을수록 K를 더 쪼개 스레드를 만든다.
+/// (conv_igemm의 Splitk 변형도 같은 기하를 쓴다. SPLIT=16/CPW=16 실험은
+/// 셀<4096에서도 이득 없음 — 리덕션 비용이 점유율 이득을 상쇄.)
+pub(crate) fn splitk_geometry(cells: u32) -> (u32, u32) {
+    if cells < 8192 { (8, 32) } else { (4, 64) }
+}
+
+/// Splitk 워크그룹의 px×ng 2D 타일 (PXT, NGT). NGT 스레드가 입력을 공유하고
+/// PXT 픽셀이 가중치 라인을 공유한다 — 1px×CPW로 펴면 워크그룹마다 가중치
+/// 슬라이스를 L2에서 재독해 심층 conv이 L2 대역 병목이 된다.
+/// NGT는 NG를 나눠떨어지게 고른다 — NG가 4의 배수가 아닌 모델(예: cout 24 →
+/// NG 6)에서 고정 NGT=4는 레인 낭비로 퇴행한다 (NG 크면 낭비 비중이 작아 4 허용).
+pub(crate) fn splitk_tile(ng: u32, cpw: u32) -> (u32, u32) {
+    let ngt = if ng % 4 == 0 || ng >= 8 {
+        4.min(ng)
+    } else if ng % 2 == 0 {
+        2
+    } else {
+        1
+    };
+    (cpw / ngt, ngt)
 }
 
 /// 변형 선택 — spec의 순수 함수여야 캐시가 결정적이다.
 /// - 셀 극소(M×NG < 512) + K 큼 → Gemv (SE의 M=1: 스레드 36개→256×NG개)
-/// - NG·KG 충분히 큼 → Tiled (가중치 공유 이득; M은 32면 타일 1행이 참)
-/// - 그 외 → Small(4px 블로킹: 가중치 페치를 4픽셀이 공유 — NG 퇴화·소형 K에 최적)
+/// - 셀 중간 + K 큼(타일 그리드가 기아) → Splitk (960→160 실측 120 GFLOP/s 해소)
+/// - K 깊고 그리드 충분 → Tiled (공유메모리 급전이 긴 K에서만 고정비를 회수)
+/// - 그 외 → Small(4px 블로킹: 가중치 페치를 4픽셀이 공유)
+///
+/// KG<16에서 Tiled는 K루프 1~2회에 타일 적재+배리어 고정비만 내는 꼴 — 예산표
+/// 실측: 36×64 24→72(KG6)가 Tiled 83µs로 하한(6µs)의 13배. 소형 K는 Small이 정답.
 pub fn pick_variant(m: u32, kg: u32, ng: u32) -> GemmVariant {
+    let tiles = m.div_ceil(TM) * ng.div_ceil(TN_NG);
     if m * ng < 512 && kg >= 16 {
         GemmVariant::Gemv
-    } else if ng >= 16 && kg >= 4 && m >= 64 {
+    } else if kg >= 16 && tiles < 192 && ng >= 16 && m >= 64 {
+        GemmVariant::Splitk
+    } else if ng >= 16 && kg >= 16 && m >= 64 {
         GemmVariant::Tiled
     } else {
         GemmVariant::Small
@@ -146,6 +180,32 @@ impl KernelSpec for GemmPwSpec {
                     ],
                 )
             }
+            GemmVariant::Splitk => {
+                let cells = self.m * self.ng;
+                let (split, cpw) = splitk_geometry(cells);
+                let (pxt, ngt) = splitk_tile(self.ng, cpw);
+                let ngtc = self.ng.div_ceil(ngt);
+                let kc = self.kg.div_ceil(split);
+                let consts_sk = format!(
+                    "{consts}\nconst CPW: u32 = {cpw}u;\nconst SPLIT: u32 = {split}u;\nconst KC: u32 = {kc}u;\nconst PXT: u32 = {pxt}u;\nconst NGT: u32 = {ngt}u;\nconst NGTC: u32 = {ngtc}u;"
+                );
+                let epi = epilogue::emit(
+                    "acc2",
+                    Some("vec4f(BIAS[ng])"),
+                    self.act,
+                    self.residual.then_some("vec4f(RES[out_idx])"),
+                );
+                fill(
+                    TEMPLATE_SPLITK,
+                    &[
+                        ("TYPES", types),
+                        ("CONSTS", consts_sk),
+                        ("RES_BINDING", res_b),
+                        ("OUT_BINDING", out_b),
+                        ("EPILOGUE", epi),
+                    ],
+                )
+            }
             GemmVariant::Tiled => fill(
                 TEMPLATE_TILED,
                 &[
@@ -171,8 +231,14 @@ impl KernelSpec for GemmPwSpec {
 
     fn workgroups(&self) -> [u32; 3] {
         match self.variant() {
-            GemmVariant::Small => [(self.m.div_ceil(4) * self.ng).div_ceil(64), 1, 1],
+            GemmVariant::Small => [(self.m.div_ceil(4) * self.ng).div_ceil(256), 1, 1],
             GemmVariant::Gemv => [self.m * self.ng, 1, 1],
+            GemmVariant::Splitk => {
+                let cells = self.m * self.ng;
+                let (_, cpw) = splitk_geometry(cells);
+                let (pxt, ngt) = splitk_tile(self.ng, cpw);
+                [self.m.div_ceil(pxt) * self.ng.div_ceil(ngt), 1, 1]
+            }
             GemmVariant::Tiled => [self.m.div_ceil(TM), self.ng.div_ceil(TN_NG), 1],
         }
     }
@@ -187,9 +253,17 @@ mod tests {
     #[test]
     fn naga_validates_all_variants() {
         let caps = crate::test_util::fake_caps();
-        // 양 변형 × 전 활성화 × residual × 에지 shape
-        for (m, kg, ng) in [(1, 144, 36), (144, 32, 6), (9216, 4, 16), (147456, 1, 1), (768, 2, 3)]
-        {
+        // 양 변형 × 전 활성화 × residual × 에지 shape (Splitk: 144×240·60, 셀 비배수 에지)
+        for (m, kg, ng) in [
+            (1, 144, 36),
+            (144, 32, 6),
+            (9216, 4, 16),
+            (147456, 1, 1),
+            (768, 2, 3),
+            (144, 240, 40),
+            (144, 40, 240),
+            (100, 17, 21),
+        ] {
             for act in ALL {
                 for residual in [false, true] {
                     for dt in [DType::F32, DType::F16] {
@@ -205,8 +279,12 @@ mod tests {
     fn variant_policy() {
         // SE M=1 + 큰 K → Gemv
         assert_eq!(pick_variant(1, 144, 36), GemmVariant::Gemv);
-        // NG·KG 큼 → Tiled (LR-ASPP 160→960 등)
-        assert_eq!(pick_variant(144, 40, 240), GemmVariant::Tiled);
+        // 심층 M=144 + K 큼 → Splitk (타일 그리드 기아 해소)
+        assert_eq!(pick_variant(144, 240, 40), GemmVariant::Splitk);
+        assert_eq!(pick_variant(144, 40, 240), GemmVariant::Splitk);
+        assert_eq!(pick_variant(144, 168, 28), GemmVariant::Splitk);
+        // M 큰 전해상도 + NG 큼 → Tiled 유지
+        assert_eq!(pick_variant(9216, 16, 16), GemmVariant::Tiled);
         // NG 작음 → Small4 (타일 낭비 회피 — 디코더 24→16, refiner 3→1)
         assert_eq!(pick_variant(36864, 6, 4), GemmVariant::Small);
         assert_eq!(pick_variant(36864, 1, 4), GemmVariant::Small);

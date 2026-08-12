@@ -75,6 +75,10 @@ pub enum SwOp {
         #[serde(rename = "in")]
         input: u32,
         out: u32,
+        /// concat-into-conv 융합: 입력이 채널 concat의 파트들일 때 (그룹 정렬 필수).
+        /// 비어 있으면 단일 입력(input). 채워져 있으면 input == srcs[0].input.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        srcs: Vec<SwConcatPart>,
         /// residual 에필로그 소스 (활성화 후 더해짐 — conv-tail 규약)
         #[serde(default)]
         res: Option<u32>,
@@ -124,6 +128,9 @@ pub enum SwOp {
         #[serde(rename = "in")]
         input: u32,
         out: u32,
+        /// concat-into-resize 융합 파트 (Conv.srcs와 동일 규약 — 그룹 정렬 필수)
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        srcs: Vec<SwConcatPart>,
         oh: u32,
         ow: u32,
         mode: CoordMode,
@@ -148,13 +155,37 @@ pub enum SwOp {
         out: u32,
         act: Activation,
     },
-    /// GRU mix(a,b,z) = a + z*(b-a) — 예약 (--fuse-mix 시에만 방출)
+    /// GRU mix(a,b,z) = a + z*(b-a) — fuse_mix 패스가 sub/mul/mul/add 체인에서 방출
     Mix {
         z: u32,
         a: u32,
         b: u32,
         out: u32,
     },
+    /// SE 게이트: gpool(채널 평균) → FC1(act1) [→ FC2] 를 한 디스패치로 (fuse_se).
+    /// 출력은 [1,1,C] 벡터 텐서 — 후속 cvec-mul이 게이트로 읽는다.
+    SeGate {
+        #[serde(rename = "in")]
+        input: u32,
+        out: u32,
+        /// FC1 출력 채널 (fc2 없으면 곧 최종 채널)
+        c_mid: u32,
+        act1: Activation,
+        /// pack_weights_conv(kg_align=4) 레이아웃 (1×1 conv과 동일)
+        w1: WRef,
+        b1: WRef,
+        #[serde(default)]
+        fc2: Option<SeFc>,
+    },
+}
+
+/// SeGate의 두 번째 FC
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
+pub struct SeFc {
+    pub c_out: u32,
+    pub act: Activation,
+    pub w: WRef,
+    pub b: WRef,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -247,6 +278,7 @@ mod tests {
             ops: vec![SwOp::Conv {
                 input: 0,
                 out: 1,
+                srcs: vec![],
                 res: None,
                 cin: 3,
                 cout: 8,

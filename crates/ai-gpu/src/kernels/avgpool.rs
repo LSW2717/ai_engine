@@ -5,6 +5,7 @@ use ai_core::DType;
 
 use crate::context::DeviceCaps;
 use crate::kernel::{KernelSpec, StorageDir};
+use crate::kernels::common::sv4_alias;
 use crate::kernels::common::writer::{fill, W};
 
 const TEMPLATE: &str = include_str!("shaders/avgpool.wgsl");
@@ -69,17 +70,18 @@ impl KernelSpec for AvgPoolSpec {
                 body.line("  let m = select(0.0, 1.0, iy >= 0 && iy < IH && ix >= 0 && ix < IW);");
                 body.line("  let cy = u32(clamp(iy, 0, IH - 1));");
                 body.line("  let cx = u32(clamp(ix, 0, IW - 1));");
-                body.line("  acc = acc + IN[(cy * u32(IW) + cx) * CG + cg] * m; }");
+                body.line("  acc = acc + vec4f(IN[(cy * u32(IW) + cx) * CG + cg]) * m; }");
             }
         }
         fill(
             TEMPLATE,
             &[
+                ("TYPES", sv4_alias(self.dt)),
                 ("CONSTS", consts),
                 ("TAPS_UNROLLED", body.done()),
                 (
                     "OUT_BINDING",
-                    "@group(0) @binding(2) var<storage, read_write> OUT: array<vec4f>;".to_string(),
+                    "@group(0) @binding(2) var<storage, read_write> OUT: array<sv4>;".to_string(),
                 ),
             ],
         )
@@ -91,7 +93,7 @@ impl KernelSpec for AvgPoolSpec {
 
     fn workgroups(&self) -> [u32; 3] {
         let (oh, ow) = self.out_hw();
-        [ow.div_ceil(8), oh.div_ceil(8), self.cg()]
+        [(oh * ow * self.cg()).div_ceil(256), 1, 1]
     }
 }
 

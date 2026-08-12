@@ -9,7 +9,7 @@ pub mod npy;
 
 use std::collections::HashMap;
 
-use ai_core::format::{SwModel, SwOp, SwOperand};
+use ai_core::format::{SwModel, SwOp, SwOperand, WRef};
 use ai_core::ops::{AvgPool2d, Conv2d, ResizeBilinear};
 use ai_core::{pack, reference, Activation, DType};
 
@@ -88,6 +88,7 @@ impl<'a> CpuExec<'a> {
             SwOp::Conv {
                 input,
                 out,
+                srcs,
                 res,
                 cin,
                 cout,
@@ -104,7 +105,27 @@ impl<'a> CpuExec<'a> {
                 kg_pad,
             } => {
                 let (ih, iw, _) = self.hw(*input);
-                let x = self.read(*input)?;
+                // concat 융합 conv: 파트를 채널 축으로 이어붙여 단일 입력으로 평가
+                let x = if srcs.is_empty() {
+                    self.read(*input)?
+                } else {
+                    let datas: Vec<(Vec<f32>, usize)> = srcs
+                        .iter()
+                        .map(|p| Ok((self.read(p.input)?, p.c as usize)))
+                        .collect::<Result<_, ConvertError>>()?;
+                    let px = (ih * iw) as usize;
+                    let ctot: usize = datas.iter().map(|(_, c)| c).sum();
+                    let mut cat = vec![0f32; px * ctot];
+                    for p in 0..px {
+                        let mut off = 0usize;
+                        for (dv, c) in &datas {
+                            cat[p * ctot + off..p * ctot + off + c]
+                                .copy_from_slice(&dv[p * c..(p + 1) * c]);
+                            off += c;
+                        }
+                    }
+                    cat
+                };
                 let weights = if *groups > 1 {
                     pack::unpack_weights_dw(self.wref(*w), *cout, *kh, *kw, DType::F32)
                 } else {
@@ -179,10 +200,32 @@ impl<'a> CpuExec<'a> {
                 let op = AvgPool2d { kh: *kh, kw: *kw, sh: *sh, sw: *sw, pad: *pad };
                 (*out, reference::pool::avg_pool(&op, ih, iw, c, &self.read(*input)?))
             }
-            SwOp::Resize { input, out, oh, ow, mode } => {
-                let (ih, iw, c) = self.hw(*input);
+            SwOp::Resize { input, out, srcs, oh, ow, mode } => {
+                let (ih, iw, _) = self.hw(*input);
+                // concat 융합 resize: 파트를 채널 concat해 단일 입력으로 평가
+                let (x, c) = if srcs.is_empty() {
+                    let (_, _, c) = self.hw(*input);
+                    (self.read(*input)?, c)
+                } else {
+                    let datas: Vec<(Vec<f32>, usize)> = srcs
+                        .iter()
+                        .map(|p| Ok((self.read(p.input)?, p.c as usize)))
+                        .collect::<Result<_, ConvertError>>()?;
+                    let px = (ih * iw) as usize;
+                    let ctot: usize = datas.iter().map(|(_, c)| c).sum();
+                    let mut cat = vec![0f32; px * ctot];
+                    for p in 0..px {
+                        let mut off = 0usize;
+                        for (dv, c) in &datas {
+                            cat[p * ctot + off..p * ctot + off + c]
+                                .copy_from_slice(&dv[p * c..(p + 1) * c]);
+                            off += c;
+                        }
+                    }
+                    (cat, ctot as u32)
+                };
                 let op = ResizeBilinear { oh: *oh, ow: *ow, mode: *mode };
-                (*out, reference::resize::resize_bilinear(&op, ih, iw, c, &self.read(*input)?))
+                (*out, reference::resize::resize_bilinear(&op, ih, iw, c, &x))
             }
             SwOp::Concat { out, parts } => {
                 let (h, w, oc) = self.hw(*out);
@@ -218,8 +261,55 @@ impl<'a> CpuExec<'a> {
                 let x = self.read(*input)?;
                 (*out, x.iter().map(|v| act.apply(*v)).collect())
             }
-            SwOp::Mix { .. } => {
-                return Err(ConvertError::Other("mix는 기본 미방출".into()))
+            SwOp::SeGate { input, out, c_mid, act1, w1, b1, fc2 } => {
+                let (h, w, c_in) = self.hw(*input);
+                let x = self.read(*input)?;
+                // 채널 평균
+                let px = (h * w) as usize;
+                let cin = c_in as usize;
+                let mut mean = vec![0f32; cin];
+                for p in 0..px {
+                    for ch in 0..cin {
+                        mean[ch] += x[p * cin + ch];
+                    }
+                }
+                for m in &mut mean {
+                    *m /= px as f32;
+                }
+                let fc = |xv: &[f32], w: &WRef, b: &WRef, cout: u32, act: Activation| {
+                    let cin = xv.len() as u32;
+                    let kg_pad = cin.div_ceil(4).next_multiple_of(4);
+                    let wts = pack::unpack_weights_conv(
+                        self.wref(*w),
+                        cout,
+                        cin,
+                        1,
+                        1,
+                        kg_pad,
+                        DType::F32,
+                    );
+                    let bias = pack::unpack_bias(self.wref(*b), cout, DType::F32);
+                    (0..cout as usize)
+                        .map(|o| {
+                            let mut acc = bias[o];
+                            for i in 0..cin as usize {
+                                acc += wts[o * cin as usize + i] * xv[i];
+                            }
+                            act.apply(acc)
+                        })
+                        .collect::<Vec<f32>>()
+                };
+                let mid = fc(&mean, w1, b1, *c_mid, *act1);
+                let y = match fc2 {
+                    Some(f) => fc(&mid, &f.w, &f.b, f.c_out, f.act),
+                    None => mid,
+                };
+                (*out, y)
+            }
+            SwOp::Mix { z, a, b, out } => {
+                let (av, bv, zv) = (self.read(*a)?, self.read(*b)?, self.read(*z)?);
+                let y = (0..av.len()).map(|i| av[i] + zv[i] * (bv[i] - av[i])).collect();
+                (*out, y)
             }
         })
     }

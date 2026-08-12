@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use ai_core::format::{SwAlias, SwConcatPart, SwModel, SwOp, SwOperand, SwSize, SwState, SwTensor};
+use ai_core::format::{SeFc, SwAlias, SwConcatPart, SwModel, SwOp, SwOperand, SwSize, SwState, SwTensor};
 use ai_core::ops::{BinaryOp, CoordMode};
 use ai_core::{pack, Activation, DType, TensorDesc};
 
@@ -93,6 +93,18 @@ impl<'a> Lowerer<'a> {
 
     fn lower_conv(&mut self, node: &Node) -> Result<SwOp, ConvertError> {
         let x = node.inputs[0].clone();
+        // concat-into-conv 융합: 추가 파트는 inputs 끝에 붙어 있다 (fuse_concat 참조)
+        let src_cs = node.attr_is("src_cs").map(|v| v.to_vec());
+        let n_extra = src_cs.as_ref().map(|v| v.len() - 1).unwrap_or(0);
+        let base_len = node.inputs.len() - n_extra;
+        let mut srcs = Vec::new();
+        if let Some(cs) = &src_cs {
+            srcs.push(SwConcatPart { input: self.tid(&x)?, c: cs[0] as u32 });
+            for (i, c) in cs[1..].iter().enumerate() {
+                let name = node.inputs[base_len + i].clone();
+                srcs.push(SwConcatPart { input: self.tid(&name)?, c: *c as u32 });
+            }
+        }
         let w_name = &node.inputs[1];
         let w_shape = self
             .g
@@ -123,7 +135,7 @@ impl<'a> Lowerer<'a> {
         };
         let w = self.blob.push(&wbytes);
 
-        let bias = match node.inputs.get(2) {
+        let bias = match (base_len >= 3).then(|| &node.inputs[2]) {
             Some(b) => self.const_f32s(b)?,
             None => vec![0.0; cout as usize],
         };
@@ -140,6 +152,7 @@ impl<'a> Lowerer<'a> {
         Ok(SwOp::Conv {
             input: self.tid(&x)?,
             out: self.tid(&node.outputs[0])?,
+            srcs,
             res,
             cin,
             cout,
@@ -211,6 +224,12 @@ pub fn lower(g: &Graph, ctx: &Ctx, name: &str) -> Result<(SwModel, Vec<u8>), Con
             }
             "Conv" => ops.push(lw.lower_conv(node)?),
             "Mul" | "Add" | "Sub" => ops.push(lw.lower_binary(node)?),
+            "mix" => ops.push(SwOp::Mix {
+                a: lw.tid(&node.inputs[0])?,
+                b: lw.tid(&node.inputs[1])?,
+                z: lw.tid(&node.inputs[2])?,
+                out: lw.tid(&node.outputs[0])?,
+            }),
             "gpool" => ops.push(SwOp::Gpool {
                 input: lw.tid(&node.inputs[0])?,
                 out: lw.tid(&node.outputs[0])?,
@@ -237,9 +256,19 @@ pub fn lower(g: &Graph, ctx: &Ctx, name: &str) -> Result<(SwModel, Vec<u8>), Con
                         return Err(ConvertError::Malformed(format!("resize mode {other:?}")))
                     }
                 };
+                let mut srcs = Vec::new();
+                if let Some(cs) = node.attr_is("src_cs") {
+                    let cs = cs.to_vec();
+                    srcs.push(SwConcatPart { input: lw.tid(&node.inputs[0])?, c: cs[0] as u32 });
+                    for (i, c) in cs[1..].iter().enumerate() {
+                        let name = node.inputs[1 + i].clone();
+                        srcs.push(SwConcatPart { input: lw.tid(&name)?, c: *c as u32 });
+                    }
+                }
                 ops.push(SwOp::Resize {
                     input: lw.tid(&node.inputs[0])?,
                     out: lw.tid(&node.outputs[0])?,
+                    srcs,
                     oh: node.attr_i("oh").unwrap() as u32,
                     ow: node.attr_i("ow").unwrap() as u32,
                     mode,
@@ -259,6 +288,39 @@ pub fn lower(g: &Graph, ctx: &Ctx, name: &str) -> Result<(SwModel, Vec<u8>), Con
                     parts.push(SwConcatPart { input: lw.tid(i)?, c });
                 }
                 ops.push(SwOp::Concat { out: lw.tid(&node.outputs[0])?, parts });
+            }
+            "segate" => {
+                let x = node.inputs[0].clone();
+                let (_, _, cin) = lw.desc_of(&x)?;
+                let c_mid = node.attr_i("c_mid").unwrap() as u32;
+                let act1 = parse_act(node.attr_s("act1"))?;
+                let w1v = lw.const_f32s(&node.inputs[1])?;
+                let (w1b, _) = pack::pack_weights_conv(&w1v, c_mid, cin, 1, 1, 4, lw.dt);
+                let w1 = lw.blob.push(&w1b);
+                let b1v = lw.const_f32s(&node.inputs[2])?;
+                let b1 = lw.blob.push(&pack::pack_bias(&b1v, c_mid, lw.dt));
+                let fc2 = match node.attr_i("c_out") {
+                    Some(c_out) => {
+                        let c_out = c_out as u32;
+                        let act2 = parse_act(node.attr_s("act2"))?;
+                        let w2v = lw.const_f32s(&node.inputs[3])?;
+                        let (w2b, _) = pack::pack_weights_conv(&w2v, c_out, c_mid, 1, 1, 4, lw.dt);
+                        let w2 = lw.blob.push(&w2b);
+                        let b2v = lw.const_f32s(&node.inputs[4])?;
+                        let b2 = lw.blob.push(&pack::pack_bias(&b2v, c_out, lw.dt));
+                        Some(SeFc { c_out, act: act2, w: w2, b: b2 })
+                    }
+                    None => None,
+                };
+                ops.push(SwOp::SeGate {
+                    input: lw.tid(&x)?,
+                    out: lw.tid(&node.outputs[0])?,
+                    c_mid,
+                    act1,
+                    w1,
+                    b1,
+                    fc2,
+                });
             }
             "chcopy" => ops.push(SwOp::Chcopy {
                 input: lw.tid(&node.inputs[0])?,
@@ -329,8 +391,12 @@ pub fn lower(g: &Graph, ctx: &Ctx, name: &str) -> Result<(SwModel, Vec<u8>), Con
     let mut tensors = lw.tensors;
     let op_inputs = |op: &SwOp| -> Vec<u32> {
         match op {
-            SwOp::Conv { input, res, .. } => {
-                let mut v = vec![*input];
+            SwOp::Conv { input, srcs, res, .. } => {
+                let mut v = if srcs.is_empty() {
+                    vec![*input]
+                } else {
+                    srcs.iter().map(|p| p.input).collect()
+                };
                 if let Some(r) = res {
                     v.push(*r);
                 }
@@ -344,12 +410,19 @@ pub fn lower(g: &Graph, ctx: &Ctx, name: &str) -> Result<(SwModel, Vec<u8>), Con
                 }
                 v
             }
+            SwOp::Resize { input, srcs, .. } => {
+                if srcs.is_empty() {
+                    vec![*input]
+                } else {
+                    srcs.iter().map(|p| p.input).collect()
+                }
+            }
             SwOp::Gpool { input, .. }
             | SwOp::Avgpool { input, .. }
-            | SwOp::Resize { input, .. }
             | SwOp::Chcopy { input, .. }
             | SwOp::Act { input, .. } => vec![*input],
             SwOp::Concat { parts, .. } => parts.iter().map(|p| p.input).collect(),
+            SwOp::SeGate { input, .. } => vec![*input],
             SwOp::Mix { z, a, b, .. } => vec![*z, *a, *b],
         }
     };

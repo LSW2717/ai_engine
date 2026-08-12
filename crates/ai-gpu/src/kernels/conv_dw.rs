@@ -53,6 +53,12 @@ impl ConvDwSpec {
         self.c.div_ceil(4)
     }
 
+    /// 픽셀 블록 폭 — k5(탭 25)만 4px 행 재사용이 이긴다 (실측: k3는 스레드
+    /// 감소+CG소형 비합체로 퇴행, k5는 c960 53.8→38.5µs / c120 22→16.8µs).
+    fn pb(&self) -> u32 {
+        if self.k >= 5 { 4 } else { 1 }
+    }
+
     fn out_binding(&self) -> u32 {
         if self.residual { 5 } else { 4 }
     }
@@ -77,57 +83,84 @@ impl KernelSpec for ConvDwSpec {
     fn wgsl(&self, _caps: &DeviceCaps) -> String {
         let (oh, ow) = self.out_hw();
         let taps = self.k * self.k;
+        let pb = self.pb();
+        let bpr = ow.div_ceil(pb);
+        let nblk = oh * bpr;
         let consts = format!(
-            "const IH: i32 = {};\nconst IW: i32 = {};\nconst OH: u32 = {}u;\nconst OW: u32 = {}u;\nconst CG: u32 = {}u;\nconst TAPS: u32 = {}u;",
-            self.ih, self.iw, oh, ow, self.cg(), taps
+            "const IH: i32 = {};\nconst IW: i32 = {};\nconst OH: u32 = {}u;\nconst OW: u32 = {}u;\nconst CG: u32 = {}u;\nconst TAPS: u32 = {}u;\nconst NBLK: u32 = {}u;\nconst BPR: u32 = {}u;\nconst PB: u32 = {}u;",
+            self.ih, self.iw, oh, ow, self.cg(), taps, nblk, bpr, pb
         );
-        let wsh = format!("var<workgroup> Wsh: array<vec4f, {taps}>;");
 
-        // 탭 완전 언롤 — stride/pad는 리터럴로 박는다
+        // direct4식 행 재사용: 행당 유니크 열 {p*S + kx*D} 로드, 탭은 완전 언롤
+        let mut used: Vec<u32> = Vec::new();
+        for p in 0..pb {
+            for kx in 0..self.k {
+                let c = p * self.s + kx * self.d;
+                if !used.contains(&c) {
+                    used.push(c);
+                }
+            }
+        }
+        used.sort_unstable();
+        let pl = self.pad[1] as i32;
         let mut body = W::new();
         for ky in 0..self.k {
-            for kx in 0..self.k {
-                let tap = ky * self.k + kx;
+            let dy = ky * self.d;
+            body.line(format!("{{ // row {ky}"));
+            body.line(format!("  let iy = i32(oy) * {} + {} - {};", self.s, dy, self.pad[0]));
+            body.line("  if (iy >= 0 && iy < IH) {");
+            body.line("    let row = u32(iy) * u32(IW);");
+            for &c in &used {
+                body.line(format!("    let x{c} = i32(ox0) * {} + {};", self.s, c as i32 - pl));
                 body.line(format!(
-                    "{{ let iy = i32(oy) * {} + {} - {};",
-                    self.s,
-                    ky * self.d,
-                    self.pad[0]
-                ));
-                body.line(format!(
-                    "  let ix = i32(ox) * {} + {} - {};",
-                    self.s,
-                    kx * self.d,
-                    self.pad[1]
-                ));
-                body.line("  let m = select(0.0, 1.0, iy >= 0 && iy < IH && ix >= 0 && ix < IW);");
-                body.line("  let cy = u32(clamp(iy, 0, IH - 1));");
-                body.line("  let cx = u32(clamp(ix, 0, IW - 1));");
-                body.line(format!(
-                    "  acc = acc + Wsh[{tap}u] * vec4f(IN[(cy * u32(IW) + cx) * CG + cg]) * m; }}"
+                    "    let a{c} = vec4f(IN[(row + u32(clamp(x{c}, 0, IW - 1))) * CG + cg]) * f32(x{c} >= 0 && x{c} < IW);"
                 ));
             }
+            for kx in 0..self.k {
+                let tap = ky * self.k + kx;
+                body.line(format!("    {{ let wv = vec4f(W[{tap}u * CG + cg]);"));
+                for p in 0..pb {
+                    let c = p * self.s + kx * self.d;
+                    body.line(format!("      acc[{p}] = acc[{p}] + wv * a{c};"));
+                }
+                body.line("    }");
+            }
+            body.line("  }");
+            body.line("}");
+        }
+
+        // 스토어: 4픽셀 언롤 + OW 에지 가드 + 에필로그
+        let mut store = W::new();
+        for p in 0..pb {
+            store.line(format!("if (ox0 + {p}u < OW) {{"));
+            store.line(format!("  let out_idx = (oy * OW + ox0 + {p}u) * CG + cg;"));
+            store.line(format!("  var v_{p} = acc[{p}];"));
+            let epi = epilogue::emit(
+                &format!("v_{p}"),
+                Some("vec4f(BIAS[cg])"),
+                self.act,
+                self.residual.then_some(&*format!("vec4f(RES[out_idx])")),
+            );
+            for line in epi.lines() {
+                store.line(format!("  {line}"));
+            }
+            store.line(format!("  OUT[out_idx] = sv4(v_{p});"));
+            store.line("}");
         }
 
         let (res_b, out_b) = crate::kernels::common::gemm_tile::binding_slots(self.residual);
 
-        let epi = epilogue::emit(
-            "acc",
-            Some("vec4f(BIAS[cg])"),
-            self.act,
-            self.residual.then_some("vec4f(RES[out_idx])"),
-        );
-
+        let acc_init = (0..pb).map(|_| "vec4f(0.0)").collect::<Vec<_>>().join(", ");
         fill(
             TEMPLATE,
             &[
                 ("TYPES", sv4_alias(self.dt)),
                 ("CONSTS", consts),
-                ("WSH_DECL", wsh),
                 ("RES_BINDING", res_b),
                 ("OUT_BINDING", out_b),
-                ("TAPS_UNROLLED", body.done()),
-                ("EPILOGUE", epi),
+                ("ACC_DECL", format!("var acc = array<vec4f, {pb}>({acc_init});")),
+                ("ROWS", body.done()),
+                ("STORE4", store.done()),
             ],
         )
     }
@@ -143,7 +176,8 @@ impl KernelSpec for ConvDwSpec {
 
     fn workgroups(&self) -> [u32; 3] {
         let (oh, ow) = self.out_hw();
-        [ow.div_ceil(8), oh.div_ceil(8), self.cg()]
+        let nblk = oh * ow.div_ceil(self.pb());
+        [(nblk * self.cg()).div_ceil(256), 1, 1]
     }
 }
 

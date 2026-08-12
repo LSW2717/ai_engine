@@ -10,3 +10,4 @@ pub mod elementwise;
 pub mod gemm_pw;
 pub mod gpool;
 pub mod resize_bilinear;
+pub mod se_gate;

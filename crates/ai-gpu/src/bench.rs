@@ -45,7 +45,7 @@ pub struct BenchResult {
     pub pipeline_ms: f64,
 }
 
-async fn bench_kernel(
+pub async fn bench_kernel(
     ctx: &GpuContext,
     spec: &dyn KernelSpec,
     params: &[u8],
@@ -320,7 +320,7 @@ pub async fn run_benchmarks(ctx: &GpuContext) -> Result<Vec<BenchResult>, String
         let din = TensorDesc::new(ih, iw, c, dt);
         let dout = TensorDesc::new(oh, ow, c, dt);
         let spec =
-            ResizeBilinearSpec { ih, iw, c, oh, ow, mode: CoordMode::HalfPixel, dt };
+            ResizeBilinearSpec { ih, iw, c, oh, ow, mode: CoordMode::HalfPixel, dt, srcs: [0; 3] };
         let bufs = [filled(ctx, &din, seed), storage_out(ctx, dout.size_bytes())];
         let flops = 8.0 * (oh * ow * c) as f64;
         out.push(

@@ -43,6 +43,7 @@ pub(crate) mod test_util {
     pub fn fake_caps() -> DeviceCaps {
         DeviceCaps {
             f16: true,
+            subgroups: false,
             timestamps: false,
             limits: wgpu::Limits::default(),
             info: wgpu::AdapterInfo {

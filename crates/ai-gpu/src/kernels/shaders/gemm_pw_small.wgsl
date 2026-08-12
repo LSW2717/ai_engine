@@ -13,7 +13,7 @@
 //@OUT_BINDING
 //@CONSTS
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= NBLK * NG) {

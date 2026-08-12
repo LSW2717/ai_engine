@@ -59,6 +59,7 @@ fn bisect_rvm_frame2() {
             | ai_core::format::SwOp::Resize { out, .. }
             | ai_core::format::SwOp::Concat { out, .. }
             | ai_core::format::SwOp::Chcopy { out, .. }
+            | ai_core::format::SwOp::SeGate { out, .. }
             | ai_core::format::SwOp::Act { out, .. }
             | ai_core::format::SwOp::Mix { out, .. } => *out,
         };

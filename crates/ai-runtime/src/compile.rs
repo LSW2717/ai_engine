@@ -16,18 +16,30 @@ pub async fn compile_all(
     ctx: &GpuContext,
     specs: &[&dyn KernelSpec],
 ) -> Result<HashMap<String, Arc<CompiledKernel>>, RuntimeError> {
-    // dedupe
+    // dedupe + 컨텍스트 캐시 히트 분리 (재로드·다중 모델은 컴파일을 건너뛴다)
     let mut unique: Vec<&dyn KernelSpec> = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    for s in specs {
-        let key = s.cache_key(&ctx.caps);
-        if seen.insert(key) {
-            unique.push(*s);
+    let mut map = HashMap::new();
+    {
+        let cache = ctx.kernel_cache.lock().unwrap();
+        for s in specs {
+            let key = s.cache_key(&ctx.caps);
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            if let Some(k) = cache.get(&key) {
+                map.insert(key, k.clone());
+            } else {
+                unique.push(*s);
+            }
         }
     }
-    log::info!("[ai-runtime] 파이프라인 {}개 (고유 {})", specs.len(), unique.len());
-
-    let mut map = HashMap::new();
+    log::info!(
+        "[ai-runtime] 파이프라인 {}개 (고유 신규 {}, 캐시 {})",
+        specs.len(),
+        unique.len(),
+        map.len()
+    );
 
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -54,11 +66,20 @@ pub async fn compile_all(
 
     #[cfg(target_arch = "wasm32")]
     {
-        for spec in unique {
-            let k = kernel::compile(ctx, spec)
-                .await
-                .map_err(RuntimeError::Gpu)?;
+        // 2단계: 모듈을 전부 먼저 만들면 브라우저(Dawn/Tint)가 내부 스레드풀에서
+        // 병렬 컴파일한다 — 파이프라인 생성은 완료 대기 지점일 뿐.
+        let pending: Vec<_> = unique.iter().map(|s| kernel::begin_compile(ctx, *s)).collect();
+        for p in pending {
+            let k = kernel::finish_compile(ctx, p);
             map.insert(k.key.clone(), Arc::new(k));
+        }
+    }
+
+    // 신규 컴파일분을 컨텍스트 캐시에 반영
+    {
+        let mut cache = ctx.kernel_cache.lock().unwrap();
+        for (k, v) in &map {
+            cache.entry(k.clone()).or_insert_with(|| v.clone());
         }
     }
 

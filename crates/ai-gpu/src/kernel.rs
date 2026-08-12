@@ -11,11 +11,13 @@ use std::sync::Arc;
 
 use crate::context::{DeviceCaps, GpuContext};
 
-/// storage 바인딩의 접근 방향
+/// storage 바인딩의 접근 방향 (Uniform = Metal constant 주소공간 — 브로드캐스트
+/// 최적 경로. 64KB 이하 read-only 상수 데이터 전용)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum StorageDir {
     Read,
     ReadWrite,
+    Uniform,
 }
 
 /// 커널 계열마다 하나씩 구현하는 codegen 명세.
@@ -51,10 +53,18 @@ pub struct OpDispatch {
     pub label: String,
 }
 
-/// error scope 없이 컴파일 — 병렬 팬아웃용.
-/// (error scope 스택은 디바이스 전역이라 멀티스레드 push/pop이 얽힌다.
+/// 2단계 컴파일의 중간 산출물 — 모듈 생성(비싼 셰이더 번역이 백엔드에서 비동기로
+/// 시작됨)과 파이프라인 생성(모듈 완료 대기)을 분리해, wasm에서 모듈들을 먼저 전부
+/// 만들어 브라우저 내부 스레드풀 병렬 컴파일을 유도한다.
+pub struct PendingKernel {
+    module: wgpu::ShaderModule,
+    bgl: wgpu::BindGroupLayout,
+    key: String,
+}
+
+/// 1단계: WGSL codegen + 모듈/BGL 생성 (error scope 없음 — 병렬 팬아웃용.
 /// 오류는 on_uncaptured_error 로그 + 워밍업 디스패치에서 드러난다.)
-pub fn compile_unscoped(ctx: &GpuContext, spec: &dyn KernelSpec) -> CompiledKernel {
+pub fn begin_compile(ctx: &GpuContext, spec: &dyn KernelSpec) -> PendingKernel {
     let key = spec.cache_key(&ctx.caps);
     let src = spec.wgsl(&ctx.caps);
     let entries = bgl_entries(&spec.bindings());
@@ -67,20 +77,31 @@ pub fn compile_unscoped(ctx: &GpuContext, spec: &dyn KernelSpec) -> CompiledKern
         label: Some(&key),
         entries: &entries,
     });
+    PendingKernel { module, bgl, key }
+}
+
+/// 2단계: 파이프라인 생성 (백엔드 셰이더 컴파일 완료 대기 지점)
+pub fn finish_compile(ctx: &GpuContext, p: PendingKernel) -> CompiledKernel {
+    let device = &ctx.device;
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some(&key),
-        bind_group_layouts: &[Some(&bgl)],
+        label: Some(&p.key),
+        bind_group_layouts: &[Some(&p.bgl)],
         ..Default::default()
     });
     let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some(&key),
+        label: Some(&p.key),
         layout: Some(&layout),
-        module: &module,
+        module: &p.module,
         entry_point: Some("main"),
         compilation_options: Default::default(),
         cache: None,
     });
-    CompiledKernel { pipeline, bgl, key }
+    CompiledKernel { pipeline, bgl: p.bgl, key: p.key }
+}
+
+/// error scope 없이 일괄 컴파일 — 병렬 팬아웃용
+pub fn compile_unscoped(ctx: &GpuContext, spec: &dyn KernelSpec) -> CompiledKernel {
+    finish_compile(ctx, begin_compile(ctx, spec))
 }
 
 fn bgl_entries(storage: &[StorageDir]) -> Vec<wgpu::BindGroupLayoutEntry> {
@@ -95,16 +116,14 @@ fn bgl_entries(storage: &[StorageDir]) -> Vec<wgpu::BindGroupLayoutEntry> {
         count: None,
     }];
     for (i, dir) in storage.iter().enumerate() {
+        let ty = match dir {
+            StorageDir::Uniform => wgpu::BufferBindingType::Uniform,
+            d => wgpu::BufferBindingType::Storage { read_only: *d == StorageDir::Read },
+        };
         entries.push(wgpu::BindGroupLayoutEntry {
             binding: (i + 1) as u32,
             visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Storage {
-                    read_only: *dir == StorageDir::Read,
-                },
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
+            ty: wgpu::BindingType::Buffer { ty, has_dynamic_offset: false, min_binding_size: None },
             count: None,
         });
     }

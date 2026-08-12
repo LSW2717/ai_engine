@@ -11,6 +11,7 @@ use crate::context::DeviceCaps;
 use crate::kernel::{KernelSpec, StorageDir};
 use crate::kernels::common::activation::act_expr;
 use crate::kernels::common::writer::fill;
+use crate::kernels::common::sv4_alias;
 
 const TEMPLATE: &str = include_str!("shaders/elementwise.wgsl");
 pub const WORKGROUP: u32 = 256;
@@ -26,6 +27,8 @@ pub enum EwOperand {
     ChannelVector,
     /// 단항 (op 무시, v = A[i] → act) — 단독 활성화 op의 lowering 대상
     Unary,
+    /// GRU 갱신 mix(A,B,Z) = (1-Z)·A + Z·B (op 무시) — sub/mul/mul/add 4패스 융합
+    Mix,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -46,44 +49,54 @@ impl KernelSpec for ElementwiseSpec {
             EwOperand::Scalar { scalar_first: true } => "st",
             EwOperand::ChannelVector => "tv",
             EwOperand::Unary => "u",
+            EwOperand::Mix => "mix",
         };
         format!("ew op={} mode={mode} act={} dt={}", self.op.tag(), self.act.tag(), self.dt.tag())
     }
 
     fn wgsl(&self, _caps: &DeviceCaps) -> String {
-        let two_bindings = matches!(self.operand, EwOperand::Scalar { .. } | EwOperand::Unary);
-        let extra = if two_bindings {
-            "@group(0) @binding(2) var<storage, read_write> O: array<vec4f>;".to_string()
-        } else {
-            "@group(0) @binding(2) var<storage, read> B: array<vec4f>;\n\
-             @group(0) @binding(3) var<storage, read_write> O: array<vec4f>;"
-                .to_string()
+        let extra = match self.operand {
+            EwOperand::Scalar { .. } | EwOperand::Unary => {
+                "@group(0) @binding(2) var<storage, read_write> O: array<sv4>;".to_string()
+            }
+            EwOperand::Mix => "@group(0) @binding(2) var<storage, read> B: array<sv4>;\n\
+                 @group(0) @binding(3) var<storage, read> Z: array<sv4>;\n\
+                 @group(0) @binding(4) var<storage, read_write> O: array<sv4>;"
+                .to_string(),
+            _ => "@group(0) @binding(2) var<storage, read> B: array<sv4>;\n\
+                 @group(0) @binding(3) var<storage, read_write> O: array<sv4>;"
+                .to_string(),
         };
         let o = self.op.wgsl_op();
         let mut body = match self.operand {
-            EwOperand::Tensor => format!("var v = A[i] {o} B[i];\n"),
+            EwOperand::Tensor => format!("var v = vec4f(A[i]) {o} vec4f(B[i]);\n"),
             EwOperand::Scalar { scalar_first } => {
                 let s = "vec4f(P.scalar)";
                 if scalar_first {
-                    format!("var v = {s} {o} A[i];\n")
+                    format!("var v = {s} {o} vec4f(A[i]);\n")
                 } else {
-                    format!("var v = A[i] {o} {s};\n")
+                    format!("var v = vec4f(A[i]) {o} {s};\n")
                 }
             }
-            EwOperand::ChannelVector => format!("var v = A[i] {o} B[i % P.cg];\n"),
-            EwOperand::Unary => "var v = A[i];\n".to_string(),
+            EwOperand::ChannelVector => format!("var v = vec4f(A[i]) {o} vec4f(B[i % P.cg]);\n"),
+            EwOperand::Unary => "var v = vec4f(A[i]);\n".to_string(),
+            EwOperand::Mix => "var v = mix(vec4f(A[i]), vec4f(B[i]), vec4f(Z[i]));\n".to_string(),
         };
         if self.act != Activation::None {
             body.push_str(&format!("v = {};\n", act_expr(self.act, "v")));
         }
-        fill(TEMPLATE, &[("EXTRA_BINDINGS", extra), ("BODY", body)])
+        fill(TEMPLATE, &[("TYPES", sv4_alias(self.dt)), ("EXTRA_BINDINGS", extra), ("BODY", body)])
     }
 
     fn bindings(&self) -> Vec<StorageDir> {
-        if matches!(self.operand, EwOperand::Scalar { .. } | EwOperand::Unary) {
-            vec![StorageDir::Read, StorageDir::ReadWrite]
-        } else {
-            vec![StorageDir::Read, StorageDir::Read, StorageDir::ReadWrite]
+        match self.operand {
+            EwOperand::Scalar { .. } | EwOperand::Unary => {
+                vec![StorageDir::Read, StorageDir::ReadWrite]
+            }
+            EwOperand::Mix => {
+                vec![StorageDir::Read, StorageDir::Read, StorageDir::Read, StorageDir::ReadWrite]
+            }
+            _ => vec![StorageDir::Read, StorageDir::Read, StorageDir::ReadWrite],
         }
     }
 
@@ -110,6 +123,7 @@ mod tests {
             EwOperand::Scalar { scalar_first: true },
             EwOperand::ChannelVector,
             EwOperand::Unary,
+            EwOperand::Mix,
         ];
         for op in [BinaryOp::Add, BinaryOp::Sub, BinaryOp::Mul] {
             for operand in operands {

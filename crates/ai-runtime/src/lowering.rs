@@ -15,6 +15,7 @@ use ai_gpu::kernels::elementwise::{ElementwiseSpec, EwOperand};
 use ai_gpu::kernels::gemm_pw::GemmPwSpec;
 use ai_gpu::kernels::gpool::GpoolSpec;
 use ai_gpu::kernels::resize_bilinear::ResizeBilinearSpec;
+use ai_gpu::kernels::se_gate::SeGateSpec;
 
 use crate::error::RuntimeError;
 
@@ -59,7 +60,7 @@ pub fn lower_op(
     let dt = sw.dt_default;
     Ok(match op {
         SwOp::Conv {
-            input, out, res, cin, cout, kh, kw, sh, sw: swid, pad, d, groups, act, w, b, ..
+            input, out, srcs, res, cin, cout, kh, kw, sh, sw: swid, pad, d, groups, act, w, b, ..
         } => {
             let (ih, iw, _) = tdesc(sw, *input);
             let conv = Conv2d {
@@ -75,12 +76,18 @@ pub fn lower_op(
                 act: *act,
             };
             let spec: Box<dyn KernelSpec> = if *groups > 1 {
+                if !srcs.is_empty() {
+                    return Err(RuntimeError::Other("dw conv는 concat 융합 미지원".into()));
+                }
                 Box::new(ConvDwSpec::from_op(&conv, ih, iw, res.is_some(), dt))
             } else if *kh == 1 {
                 if *sh != 1 || pad.iter().any(|p| *p != 0) {
                     return Err(RuntimeError::Other(format!(
                         "1×1 conv stride/pad 미지원 (s={sh}, pad={pad:?})"
                     )));
+                }
+                if !srcs.is_empty() {
+                    return Err(RuntimeError::Other("1×1 conv는 concat 융합 미지원".into()));
                 }
                 Box::new(GemmPwSpec {
                     m: ih * iw,
@@ -91,14 +98,27 @@ pub fn lower_op(
                     dt,
                 })
             } else {
-                Box::new(ConvIgemmSpec::from_op(&conv, ih, iw, res.is_some(), dt))
+                let mut spec = ConvIgemmSpec::from_op(&conv, ih, iw, res.is_some(), dt);
+                if !srcs.is_empty() {
+                    if srcs.len() > 3 {
+                        return Err(RuntimeError::Other("conv 융합 파트 3개 초과".into()));
+                    }
+                    for (i, p) in srcs.iter().enumerate() {
+                        spec.srcs[i] = p.c;
+                    }
+                }
+                Box::new(spec)
             };
-            let mut bindings = vec![
-                RtBinding::Tensor(map(*input)),
-                RtBinding::Weights(*w),
-                RtBinding::Weights(*b),
-            ];
-            let mut reads = vec![map(*input)];
+            let in_tids: Vec<u32> = if srcs.is_empty() {
+                vec![map(*input)]
+            } else {
+                srcs.iter().map(|p| map(p.input)).collect()
+            };
+            let mut bindings: Vec<RtBinding> =
+                in_tids.iter().map(|t| RtBinding::Tensor(*t)).collect();
+            bindings.push(RtBinding::Weights(*w));
+            bindings.push(RtBinding::Weights(*b));
+            let mut reads = in_tids;
             if let Some(r) = res {
                 bindings.push(RtBinding::Tensor(map(*r)));
                 reads.push(map(*r));
@@ -201,15 +221,30 @@ pub fn lower_op(
                 writes: vec![map(*out)],
             }
         }
-        SwOp::Resize { input, out, oh, ow, mode } => {
-            let (ih, iw, c) = tdesc(sw, *input);
-            let spec = ResizeBilinearSpec { ih, iw, c, oh: *oh, ow: *ow, mode: *mode, dt };
+        SwOp::Resize { input, out, srcs, oh, ow, mode } => {
+            let (ih, iw, _) = tdesc(sw, *input);
+            let (_, _, c_out) = tdesc(sw, *out);
+            let mut spec =
+                ResizeBilinearSpec { ih, iw, c: c_out, oh: *oh, ow: *ow, mode: *mode, dt, srcs: [0; 3] };
+            let in_tids: Vec<u32> = if srcs.is_empty() {
+                let (_, _, c) = tdesc(sw, *input);
+                spec.c = c;
+                vec![map(*input)]
+            } else {
+                for (i, p) in srcs.iter().enumerate() {
+                    spec.srcs[i] = p.c;
+                }
+                srcs.iter().map(|p| map(p.input)).collect()
+            };
+            let mut bindings: Vec<RtBinding> =
+                in_tids.iter().map(|t| RtBinding::Tensor(*t)).collect();
+            bindings.push(RtBinding::Tensor(map(*out)));
             LoweredOp {
                 label: format!("resize {ih}x{iw}->{oh}x{ow}"),
                 spec: Box::new(spec),
-                bindings: vec![RtBinding::Tensor(map(*input)), RtBinding::Tensor(map(*out))],
+                bindings,
                 params: [0; 16],
-                reads: vec![map(*input)],
+                reads: in_tids,
                 writes: vec![map(*out)],
             }
         }
@@ -251,8 +286,58 @@ pub fn lower_op(
                 writes: vec![map(*out)],
             }
         }
-        SwOp::Mix { .. } => {
-            return Err(RuntimeError::Other("mix 커널 미구현 (변환기 기본 미방출)".into()))
+        SwOp::SeGate { input, out, c_mid, act1, w1, b1, fc2 } => {
+            let (h, w, c_in) = tdesc(sw, *input);
+            let spec = SeGateSpec {
+                hw: h * w,
+                c_in,
+                c_mid: *c_mid,
+                act1: *act1,
+                fc2: fc2.as_ref().map(|f| (f.c_out, f.act)),
+                dt,
+            };
+            let mut bindings = vec![
+                RtBinding::Tensor(map(*input)),
+                RtBinding::Weights(*w1),
+                RtBinding::Weights(*b1),
+            ];
+            if let Some(f) = fc2 {
+                bindings.push(RtBinding::Weights(f.w));
+                bindings.push(RtBinding::Weights(f.b));
+            }
+            bindings.push(RtBinding::Tensor(map(*out)));
+            LoweredOp {
+                label: format!("segate c{c_in}"),
+                spec: Box::new(spec),
+                bindings,
+                params: [0; 16],
+                reads: vec![map(*input)],
+                writes: vec![map(*out)],
+            }
+        }
+        SwOp::Mix { z, a, b, out } => {
+            let (h, w, c) = tdesc(sw, *a);
+            let len = (h * w * c.div_ceil(4)) as u32;
+            let spec = ElementwiseSpec {
+                op: BinaryOp::Add, // Mix에서 op는 무시됨
+                operand: EwOperand::Mix,
+                act: Activation::None,
+                len_vec4: len,
+                dt,
+            };
+            LoweredOp {
+                label: "mix".into(),
+                spec: Box::new(spec),
+                bindings: vec![
+                    RtBinding::Tensor(map(*a)),
+                    RtBinding::Tensor(map(*b)),
+                    RtBinding::Tensor(map(*z)),
+                    RtBinding::Tensor(map(*out)),
+                ],
+                params: ew_params(0.0, c.div_ceil(4), len),
+                reads: vec![map(*a), map(*b), map(*z)],
+                writes: vec![map(*out)],
+            }
         }
     })
 }

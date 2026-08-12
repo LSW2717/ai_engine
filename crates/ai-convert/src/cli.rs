@@ -52,7 +52,6 @@ pub fn parse(args: &[String]) -> Result<Opts, String> {
             }
             "--fp16" => opts.ctx.fp16 = true,
             "--strip-refiner" => opts.ctx.strip_refiner = true,
-            "--fuse-mix" => opts.ctx.fuse_mix = true,
             "--name" => opts.name = Some(it.next().ok_or("--name 값 필요")?.clone()),
             "--summary" => opts.summary = true,
             "--dump-json" => opts.dump_json = true,

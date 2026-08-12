@@ -26,7 +26,7 @@ web: build-wasm serve-web
 convert-rvm-web:
 	cargo run --release -p ai-convert -- models/rvm_fp32.onnx -o web/models/rvm_256x144.sw \
 	  --size 256x144 --set-input downsample_ratio=1.0 \
-	  --state r1i=r1o --state r2i=r2o --state r3i=r3o --state r4i=r4o --name rvm
+	  --state r1i=r1o --state r2i=r2o --state r3i=r3o --state r4i=r4o --name rvm --fp16
 
 setup-wasm:
 	rustup target add wasm32-unknown-unknown

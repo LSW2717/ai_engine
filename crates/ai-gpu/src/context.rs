@@ -24,6 +24,8 @@ pub enum InitError {
 #[derive(Debug)]
 pub struct DeviceCaps {
     pub f16: bool,
+    /// subgroup 연산 지원 (WGSL enable subgroups)
+    pub subgroups: bool,
     pub timestamps: bool,
     pub limits: wgpu::Limits,
     pub info: wgpu::AdapterInfo,
@@ -37,6 +39,12 @@ pub struct GpuContext {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub caps: DeviceCaps,
+    /// 프로세스 수명 파이프라인 캐시 (cache_key → 컴파일 완료 커널).
+    /// 재로드·다중 모델이 같은 shape 커널을 공유한다 — 로드 시간의 지배 항목이
+    /// 파이프라인 컴파일이라 2회차 로드가 버퍼 비용만 남는다.
+    pub kernel_cache: std::sync::Mutex<
+        std::collections::HashMap<String, std::sync::Arc<crate::kernel::CompiledKernel>>,
+    >,
 }
 
 impl GpuContext {
@@ -56,7 +64,11 @@ impl GpuContext {
 
         let adapter_features = adapter.features();
         let mut required_features = wgpu::Features::empty();
-        for f in [wgpu::Features::SHADER_F16, wgpu::Features::TIMESTAMP_QUERY] {
+        for f in [
+            wgpu::Features::SHADER_F16,
+            wgpu::Features::TIMESTAMP_QUERY,
+            wgpu::Features::SUBGROUP,
+        ] {
             if adapter_features.contains(f) {
                 required_features |= f;
             }
@@ -84,6 +96,7 @@ impl GpuContext {
         let limits = device.limits();
         let caps = DeviceCaps {
             f16: required_features.contains(wgpu::Features::SHADER_F16),
+            subgroups: required_features.contains(wgpu::Features::SUBGROUP),
             timestamps: required_features.contains(wgpu::Features::TIMESTAMP_QUERY),
             storage_align: limits.min_storage_buffer_offset_alignment,
             limits,
@@ -97,7 +110,7 @@ impl GpuContext {
             caps.timestamps
         );
 
-        Ok(Self { instance, adapter, device, queue, caps })
+        Ok(Self { instance, adapter, device, queue, caps, kernel_cache: Default::default() })
     }
 
     /// 네이티브 전용 블로킹 래퍼. wasm에는 존재하지 않는다(블로킹 poll 불가).

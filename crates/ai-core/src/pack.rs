@@ -106,13 +106,15 @@ pub fn pack_weights_dw(w: &[f32], c: u32, kh: u32, kw: u32, dt: DType) -> Vec<u8
     assert_eq!(w.len(), (c * kh * kw) as usize);
     let cg = c.div_ceil(4);
     let taps = kh * kw;
+    // tap-major `[tap][cg]` — dw 커널이 cg-최하위 1D 스레드 배치라, 탭마다 인접
+    // cg 스레드가 인접 vec4를 읽어야 합체된다 (cg-major는 c960 k5에서 2배 퇴행).
     let mut out = vec![0f32; (cg * taps * 4) as usize];
     for cgi in 0..cg {
         for t in 0..taps {
             for comp in 0..4u32 {
                 let ch = cgi * 4 + comp;
                 let v = if ch < c { w[(ch * taps + t) as usize] } else { 0.0 };
-                out[((cgi * taps + t) * 4 + comp) as usize] = v;
+                out[((t * cg + cgi) * 4 + comp) as usize] = v;
             }
         }
     }
@@ -157,10 +159,11 @@ pub fn unpack_weights_conv(
 pub fn unpack_weights_dw(bytes: &[u8], c: u32, kh: u32, kw: u32, dt: DType) -> Vec<f32> {
     let flat = bytes_to_f32s(bytes, dt);
     let taps = kh * kw;
+    let cg = c.div_ceil(4);
     let mut out = vec![0f32; (c * taps) as usize];
     for ch in 0..c {
         for t in 0..taps {
-            out[(ch * taps + t) as usize] = flat[(((ch / 4) * taps + t) * 4 + ch % 4) as usize];
+            out[(ch * taps + t) as usize] = flat[((t * cg + ch / 4) * 4 + ch % 4) as usize];
         }
     }
     out
@@ -269,17 +272,18 @@ mod tests {
 
     #[test]
     fn dw_weight_layout() {
-        // c=5, k=3: cg=2, [cg][tap] — 채널 4(두 번째 그룹 comp 0)의 tap 순서 확인
+        // c=5, k=3: cg=2, tap-major [tap][cg] — 채널 4(두 번째 그룹 comp 0) 확인
         let c = 5u32;
         let taps = 9u32;
+        let cg = 2u32;
         let w: Vec<f32> = (0..c * taps).map(|i| i as f32).collect();
         let packed = pack_weights_dw(&w, c, 3, 3, DType::F32);
         let flat: &[f32] = bytemuck::cast_slice(&packed);
         for t in 0..taps {
-            // cg=1, comp=0 → 채널 4의 t번째 탭 = 4*9 + t
-            assert_eq!(flat[((1 * taps + t) * 4) as usize], (4 * taps + t) as f32);
+            // tap t, cg=1, comp=0 → 채널 4의 t번째 탭 = 4*9 + t
+            assert_eq!(flat[((t * cg + 1) * 4) as usize], (4 * taps + t) as f32);
             // comp=1..3은 패딩 → 0
-            assert_eq!(flat[((1 * taps + t) * 4 + 1) as usize], 0.0);
+            assert_eq!(flat[((t * cg + 1) * 4 + 1) as usize], 0.0);
         }
     }
 }

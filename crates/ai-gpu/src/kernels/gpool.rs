@@ -5,6 +5,7 @@ use ai_core::DType;
 use crate::context::DeviceCaps;
 use crate::kernel::{KernelSpec, StorageDir};
 use crate::kernels::common::writer::fill;
+use crate::kernels::common::sv4_alias;
 
 const TEMPLATE: &str = include_str!("shaders/gpool.wgsl");
 
@@ -36,10 +37,11 @@ impl KernelSpec for GpoolSpec {
         fill(
             TEMPLATE,
             &[
+                ("TYPES", sv4_alias(self.dt)),
                 ("CONSTS", consts),
                 (
                     "OUT_BINDING",
-                    "@group(0) @binding(2) var<storage, read_write> OUT: array<vec4f>;".to_string(),
+                    "@group(0) @binding(2) var<storage, read_write> OUT: array<sv4>;".to_string(),
                 ),
             ],
         )

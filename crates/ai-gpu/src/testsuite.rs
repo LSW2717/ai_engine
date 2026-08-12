@@ -45,7 +45,7 @@ pub fn compare(name: &str, got: &[f32], want: &[f32], atol: f32, rtol: f32) -> C
 
 // ---- GPU 헬퍼 (arena 도입 전까지의 직접 버퍼 경로; 벤치도 재사용) ----
 
-pub(crate) fn storage_in(ctx: &GpuContext, bytes: &[u8]) -> wgpu::Buffer {
+pub fn storage_in(ctx: &GpuContext, bytes: &[u8]) -> wgpu::Buffer {
     let buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
         size: bytes.len() as u64,
@@ -56,7 +56,7 @@ pub(crate) fn storage_in(ctx: &GpuContext, bytes: &[u8]) -> wgpu::Buffer {
     buf
 }
 
-pub(crate) fn storage_out(ctx: &GpuContext, size: u64) -> wgpu::Buffer {
+pub fn storage_out(ctx: &GpuContext, size: u64) -> wgpu::Buffer {
     ctx.device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
         size,
@@ -186,6 +186,9 @@ pub async fn run_elementwise(ctx: &GpuContext) -> Result<Vec<CaseResult>, String
         ew_case(ctx, BinaryOp::Mul, EwOperand::ChannelVector, Activation::None, &large, 1002)
             .await?,
     );
+    // GRU mix (a + z·(b-a)) — 홀수/큰 텐서 양쪽
+    results.push(ew_case(ctx, BinaryOp::Add, EwOperand::Mix, Activation::None, &small, 1004).await?);
+    results.push(ew_case(ctx, BinaryOp::Add, EwOperand::Mix, Activation::None, &large, 1005).await?);
     Ok(results)
 }
 
@@ -244,6 +247,25 @@ async fn ew_case(
             let b_buf = storage_in(ctx, &pack::pack_nhwc(&bvec, &bdesc));
             let bytes =
                 run_single(ctx, &spec, &params, &[&a_buf, &b_buf, &out], desc.size_bytes()).await?;
+            (want, bytes)
+        }
+        EwOperand::Mix => {
+            // out = (1-z)·a + z·b (GRU 갱신)
+            let b = rng.vec_f32(desc.elems());
+            let z = rng.vec_f32(desc.elems());
+            let want: Vec<f32> = (0..desc.elems())
+                .map(|i| act.apply(a[i] + z[i] * (b[i] - a[i])))
+                .collect();
+            let b_buf = storage_in(ctx, &pack::pack_nhwc(&b, desc));
+            let z_buf = storage_in(ctx, &pack::pack_nhwc(&z, desc));
+            let bytes = run_single(
+                ctx,
+                &spec,
+                &params,
+                &[&a_buf, &b_buf, &z_buf, &out],
+                desc.size_bytes(),
+            )
+            .await?;
             (want, bytes)
         }
     };
@@ -314,6 +336,9 @@ pub async fn run_gemm_pw(ctx: &GpuContext) -> Result<Vec<CaseResult>, String> {
         (72, 128, 16, 64),           // tiled 와이드 M
         (24, 32, 6, 10),             // tiled + 홀수 채널
         (23, 33, 8, 20),             // tiled + M%32≠0, NG%8≠0
+        (9, 16, 960, 160),           // splitk 실 RVM shape (SPLIT=8)
+        (9, 16, 240, 68),            // splitk 셀 비배수 에지 (2448 % 32 ≠ 0)
+        (11, 13, 72, 68),            // splitk 홀수 M·NG 에지
     ];
     let mut seed = 2000;
     for (h, w, cin, cout) in shapes {
@@ -324,6 +349,8 @@ pub async fn run_gemm_pw(ctx: &GpuContext) -> Result<Vec<CaseResult>, String> {
     }
     // residual 융합 (활성화 후 더하기 규약)
     results.push(pw_case(ctx, 9, 16, 32, 32, Activation::Relu, true, DType::F32, 3001).await?);
+    // splitk + residual (RVM 960→160 잔차 블록)
+    results.push(pw_case(ctx, 9, 16, 960, 160, Activation::Relu, true, DType::F32, 3003).await?);
     results
         .push(pw_case(ctx, 72, 128, 16, 16, Activation::Hardswish, true, DType::F32, 3002).await?);
     // f16 스토리지 변형 (지원 기기에서만)
@@ -564,6 +591,89 @@ async fn igemm_case(
     Ok(compare(&name, &got, &want, ATOL_F32, RTOL_F32))
 }
 
+/// concat-into-conv 융합 케이스 — 파트 텐서들을 개별 버퍼로 주고, CPU 레퍼런스는
+/// 채널 concat 후 일반 conv. 파트 시작은 4채널 정렬이어야 한다 (변환기 보장 규약).
+async fn igemm_concat_case(
+    ctx: &GpuContext,
+    ih: u32,
+    iw: u32,
+    part_cs: &[u32],
+    cout: u32,
+    k: u32,
+    act: Activation,
+    residual: bool,
+    seed: u32,
+) -> Result<CaseResult, String> {
+    use crate::kernels::conv_igemm::ConvIgemmSpec;
+    use ai_core::ops::Conv2d;
+
+    let cin: u32 = part_cs.iter().sum();
+    let p = (k - 1) / 2;
+    let op = Conv2d {
+        cin,
+        cout,
+        kh: k,
+        kw: k,
+        sh: 1,
+        sw: 1,
+        pad: [p; 4],
+        dil: 1,
+        groups: 1,
+        act,
+    };
+    let (oh, ow) = op.out_hw(ih, iw);
+    let dout = TensorDesc::new(oh, ow, cout, DType::F32);
+
+    let mut rng = XorShift32::new(seed);
+    // 파트별 데이터 + CPU 쪽은 채널 concat한 단일 입력
+    let parts: Vec<Vec<f32>> =
+        part_cs.iter().map(|c| rng.vec_f32((ih * iw * c) as usize)).collect();
+    let px = (ih * iw) as usize;
+    let mut cat = vec![0f32; px * cin as usize];
+    for pxi in 0..px {
+        let mut off = 0usize;
+        for (pv, c) in parts.iter().zip(part_cs) {
+            let c = *c as usize;
+            cat[pxi * cin as usize + off..pxi * cin as usize + off + c]
+                .copy_from_slice(&pv[pxi * c..(pxi + 1) * c]);
+            off += c;
+        }
+    }
+    let wts = rng.vec_f32((cout * cin * k * k) as usize);
+    let bias = rng.vec_f32(cout as usize);
+    let res = residual.then(|| rng.vec_f32(dout.elems()));
+    let want = reference::conv::conv2d(&op, ih, iw, &cat, &wts, Some(&bias), res.as_deref());
+
+    let mut spec = ConvIgemmSpec::from_op(&op, ih, iw, residual, DType::F32);
+    for (i, c) in part_cs.iter().enumerate() {
+        spec.srcs[i] = *c;
+    }
+    let name = spec.cache_key(&ctx.caps);
+
+    let (wbytes, _) = pack::pack_weights_conv(&wts, cout, cin, k, k, 4, DType::F32);
+    let part_bufs: Vec<wgpu::Buffer> = parts
+        .iter()
+        .zip(part_cs)
+        .map(|(pv, c)| storage_in(ctx, &pack::pack_nhwc(pv, &TensorDesc::new(ih, iw, *c, DType::F32))))
+        .collect();
+    let w_buf = storage_in(ctx, &wbytes);
+    let b_buf = storage_in(ctx, &pack::pack_bias(&bias, cout, DType::F32));
+    let out_buf = storage_out(ctx, dout.size_bytes());
+
+    let mut bufs: Vec<&wgpu::Buffer> = part_bufs.iter().collect();
+    bufs.push(&w_buf);
+    bufs.push(&b_buf);
+    let r_buf = res.as_ref().map(|r| storage_in(ctx, &pack::pack_nhwc(r, &dout)));
+    if let Some(rb) = &r_buf {
+        bufs.push(rb);
+    }
+    bufs.push(&out_buf);
+    let got_bytes = run_single(ctx, &spec, &[0u8; 16], &bufs, dout.size_bytes()).await?;
+
+    let got = pack::unpack_nhwc(&got_bytes, &dout);
+    Ok(compare(&name, &got, &want, ATOL_F32, RTOL_F32))
+}
+
 pub async fn run_conv_igemm(ctx: &GpuContext) -> Result<Vec<CaseResult>, String> {
     let mut results = Vec::new();
     let acts = [Activation::None, Activation::Relu, Activation::Hardswish];
@@ -574,6 +684,8 @@ pub async fn run_conv_igemm(ctx: &GpuContext) -> Result<Vec<CaseResult>, String>
         (40, 64, 20, 32, 3, 1),                  // tiled + C%4≠0
         (17, 23, 6, 8, 3, 2),                    // direct 소-M + 홀수
         (33, 45, 8, 12, 5, 2),                   // k5 direct
+        (9, 16, 128, 128, 3, 1),                 // splitk (RVM 심층 k3, 기아 shape)
+        (18, 32, 171, 80, 3, 1),                 // splitk 대형 K + C%4≠0
     ];
     let mut seed = 6000;
     for (ih, iw, cin, cout, k, s) in shapes {
@@ -593,6 +705,21 @@ pub async fn run_conv_igemm(ctx: &GpuContext) -> Result<Vec<CaseResult>, String>
     );
     results
         .push(igemm_case(ctx, 9, 16, 8, 8, 3, 1, [1; 4], Activation::None, true, 7003).await?);
+    // splitk + residual (RVM 심층 잔차 블록)
+    results.push(
+        igemm_case(ctx, 9, 16, 128, 128, 3, 1, [1; 4], Activation::Relu, true, 7004).await?,
+    );
+    // concat-into-conv 융합: 2파트(Direct), 3파트 홀수 꼬리(Direct), 2파트(Splitk)
+    results.push(
+        igemm_concat_case(ctx, 24, 32, &[16, 16], 24, 3, Activation::Relu, false, 7101).await?,
+    );
+    results.push(
+        igemm_concat_case(ctx, 36, 64, &[80, 24, 3], 40, 3, Activation::Hardswish, false, 7102)
+            .await?,
+    );
+    results.push(
+        igemm_concat_case(ctx, 9, 16, &[64, 64], 128, 3, Activation::Relu, true, 7103).await?,
+    );
     Ok(results)
 }
 
@@ -655,7 +782,7 @@ pub async fn run_pool_resize(ctx: &GpuContext) -> Result<Vec<CaseResult>, String
         let mut rng = XorShift32::new(seed);
         let input = rng.vec_f32(din.elems());
         let want = reference::resize::resize_bilinear(&rop, ih, iw, c, &input);
-        let spec = ResizeBilinearSpec { ih, iw, c, oh, ow, mode, dt: DType::F32 };
+        let spec = ResizeBilinearSpec { ih, iw, c, oh, ow, mode, dt: DType::F32, srcs: [0; 3] };
         let in_buf = storage_in(ctx, &pack::pack_nhwc(&input, &din));
         let out_buf = storage_out(ctx, dout.size_bytes());
         let bytes =

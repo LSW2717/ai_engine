@@ -55,8 +55,15 @@ fn rvm_full_pipeline_histogram() {
     assert_eq!(h.get("Conv").copied().unwrap_or(0), 87);
     assert!(conv_with_act >= 55, "conv act 융합이 너무 적음: {conv_with_act}");
     assert!(conv_with_res >= 6, "residual 융합이 너무 적음: {conv_with_res}");
-    // GRU 게이트의 Sub(1,z) 4개는 scalar_first
-    assert!(scalar_binaries >= 4);
+    // GRU 갱신 4체인(sub/mul/mul/add)은 mix로 융합 — Sub(1,z)가 남으면 퇴행
+    assert_eq!(h.get("mix").copied().unwrap_or(0), 4, "GRU mix 융합 실패: {h:?}");
+    let _ = scalar_binaries; // mix 융합 후 scalar Sub는 사라진다 (지표만 출력)
+    // concat-into-conv: UNet 스킵 concat 12개가 conv에 흡수 (잔여 8 = resize/pw
+    // 소비자 5 + 비정렬 fgr+pha 3 — 확장 시 이 잠금을 내릴 것)
+    assert!(
+        h.get("Concat").copied().unwrap_or(0) <= 8,
+        "concat-into-conv 융합 퇴행: {h:?}"
+    );
     // 정규화 mean/std cvec 2개
     assert!(cvec_binaries >= 2);
     // 단독 활성화가 남아도 소수여야 (elementwise Unary로 lowering)

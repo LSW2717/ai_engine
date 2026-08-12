@@ -3,7 +3,9 @@
 // SE 블록의 입구 — 출력은 M=1 벡터 텐서로 gemm_pw(small)에 바로 들어간다.
 // 슬롯: OUT_BINDING, CONSTS
 
-@group(0) @binding(1) var<storage, read> IN: array<vec4f>;
+//@TYPES
+
+@group(0) @binding(1) var<storage, read> IN: array<sv4>;
 //@OUT_BINDING
 //@CONSTS
 
@@ -14,7 +16,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
     let cg = wg.x;
     var acc = vec4f(0.0);
     for (var i = t; i < HW; i = i + 256u) {
-        acc = acc + IN[i * CG + cg];
+        acc = acc + vec4f(IN[i * CG + cg]);
     }
     sh[t] = acc;
     workgroupBarrier();
@@ -25,6 +27,6 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
         workgroupBarrier();
     }
     if (t == 0u) {
-        OUT[cg] = sh[0] * INV_HW;
+        OUT[cg] = sv4(sh[0] * INV_HW);
     }
 }
