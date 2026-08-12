@@ -1,0 +1,26 @@
+[package]
+name = "ai-gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ai-core.workspace = true
+bytemuck.workspace = true
+half.workspace = true
+thiserror.workspace = true
+log.workspace = true
+futures-channel.workspace = true
+
+# 타겟별 의존성 테이블 — feature 토글 없이 네이티브/wasm이 각자 맞는 wgpu 백엔드를 가짐
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+wgpu = { workspace = true, features = ["std", "wgsl", "metal", "vulkan", "dx12"] }
+pollster.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wgpu = { workspace = true, features = ["std", "wgsl", "webgpu"] }
+web-time.workspace = true
+
+[dev-dependencies]
+naga = { workspace = true, features = ["wgsl-in"] }
+env_logger.workspace = true

@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ai_engine WebGPU 데모</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      font-family: ui-sans-serif, system-ui, -apple-system, "Apple SD Gothic Neo", sans-serif;
+      max-width: 1080px; margin: 2rem auto; padding: 0 1rem; line-height: 1.5;
+    }
+    h1 { font-size: 1.4rem; }
+    #banner { padding: .6rem .9rem; border-radius: 8px; background: rgba(88,166,255,.12); margin: 1rem 0; }
+    #error { padding: .6rem .9rem; border-radius: 8px; background: rgba(255,88,88,.15); margin: 1rem 0; display: none; white-space: pre-wrap; }
+    button { font-size: .95rem; padding: .5rem 1rem; border-radius: 8px; border: 1px solid #8884; cursor: pointer; margin-right: .5rem; }
+    button:disabled { opacity: .5; cursor: wait; }
+    table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .85rem; }
+    th, td { border-bottom: 1px solid #8883; padding: .35rem .5rem; text-align: left; }
+    td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+    .pass { color: #2da44e; font-weight: 600; }
+    .fail { color: #d1242f; font-weight: 600; }
+    .note { font-size: .8rem; opacity: .7; }
+    code { font-family: ui-monospace, monospace; font-size: .85em; }
+  </style>
+</head>
+<body>
+  <h1>ai_engine — wgpu 커널 데모 (Phase 1)</h1>
+  <div id="error"></div>
+  <div id="banner">초기화 중…</div>
+  <p>
+    <button id="btn-tests" disabled>정확도 테스트 실행</button>
+    <button id="btn-bench" disabled>벤치마크 실행</button>
+    <button id="btn-rvm" disabled>RVM 모델 로드 + 30프레임 추론</button>
+  </p>
+  <div id="model"></div>
+  <div id="tests"></div>
+  <div id="bench"></div>
+  <p class="note">
+    정밀 GPU 타임스탬프는 <code>chrome://flags/#enable-webgpu-developer-features</code>를 켜면
+    100µs 양자화 없이 측정됩니다. 벤치는 한 패스에 10연속 디스패치를 몰아 양자화를 상쇄합니다.
+    입력은 네이티브 <code>cargo test</code>·<code>ai-bench</code>와 동일한 시드입니다.
+  </p>
+  <script type="module" src="./main.js"></script>
+</body>
+</html>

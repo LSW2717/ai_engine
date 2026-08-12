@@ -1,0 +1,16 @@
+[package]
+name = "ai-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ai-bench"
+path = "src/main.rs"
+
+[dependencies]
+ai-core.workspace = true
+ai-gpu.workspace = true
+pollster.workspace = true
+env_logger.workspace = true
+log.workspace = true

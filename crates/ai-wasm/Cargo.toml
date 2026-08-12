@@ -1,0 +1,26 @@
+[package]
+name = "ai-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+# cdylib: wasm-bindgen 산출물. rlib: 호스트에서 cargo check/test가 깨지지 않도록.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ai-core.workspace = true
+ai-gpu.workspace = true
+ai-runtime.workspace = true
+web-time.workspace = true
+wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
+js-sys.workspace = true
+serde.workspace = true
+serde-wasm-bindgen.workspace = true
+console_error_panic_hook.workspace = true
+console_log.workspace = true
+log.workspace = true
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-Os"]

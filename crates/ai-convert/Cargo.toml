@@ -1,0 +1,24 @@
+[package]
+name = "ai-convert"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ai-convert"
+path = "src/main.rs"
+
+[dependencies]
+ai-core.workspace = true
+prost.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bytemuck.workspace = true
+half.workspace = true
+thiserror.workspace = true
+log.workspace = true
+env_logger.workspace = true
+
+[build-dependencies]
+prost-build.workspace = true
+protox.workspace = true

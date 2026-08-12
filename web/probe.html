@@ -1,0 +1,63 @@
+<!doctype html>
+<!-- 디버그 프로브: wgpu를 거치지 않고 순수 JS WebGPU로 커널 생성 경로를 재현 -->
+<meta charset="utf-8" />
+<script type="module">
+const WGSL = `
+struct Params {
+    scalar: f32,
+    cg: u32,
+    _p1: u32,
+    len: u32,
+}
+
+@group(0) @binding(0) var<uniform> P: Params;
+@group(0) @binding(1) var<storage, read> A: array<vec4f>;
+@group(0) @binding(2) var<storage, read> B: array<vec4f>;
+@group(0) @binding(3) var<storage, read_write> O: array<vec4f>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= P.len) {
+        return;
+    }
+    var v = A[i] + B[i];
+    O[i] = v;
+}
+`;
+
+const log = (...a) => console.log('PROBE', ...a);
+
+const run = async () => {
+  if (!navigator.gpu) { log('no-webgpu'); return; }
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+  if (!adapter) { log('no-adapter'); return; }
+  log('adapter info:', JSON.stringify({
+    vendor: adapter.info?.vendor, architecture: adapter.info?.architecture,
+    device: adapter.info?.device, description: adapter.info?.description,
+  }));
+  log('features:', [...adapter.features].join(','));
+  const req = ['shader-f16', 'timestamp-query'].filter((f) => adapter.features.has(f));
+  const device = await adapter.requestDevice({ requiredFeatures: req });
+  device.addEventListener('uncapturederror', (e) =>
+    log('uncaptured:', e.error.constructor.name, e.error.message));
+
+  device.pushErrorScope('validation');
+  const module = device.createShaderModule({ code: WGSL });
+  const ci = await module.getCompilationInfo();
+  log('compile messages:', JSON.stringify(ci.messages.map((m) => `${m.type}: ${m.message}`)));
+  const bgl = device.createBindGroupLayout({ entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform', hasDynamicOffset: true } },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+  ]});
+  const layout = device.createPipelineLayout({ bindGroupLayouts: [bgl] });
+  const pipeline = device.createComputePipeline({ layout, compute: { module, entryPoint: 'main' } });
+  const err = await device.popErrorScope();
+  log('scope error:', err ? `${err.constructor.name}: ${err.message}` : 'none');
+  log('pipeline ok:', !!pipeline);
+  log('done');
+};
+run().catch((e) => log('exception:', String(e), e?.stack ?? ''));
+</script>

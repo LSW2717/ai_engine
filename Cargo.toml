@@ -1,0 +1,60 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/ai-core",
+    "crates/ai-gpu",
+    "crates/ai-runtime",
+    "crates/ai-convert",
+    "crates/ai-bench",
+    "crates/ai-wasm",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+# 내부 크레이트
+ai-core = { path = "crates/ai-core" }
+ai-gpu = { path = "crates/ai-gpu" }
+ai-runtime = { path = "crates/ai-runtime" }
+
+# GPU
+wgpu = { version = "30", default-features = false }
+naga = "30"
+
+# 공통
+bytemuck = { version = "1", features = ["derive"] }
+half = { version = "2", features = ["bytemuck"] }
+thiserror = "2"
+log = "0.4"
+pollster = "0.4"
+futures-channel = "0.3"
+
+# wasm 경계 (wgpu 30이 벤더링한 wasm-bindgen 버전과 일치해야 함)
+wasm-bindgen = "0.2.115"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-time = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde-wasm-bindgen = "0.6"
+prost = "0.14"
+prost-build = "0.14"
+protox = "0.9"
+console_error_panic_hook = "0.1"
+console_log = "1"
+
+# dev
+env_logger = "0.11"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+# panic = "abort" 금지: 향후 ai-ffi의 catch_unwind FFI 가드를 침묵 파괴함
+
+[profile.dev.package."*"]
+opt-level = 2
