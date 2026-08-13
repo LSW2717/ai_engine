@@ -98,7 +98,7 @@ if (/swiftshader|software|llvmpipe/i.test(renderer)) {
 }
 
 const t0 = Date.now();
-const budget = camera ? 12000 : 300000;
+const budget = camera ? (args.includes('--long') ? 90000 : 12000) : 300000;
 while (!done && Date.now() - t0 < budget) await new Promise((r) => setTimeout(r, 300));
 if (!done) console.error('[경고] 완료 신호 없이 타임아웃');
 

@@ -64,6 +64,9 @@
     <div>
       <div class="pane"><span class="tag">ai_engine (WebGPU)</span><canvas id="outA"></canvas></div>
       <div class="metrics"><span id="a-fps">– fps</span><span id="a-infer">– ms</span></div>
+      <!-- present가 그린 WebGPU 캔버스 원본. 여기가 검으면 present 자체가 실패한 것이고,
+           여기는 나오는데 위 패널이 검으면 drawImage 쪽 문제다. -->
+      <div class="metrics"><span>present 원본 →</span><span id="rawslot"></span></div>
     </div>
     <div>
       <div class="pane"><span class="tag">webgl2-engine-span</span><canvas id="outB"></canvas></div>

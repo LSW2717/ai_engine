@@ -260,7 +260,14 @@ async function main() {
     addRow('ai_engine (wgpu, fp32)', 'ERR', '-', String(e).slice(0, 300));
   }
   try {
-    say('7/7 ai_engine (.sw, 가중치 fp16) 실행 중…');
+    say('8/8 ai_engine (고정 export, 가중치 fp16) 실행 중…');
+    const r = await benchOurs('../models/rvm_fixed_fp16w.sw');
+    addRow('ai_engine (고정 export, 가중치 fp16)', r.ms, r.load, `${r.report.ops} ops`);
+  } catch (e) {
+    addRow('ai_engine (고정 export)', 'ERR', '-', String(e).slice(0, 200));
+  }
+  try {
+    say('7/8 ai_engine (.sw, 가중치 fp16) 실행 중…');
     const r = await benchOurs('../models/rvm_256x144_fp16w.sw');
     addRow('ai_engine (wgpu, 가중치 fp16)', r.ms, r.load, `${r.report.ops} ops, 블롭 절반`);
   } catch (e) {

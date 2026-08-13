@@ -248,7 +248,14 @@ pub fn attach_canvas(canvas: web_sys::HtmlCanvasElement) -> Result<(), JsValue> 
 /// 반환은 없다 — 마스크는 GPU에 머문 채 캔버스로 간다.
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
-pub async fn infer_and_present(rgb: Vec<f32>, output: String, ch: u32) -> Result<(), JsValue> {
+pub async fn infer_and_present(
+    rgb: Vec<f32>,
+    output: String,
+    ch: u32,
+    frame: web_sys::HtmlCanvasElement,
+    mode: u32,
+    bg: u32,
+) -> Result<(), JsValue> {
     let ctx = engine()?;
     let mut model = MODEL
         .with(|m| m.borrow_mut().take())
@@ -262,11 +269,25 @@ pub async fn infer_and_present(rgb: Vec<f32>, output: String, ch: u32) -> Result
         let (buf, desc) = model
             .output_storage(&output)
             .ok_or_else(|| JsValue::from_str(&format!("출력 아님: {output}")))?;
-        PRESENT.with(|c| {
+        PRESENT.with(|c| -> Result<(), JsValue> {
             let b = c.borrow();
             let p = b.as_ref().ok_or_else(|| JsValue::from_str("attach_canvas() 먼저"))?;
-            p.draw(&ctx, buf, &desc, ch).map_err(|e| JsValue::from_str(&e))
-        })
+            // 카메라 프레임을 CPU 안 거치고 GPU 텍스처로 (copy_external_image_to_texture)
+            let (fw, fh) = (frame.width(), frame.height());
+            let srcinfo = ai_gpu::wgpu::wgt::CopyExternalImageSourceInfo {
+                source: ai_gpu::wgpu::wgt::ExternalImageSource::HTMLCanvasElement(frame.clone()),
+                origin: ai_gpu::wgpu::Origin2d::ZERO,
+                flip_y: false,
+            };
+            p.upload_frame(&ctx, &srcinfo, fw, fh).map_err(|e| JsValue::from_str(&e))?;
+            p.draw(&ctx, buf, &desc, ch, mode, bg).map_err(|e| JsValue::from_str(&e))
+        })?;
+        // ⚠ 제출만 하고 안 기다리면 큐가 무한정 쌓인다. 그러면 화면은 점점 과거
+        // 프레임을 보여주고(마스크가 뒤처짐), 뒤에 도는 벤치의 wait_idle이 밀린
+        // 큐 전체를 기다려 측정값이 계속 커진다. 사파리에서 실제로 그랬다
+        // (추론 3.13 → 10.00ms 단조 증가). 프레임당 완료를 기다려 1프레임으로 묶는다.
+        ai_gpu::readback::wait_idle(&ctx).await.map_err(|e| JsValue::from_str(&e))?;
+        Ok(())
     }
     .await;
     MODEL.with(|m| *m.borrow_mut() = Some(model));

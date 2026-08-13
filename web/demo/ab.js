@@ -27,7 +27,7 @@ const say = (t, err = false) => {
 
 const outA = $('outA');
 const outB = $('outB');
-const ctxA = outA.getContext('2d');
+// outA는 WebGPU 서피스라 2D 컨텍스트를 잡지 않는다
 const ctxB = outB.getContext('2d');
 
 let stream = null;
@@ -35,7 +35,6 @@ let video = null;
 let running = false;
 let io = null;
 let small = null, smallCtx = null;
-let maskA = null, maskACtx = null, maskB = null, maskBCtx = null;
 let fgA = null, fgACtx = null, fgB = null, fgBCtx = null;
 // 프레임 스냅샷 — 마스크를 계산한 그 순간의 픽셀로 합성해야 한다.
 // 합성 때 live video를 다시 그리면 추론 시간만큼 색이 앞서가 마스크가 밀려 보인다.
@@ -43,6 +42,8 @@ let snap = null, snapCtx = null;
 let inv = null, invCtx = null; // (1-m) 임시 캔버스
 let rgbNhwc = null, rgbNchw = null;
 let wgl = null, wglRecurrent = [];
+let pendingPresent = null;
+const t0Page = performance.now();
 
 const tA = [], tB = [], tBup = [], tBrun = [], tBdown = [];
 const median = (a) => (a.length ? [...a].sort((x, y) => x - y)[a.length >> 1] : NaN);
@@ -179,23 +180,6 @@ function drawBackground(ctx, w, h) {
   }
 }
 
-function alphaToMask(pha, mctx, mcanvas) {
-  const img = mctx.createImageData(io.w, io.h);
-  const d = img.data;
-  const mask = $('showMask').checked;
-  for (let i = 0, j = 0; i < pha.length; i++, j += 4) {
-    const a = Math.max(0, Math.min(1, pha[i]));
-    if (mask) {
-      d[j] = d[j + 1] = d[j + 2] = a * 255;
-      d[j + 3] = 255;
-    } else {
-      d[j] = d[j + 1] = d[j + 2] = 255;
-      d[j + 3] = a * 255;
-    }
-  }
-  mctx.putImageData(img, 0, 0);
-  return mcanvas;
-}
 
 // 마스크 업스케일 품질. 알파는 모델 해상도(256×144)라 표시 해상도로 5배 확대된다.
 // 캔버스 기본 보간은 'low'라 계단이 그대로 남는다 — 'high'로 올리고 확대 배율에
@@ -217,6 +201,17 @@ function drawMaskScaled(ctx, mcanvas, w, h) {
 //   bg층 = 배경 × (1-m)      ((1-m)은 흰색과 difference로 만든다)
 //   합    = fg층 + bg층      (lighter)
 // 전부 캔버스 GPU 합성이라 리드백이 없다.
+// 합성용 캔버스는 **일반 canvas 엘리먼트**를 쓴다 (OffscreenCanvas 아님).
+// 사파리는 OffscreenCanvas 2D의 블렌드 모드/외부 캔버스 drawImage에 구멍이 있어
+// multiply·difference가 조용히 어긋난다 — 마스크만 보기(일반 캔버스)는 멀쩡한데
+// 합성만 깨지는 증상이 정확히 그것이었다.
+function mkCanvas(w, h) {
+  const c = document.createElement('canvas');
+  c.width = w;
+  c.height = h;
+  return c;
+}
+
 function composite(ctx, mcanvas, fgCanvas, fgCtx, w, h) {
   if ($('showMask').checked) {
     ctx.clearRect(0, 0, w, h);
@@ -267,14 +262,28 @@ async function frame() {
     rgbNchw[i] = r; rgbNchw[plane + i] = g; rgbNchw[2 * plane + i] = b; // 플래너
   }
 
-  // 2) ai_engine — 마스크를 GPU에 둔 채 캔버스에 바로 그린다 (리드백 없음)
+  // 2) ai_engine — GPU에 둔 채 캔버스로 (리드백 없음). 실패하면 리드백 경로로 폴백한다.
+  // 브라우저마다 프래그먼트 스토리지 버퍼·서피스 알파 지원이 달라서, present가
+  // 안 되는 환경(사파리 등)에서도 데모는 돌아가야 한다. 한 번 실패로 루프를
+  // 죽이면 안 된다 — 실제로 그렇게 만들어서 "1프레임 후 정지"를 겪었다.
+  const bgMode = { gradient: 0, black: 1, blur: 2 }[$('bg').value] ?? 0;
   const ta0 = performance.now();
   try {
-    await infer_and_present(rgbNhwc, 'pha', 0);
+    // ⚠ 모델은 한 번에 하나만 쓸 수 있다 (wasm 쪽에서 꺼냈다 돌려놓는 구조).
+    // 두 프레임을 겹쳐 제출하면 "모델 미로드"가 난다 — 실제로 그렇게 만들었었다.
+    // 그래서 **직전 프레임을 먼저 기다린 뒤** 제출한다. 위의 CPU 준비 작업
+    // (캔버스 축소·픽셀 변환)은 이미 GPU가 직전 프레임을 도는 동안 끝나 있다.
+    if (pendingPresent) {
+      const p0 = pendingPresent;
+      pendingPresent = null;
+      await p0;
+    }
+    pendingPresent = infer_and_present(
+      rgbNhwc, 'pha', 0, snap, $('showMask').checked ? 1 : 0, bgMode);
   } catch (e) {
-    running = false;
-    say(`ai_engine 추론 실패: ${e}`, true);
-    return;
+    console.error(`[demo] present 실패: ${e}`);
+    say(`present 실패: ${e}`, true);
+    pendingPresent = null;
   }
   push(tA, performance.now() - ta0);
 
@@ -291,7 +300,7 @@ async function frame() {
   push(tBrun, tRun - tUp);
 
   // 4) 합성 — 마스크 소스는 각 엔진이 GPU에서 그린 캔버스 그대로
-  composite(ctxA, maskA, fgA, fgACtx, w, h);
+  // ai_engine 패널은 셰이더가 직접 그렸다 — 캔버스 합성 없음.
   composite(ctxB, wgl.gl.canvas, fgB, fgBCtx, w, h);
 
   fps++;
@@ -347,25 +356,61 @@ async function start() {
 
     const vw = video.videoWidth || 1280, vh = video.videoHeight || 720;
     for (const c of [outA, outB]) { c.width = vw; c.height = vh; }
-    snap = new OffscreenCanvas(vw, vh); snapCtx = snap.getContext('2d');
-    inv = new OffscreenCanvas(vw, vh); invCtx = inv.getContext('2d');
-    fgA = new OffscreenCanvas(vw, vh); fgACtx = fgA.getContext('2d');
-    fgB = new OffscreenCanvas(vw, vh); fgBCtx = fgB.getContext('2d');
+    // present 서피스는 캔버스 크기 기준으로 구성되므로 크기를 먼저 확정한다
+    snap = mkCanvas(vw, vh); snapCtx = snap.getContext('2d');
+    inv = mkCanvas(vw, vh); invCtx = inv.getContext('2d');
+    fgA = mkCanvas(vw, vh); fgACtx = fgA.getContext('2d');
+    fgB = mkCanvas(vw, vh); fgBCtx = fgB.getContext('2d');
 
     say('ai_engine 모델 로드 중…');
     await loadOurs();
     say('webgl2 엔진 로드 중…');
     await loadWebgl2();
 
-    small = new OffscreenCanvas(io.w, io.h);
+    small = mkCanvas(io.w, io.h);
     smallCtx = small.getContext('2d', { willReadFrequently: true });
     // 우리 마스크는 WebGPU 서피스 캔버스에 직접 그려진다 (OffscreenCanvas 아님)
-    maskA = document.createElement('canvas');
-    maskA.width = io.w; maskA.height = io.h;
-    attach_canvas(maskA);
+    // ⚠ 합성은 **셰이더 안에서** 끝낸다. 캔버스 2D 블렌드(multiply/difference/lighter)는
+    // 브라우저마다 결과가 달라서 사파리에서 합성만 깨졌다. outA 자체가 WebGPU
+    // 서피스이고, 셰이더가 배경·전경·마스크를 합쳐 최종 화면을 그린다.
+    try {
+      attach_canvas(outA);
+    } catch (e) {
+      console.error(`[demo] attach_canvas 실패: ${e}`);
+      say(`present 초기화 실패: ${e}`, true);
+      throw e;
+    }
     wglPresent = makeWglPresent(wgl.gl, io.w, io.h);
     rgbNhwc = new Float32Array(io.h * io.w * 3);
     rgbNchw = new Float32Array(io.h * io.w * 3);
+
+    // 시작 시 한 번은 **리드백으로** 알파를 꺼내 통계를 찍는다.
+    // "추론이 0인가 / present가 0을 그리는가"를 가르는 유일한 방법이다.
+    try {
+      smallCtx.drawImage(video, 0, 0, io.w, io.h);
+      const px0 = smallCtx.getImageData(0, 0, io.w, io.h).data;
+      for (let p2 = 0, q = 0; p2 < px0.length; p2 += 4, q += 3) {
+        rgbNhwc[q] = px0[p2] / 255;
+        rgbNhwc[q + 1] = px0[p2 + 1] / 255;
+        rgbNhwc[q + 2] = px0[p2 + 2] / 255;
+      }
+      const pha0 = await infer_frame(rgbNhwc, 'pha');
+      let mn = 1e9, mx = -1e9, sum = 0;
+      for (let i = 0; i < pha0.length; i++) {
+        mn = Math.min(mn, pha0[i]); mx = Math.max(mx, pha0[i]); sum += pha0[i];
+      }
+      console.log(
+        `AI_ENGINE_RESULT: 진단 pha n=${pha0.length} min=${mn.toFixed(4)} ` +
+          `max=${mx.toFixed(4)} mean=${(sum / pha0.length).toFixed(4)}`
+      );
+    } catch (e) {
+      console.error(`[demo] 시작 진단 실패: ${e}`);
+    }
+    // ?readback=1 이면 present를 끄고 리드백 경로로만 돈다 (원인 격리용)
+    if (new URLSearchParams(location.search).has('readback')) {
+      usePresent = false;
+      console.log('[demo] readback 모드 — present 사용 안 함');
+    }
 
     say(`실행 중 — ${io.w}×${io.h}, 두 엔진 동일 입력`);
     running = true;
@@ -407,6 +452,9 @@ let gpuMsA = NaN, gpuMsB = NaN;
 // 비교하려면 둘 다 마지막에 한 번 동기화하는 같은 방법론으로 재야 한다.
 async function autoBench() {
   try {
+    // 모델은 한 번에 하나만 쓸 수 있다 — in-flight 프레임을 먼저 비운다.
+    // 안 그러면 bench_current가 "모델 미로드"로 실패해 값이 NaN이 된다.
+    if (pendingPresent) { await pendingPresent; pendingPresent = null; }
     if (autoTurn === 0) {
       gpuMsA = await bench_current(AUTO_FRAMES);
     } else {
@@ -416,6 +464,11 @@ async function autoBench() {
       wgl.gl.finish();
       gpuMsB = (performance.now() - t0) / AUTO_FRAMES;
     }
+    console.log(
+      `AI_ENGINE_RESULT: bench t=${((performance.now() - t0Page) / 1000).toFixed(1)}s ` +
+        `${autoTurn === 0 ? 'ours' : 'webgl2'} ` +
+        `${(autoTurn === 0 ? gpuMsA : gpuMsB).toFixed(2)}ms`
+    );
     autoTurn ^= 1;
   } catch (_) { /* 측정 실패는 무시 — 표시만 안 갱신 */ }
 }
@@ -428,6 +481,7 @@ async function runBench() {
   const wasRunning = running;
   running = false;                       // 프레임 루프 정지 (측정 오염 방지)
   await new Promise((r) => setTimeout(r, 120));
+  if (pendingPresent) { await pendingPresent; pendingPresent = null; }
   $('benchout').textContent = '측정 중…';
   try {
     // ai_engine — 내부에서 워밍업 3 + N프레임 + wait_idle 1회

@@ -57,9 +57,12 @@ async function loadSelectedModel() {
   $('s-ops').textContent = `${report.ops} / ${report.unique_pipelines}`;
 
   // 모델 해상도에 맞춘 작업 캔버스들
-  small = new OffscreenCanvas(io.w, io.h);
+  // 일반 canvas 엘리먼트 사용 — 사파리 OffscreenCanvas 2D 블렌드 구멍 회피
+  small = document.createElement('canvas');
+  small.width = io.w; small.height = io.h;
   smallCtx = small.getContext('2d', { willReadFrequently: true });
-  maskCanvas = new OffscreenCanvas(io.w, io.h);
+  maskCanvas = document.createElement('canvas');
+  maskCanvas.width = io.w; maskCanvas.height = io.h;
   maskCtx = maskCanvas.getContext('2d');
   rgbBuf = new Float32Array(io.h * io.w * io.c);
   inferTimes.length = 0;
@@ -138,8 +141,10 @@ async function frame() {
   try {
     pha = await infer_frame(rgbBuf, pickAlphaOutput());
   } catch (e) {
-    running = false;
+    // 한 프레임 실패로 루프를 죽이지 않는다 — 다음 프레임에 회복될 수 있다
+    console.error(`[demo] 추론 실패: ${e}`);
     say(`추론 실패: ${e}`, true);
+    setTimeout(() => requestAnimationFrame(frame), 200);
     return;
   }
   const inferMs = performance.now() - t0;
@@ -231,9 +236,11 @@ async function start() {
     const vh = video.videoHeight || 720;
     out.width = vw;
     out.height = vh;
-    bgCanvas = new OffscreenCanvas(vw, vh);
+    bgCanvas = document.createElement('canvas');
+    bgCanvas.width = vw; bgCanvas.height = vh;
     bgCtx = bgCanvas.getContext('2d');
-    snap = new OffscreenCanvas(vw, vh);
+    snap = document.createElement('canvas');
+    snap.width = vw; snap.height = vh;
     snapCtx = snap.getContext('2d');
 
     await loadSelectedModel();
