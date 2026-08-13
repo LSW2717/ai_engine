@@ -97,7 +97,8 @@ impl Model {
             }
         };
         for op in &sw.ops {
-            let lo = lowering::lower_op(&sw, op, &map)?;
+            // lowering이 흡수한 뷰는 백킹 tid로 바인딩돼 나오므로 ensure_view가 그냥 지나간다
+            let lo = lowering::lower_op(&sw, op, &map, &views)?;
             for b in &lo.bindings {
                 if let RtBinding::Tensor(t) = b {
                     ensure_view(&mut lowered, &mut materialized, *t);
@@ -107,6 +108,27 @@ impl Model {
         }
         for &out in &sw.outputs {
             ensure_view(&mut lowered, &mut materialized, map(out));
+        }
+        // AI_RT_DUMP_OPS=1: lowering 결과(라벨+바인딩 tid)를 그대로 찍는다.
+        // "이 op이 뷰를 흡수했나 실체화 버퍼를 읽나"를 추측 말고 확인하기 위한 것.
+        #[cfg(not(target_arch = "wasm32"))]
+        if std::env::var("AI_RT_DUMP_OPS").is_ok() {
+            for (i, lo) in lowered.iter().enumerate() {
+                let b: Vec<String> = lo
+                    .bindings
+                    .iter()
+                    .map(|x| match x {
+                        RtBinding::Tensor(t) => format!("t{t}"),
+                        RtBinding::Weights(w) => format!("w@{}", w.off),
+                    })
+                    .collect();
+                eprintln!(
+                    "LOWERED[{i}] {} | {} | key={}",
+                    lo.label,
+                    b.join(" "),
+                    lo.spec.cache_key(&ctx.caps)
+                );
+            }
         }
 
         // liveness 슬롯 배정
@@ -414,6 +436,16 @@ impl Model {
             .map_err(RuntimeError::Gpu)?
             .remove(0);
         Ok(pack::unpack_nhwc(&bytes, &desc_of(&self.sw, *tid)))
+    }
+
+    /// 출력 텐서가 실제로 들어있는 **스토리지 버퍼**와 desc.
+    /// 리드백 없이 GPU에서 바로 그리려면(present) 이게 필요하다 —
+    /// out_staging의 버퍼는 MAP_READ라 셰이더에 바인딩할 수 없다.
+    pub fn output_storage(&self, name: &str) -> Option<(&wgpu::Buffer, TensorDesc)> {
+        let (tid, _, _) = self.out_staging.iter().find(|(_, n, _)| n == name)?;
+        // pha 같은 그래프 출력은 상태 텐서가 아니라 parity와 무관하다
+        let slot = self.resolve_slot_rt(*tid, 0);
+        Some((&self.buffers[slot], desc_of(&self.sw, *tid)))
     }
 
     pub fn op_labels(&self) -> &[String] {

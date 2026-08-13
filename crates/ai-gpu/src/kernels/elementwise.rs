@@ -10,6 +10,7 @@ use ai_core::{Activation, DType};
 use crate::context::DeviceCaps;
 use crate::kernel::{KernelSpec, StorageDir};
 use crate::kernels::common::activation::act_expr;
+use crate::kernels::common::source::{self, SrcView};
 use crate::kernels::common::writer::fill;
 use crate::kernels::common::sv4_alias;
 
@@ -39,6 +40,30 @@ pub struct ElementwiseSpec {
     /// 총 vec4 수 — 디스패치 계산에만 쓰이고 캐시 키/WGSL에는 안 들어감
     pub len_vec4: u32,
     pub dt: DType,
+    /// 피연산자 A/B/Z가 백킹 텐서의 채널 구간(뷰)일 때의 재매핑. 전부 NONE이면
+    /// 평범한 스트림 연산 그대로 (`A[i]`), 뷰가 있으면 그 피연산자만 인덱스를 푼다.
+    pub views: [SrcView; 3],
+    /// 출력 텐서의 채널그룹 수 — 뷰가 있을 때만 인덱스 분해에 쓰인다
+    pub out_cg: u32,
+}
+
+impl ElementwiseSpec {
+    /// 뷰 없는 평범한 스트림 연산
+    pub fn plain(op: BinaryOp, operand: EwOperand, act: Activation, len_vec4: u32, dt: DType) -> Self {
+        Self { op, operand, act, len_vec4, dt, views: [SrcView::NONE; 3], out_cg: 0 }
+    }
+
+    /// 피연산자 슬롯 하나의 읽기 식. 뷰가 아니면 `NAME[i]`,
+    /// 뷰면 행(pix)을 백킹 stride로 다시 잡는다.
+    fn read(&self, name: &str, slot: usize) -> String {
+        let v = self.views[slot];
+        if !v.is_offset() {
+            return format!("{name}[i]");
+        }
+        let (cg, stride, off) = (self.out_cg, v.stride_cg(), v.off_cg());
+        debug_assert!(cg > 0, "뷰 피연산자는 out_cg가 필요하다");
+        format!("{name}[(i / {cg}u) * {stride}u + {off}u + i % {cg}u]")
+    }
 }
 
 impl KernelSpec for ElementwiseSpec {
@@ -51,7 +76,18 @@ impl KernelSpec for ElementwiseSpec {
             EwOperand::Unary => "u",
             EwOperand::Mix => "mix",
         };
-        format!("ew op={} mode={mode} act={} dt={}", self.op.tag(), self.act.tag(), self.dt.tag())
+        format!(
+            "ew op={} mode={mode} act={} dt={}{}",
+            self.op.tag(),
+            self.act.tag(),
+            self.dt.tag(),
+            // 뷰가 있으면 인덱스 식이 달라지므로 out_cg까지 키에 들어가야 한다
+            if self.views.iter().any(|v| v.is_offset()) {
+                format!("{} cg{}", source::key_of(&self.views), self.out_cg)
+            } else {
+                String::new()
+            }
+        )
     }
 
     fn wgsl(&self, _caps: &DeviceCaps) -> String {
@@ -68,19 +104,21 @@ impl KernelSpec for ElementwiseSpec {
                 .to_string(),
         };
         let o = self.op.wgsl_op();
+        let (a, b, z) = (self.read("A", 0), self.read("B", 1), self.read("Z", 2));
         let mut body = match self.operand {
-            EwOperand::Tensor => format!("var v = vec4f(A[i]) {o} vec4f(B[i]);\n"),
+            EwOperand::Tensor => format!("var v = vec4f({a}) {o} vec4f({b});\n"),
             EwOperand::Scalar { scalar_first } => {
                 let s = "vec4f(P.scalar)";
                 if scalar_first {
-                    format!("var v = {s} {o} vec4f(A[i]);\n")
+                    format!("var v = {s} {o} vec4f({a});\n")
                 } else {
-                    format!("var v = vec4f(A[i]) {o} {s};\n")
+                    format!("var v = vec4f({a}) {o} {s};\n")
                 }
             }
-            EwOperand::ChannelVector => format!("var v = vec4f(A[i]) {o} vec4f(B[i % P.cg]);\n"),
-            EwOperand::Unary => "var v = vec4f(A[i]);\n".to_string(),
-            EwOperand::Mix => "var v = mix(vec4f(A[i]), vec4f(B[i]), vec4f(Z[i]));\n".to_string(),
+            // 채널 벡터 B는 [1,1,C]라 뷰 대상이 아니다 (재매핑 없음)
+            EwOperand::ChannelVector => format!("var v = vec4f({a}) {o} vec4f(B[i % P.cg]);\n"),
+            EwOperand::Unary => format!("var v = vec4f({a});\n"),
+            EwOperand::Mix => format!("var v = mix(vec4f({a}), vec4f({b}), vec4f({z}));\n"),
         };
         if self.act != Activation::None {
             body.push_str(&format!("v = {};\n", act_expr(self.act, "v")));
@@ -128,9 +166,15 @@ mod tests {
         for op in [BinaryOp::Add, BinaryOp::Sub, BinaryOp::Mul] {
             for operand in operands {
                 for act in ALL {
-                    let spec =
-                        ElementwiseSpec { op, operand, act, len_vec4: 1024, dt: DType::F32 };
+                    let spec = ElementwiseSpec::plain(op, operand, act, 1024, DType::F32);
                     validate_wgsl(&spec.wgsl(&caps));
+                    // 뷰 피연산자 변형: A/B/Z 전부 백킹의 채널 구간
+                    let viewed = ElementwiseSpec {
+                        views: [SrcView::view(16, 48, 16); 3],
+                        out_cg: 4,
+                        ..spec
+                    };
+                    validate_wgsl(&viewed.wgsl(&caps));
                 }
             }
         }

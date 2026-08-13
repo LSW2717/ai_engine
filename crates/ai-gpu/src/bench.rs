@@ -122,14 +122,23 @@ pub async fn bench_kernel(
     let wall_total = wall_t0.elapsed().as_secs_f64() * 1e3;
     let wall_ms = wall_total / (MEASURES * DISPATCHES_PER_PASS) as f64;
 
-    let (gpu_min_ms, gpu_median_ms) = if let Some(p) = &profiler {
-        let mut per_pass = p.read_ms(ctx, MEASURES).await?;
-        per_pass.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let min = per_pass[0] / DISPATCHES_PER_PASS as f64;
-        let med = per_pass[per_pass.len() / 2] / DISPATCHES_PER_PASS as f64;
-        (Some(min), Some(med))
-    } else {
-        (None, None)
+    // 일부 기기(Apple Silicon)는 TIMESTAMP_QUERY를 광고하면서도 컴퓨트 패스 경계
+    // 샘플링을 하지 않아 begin==end로 전부 0이 돌아온다. 전부 0이면 없는 것으로 보고
+    // wall-clock 폴백 — 0을 그대로 쓰면 "0µs, inf GFLOP/s"라는 침묵의 오답이 된다.
+    let (gpu_min_ms, gpu_median_ms) = match &profiler {
+        Some(p) => {
+            let mut per_pass = p.read_ms(ctx, MEASURES).await?;
+            per_pass.retain(|v| *v > 0.0);
+            per_pass.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            if per_pass.is_empty() {
+                (None, None)
+            } else {
+                let min = per_pass[0] / DISPATCHES_PER_PASS as f64;
+                let med = per_pass[per_pass.len() / 2] / DISPATCHES_PER_PASS as f64;
+                (Some(min), Some(med))
+            }
+        }
+        None => (None, None),
     };
 
     let basis_ms = gpu_min_ms.unwrap_or(wall_ms);
@@ -172,8 +181,7 @@ pub async fn run_benchmarks(ctx: &GpuContext) -> Result<Vec<BenchResult>, String
             ng: dout.cg(),
             act: Activation::Relu,
             residual: false,
-            dt,
-        };
+            dt, wdt: dt };
         let wts = XorShift32::new(seed).vec_f32((cout * cin) as usize);
         let (wb, _) = pack::pack_weights_conv(&wts, cout, cin, 1, 1, 4, dt);
         let bias = vec![0f32; cout as usize];
@@ -261,8 +269,7 @@ pub async fn run_benchmarks(ctx: &GpuContext) -> Result<Vec<BenchResult>, String
                 ng: dout.cg(),
                 act: Activation::Relu,
                 residual: false,
-                dt: dt16,
-            };
+                dt: dt16, wdt: dt };
             let wts = XorShift32::new(71).vec_f32((cout * cin) as usize);
             let (wb, _) = pack::pack_weights_conv(&wts, cout, cin, 1, 1, 4, dt16);
             let bias = vec![0f32; cout as usize];
@@ -320,7 +327,7 @@ pub async fn run_benchmarks(ctx: &GpuContext) -> Result<Vec<BenchResult>, String
         let din = TensorDesc::new(ih, iw, c, dt);
         let dout = TensorDesc::new(oh, ow, c, dt);
         let spec =
-            ResizeBilinearSpec { ih, iw, c, oh, ow, mode: CoordMode::HalfPixel, dt, srcs: [0; 3] };
+            ResizeBilinearSpec { ih, iw, c, oh, ow, mode: CoordMode::HalfPixel, dt, srcs: [crate::kernels::common::source::SrcView::NONE; 3] };
         let bufs = [filled(ctx, &din, seed), storage_out(ctx, dout.size_bytes())];
         let flops = 8.0 * (oh * ow * c) as f64;
         out.push(
@@ -337,6 +344,8 @@ pub async fn run_benchmarks(ctx: &GpuContext) -> Result<Vec<BenchResult>, String
             act: Activation::None,
             len_vec4: desc.vec4_len() as u32,
             dt,
+            views: [crate::kernels::common::source::SrcView::NONE; 3],
+            out_cg: 0,
         };
         let bufs = [
             filled(ctx, &desc, seed),

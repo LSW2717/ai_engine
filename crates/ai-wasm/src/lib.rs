@@ -10,6 +10,11 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use ai_gpu::GpuContext;
+// 캔버스 서피스는 wasm32 타깃에만 있다 (SurfaceTarget::Canvas가 cfg 게이트됨).
+// 게이트하지 않으면 `cargo test --workspace`(네이티브)가 깨진다.
+#[cfg(target_arch = "wasm32")]
+mod present;
+
 use wasm_bindgen::prelude::*;
 
 thread_local! {
@@ -165,6 +170,133 @@ pub async fn model_bench(frames: u32) -> Result<JsValue, JsValue> {
     MODEL.with(|m| *m.borrow_mut() = Some(model));
     let bench = result?;
     serde_wasm_bindgen::to_value(&bench).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+#[derive(serde::Serialize)]
+struct JsFrameInfo {
+    h: u32,
+    w: u32,
+    c: u32,
+    input: String,
+    outputs: Vec<String>,
+}
+
+/// 로드된 모델의 입력 크기·이름 (호스트가 프레임을 어떤 크기로 만들지 알아야 한다)
+#[wasm_bindgen]
+pub fn model_io() -> Result<JsValue, JsValue> {
+    MODEL.with(|m| {
+        let b = m.borrow();
+        let model = b.as_ref().ok_or_else(|| JsValue::from_str("모델 미로드"))?;
+        let t = &model.sw.tensors[model.sw.inputs[0] as usize];
+        let info = JsFrameInfo {
+            h: t.h,
+            w: t.w,
+            c: t.c,
+            input: t.name.clone(),
+            outputs: model
+                .sw
+                .outputs
+                .iter()
+                .map(|&o| model.sw.tensors[o as usize].name.clone())
+                .collect(),
+        };
+        serde_wasm_bindgen::to_value(&info).map_err(|e| JsValue::from_str(&e.to_string()))
+    })
+}
+
+/// 프레임 1장 추론: 논리 NHWC(h*w*c, [0,1] RGB) 입력 → 지정 출력을 논리 NHWC로 반환.
+/// 업로드·추론·리드백을 한 번에 도는 이유는 JS 왕복(=await 경계)을 최소화하기 위해서다.
+/// 순환 상태는 엔진이 프레임 간 GPU 상주로 유지한다 — 호출자는 신경 쓸 필요 없다.
+#[wasm_bindgen]
+pub async fn infer_frame(rgb: Vec<f32>, output: String) -> Result<Vec<f32>, JsValue> {
+    let ctx = engine()?;
+    let mut model = MODEL
+        .with(|m| m.borrow_mut().take())
+        .ok_or_else(|| JsValue::from_str("모델 미로드"))?;
+
+    let result: Result<Vec<f32>, JsValue> = async {
+        let in_name = model.sw.tensors[model.sw.inputs[0] as usize].name.clone();
+        model
+            .upload_input(&ctx, &in_name, &rgb)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        model.infer(&ctx).await.map_err(|e| JsValue::from_str(&e.to_string()))?;
+        model.read_output(&ctx, &output).await.map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+    .await;
+
+    MODEL.with(|m| *m.borrow_mut() = Some(model));
+    result
+}
+
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static PRESENT: std::cell::RefCell<Option<present::Presenter>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// 출력 마스크를 그릴 캔버스를 붙인다 (WebGPU 서피스). 캔버스 크기는 모델 출력 크기로.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn attach_canvas(canvas: web_sys::HtmlCanvasElement) -> Result<(), JsValue> {
+    let ctx = engine()?;
+    let p = present::Presenter::new(&ctx, canvas).map_err(|e| JsValue::from_str(&e))?;
+    PRESENT.with(|c| *c.borrow_mut() = Some(p));
+    Ok(())
+}
+
+/// 프레임 추론 후 지정 출력을 **리드백 없이** 캔버스에 바로 그린다.
+/// 반환은 없다 — 마스크는 GPU에 머문 채 캔버스로 간다.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub async fn infer_and_present(rgb: Vec<f32>, output: String, ch: u32) -> Result<(), JsValue> {
+    let ctx = engine()?;
+    let mut model = MODEL
+        .with(|m| m.borrow_mut().take())
+        .ok_or_else(|| JsValue::from_str("모델 미로드"))?;
+    let result: Result<(), JsValue> = async {
+        let in_name = model.sw.tensors[model.sw.inputs[0] as usize].name.clone();
+        model
+            .upload_input(&ctx, &in_name, &rgb)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        model.infer(&ctx).await.map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let (buf, desc) = model
+            .output_storage(&output)
+            .ok_or_else(|| JsValue::from_str(&format!("출력 아님: {output}")))?;
+        PRESENT.with(|c| {
+            let b = c.borrow();
+            let p = b.as_ref().ok_or_else(|| JsValue::from_str("attach_canvas() 먼저"))?;
+            p.draw(&ctx, buf, &desc, ch).map_err(|e| JsValue::from_str(&e))
+        })
+    }
+    .await;
+    MODEL.with(|m| *m.borrow_mut() = Some(model));
+    result
+}
+
+/// 지금 올라가 있는 입력 그대로 N프레임 실행하고 **마지막에 한 번만** 동기화한다.
+/// `model_bench`와 달리 입력을 시드 난수로 덮지 않아 라이브 데모 중에도 부를 수 있다.
+/// 반환 = ms/frame. 상태 순환이 프레임 간 의존을 만들어 실제로 직렬 실행된다.
+#[wasm_bindgen]
+pub async fn bench_current(frames: u32) -> Result<f64, JsValue> {
+    let ctx = engine()?;
+    let mut model = MODEL
+        .with(|m| m.borrow_mut().take())
+        .ok_or_else(|| JsValue::from_str("모델 미로드"))?;
+    let result: Result<f64, JsValue> = async {
+        for _ in 0..2 {
+            model.infer(&ctx).await.map_err(|e| JsValue::from_str(&e.to_string()))?;
+        }
+        ai_gpu::readback::wait_idle(&ctx).await.map_err(|e| JsValue::from_str(&e))?;
+        let t0 = web_time::Instant::now();
+        for _ in 0..frames {
+            model.infer(&ctx).await.map_err(|e| JsValue::from_str(&e.to_string()))?;
+        }
+        ai_gpu::readback::wait_idle(&ctx).await.map_err(|e| JsValue::from_str(&e))?;
+        Ok(t0.elapsed().as_secs_f64() * 1e3 / frames.max(1) as f64)
+    }
+    .await;
+    MODEL.with(|m| *m.borrow_mut() = Some(model));
+    result
 }
 
 /// 공유 벤치마크 실행 — 네이티브 ai-bench와 동일 루틴

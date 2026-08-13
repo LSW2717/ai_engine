@@ -23,9 +23,11 @@ fn filled(ctx: &GpuContext, desc: &TensorDesc, seed: u32) -> ai_gpu::wgpu::Buffe
 fn report(tag: &str, n: u32, r: &ai_gpu::bench::BenchResult) {
     let us = r.gpu_min_ms.unwrap_or(r.wall_ms) * 1e3;
     println!(
-        "{n}x {tag:<44} {us:8.1}us  (x{n} = {:8.1}us)  {:7.1} GFLOP/s",
+        "{n}x {tag:<44} {us:8.1}us  (x{n} = {:8.1}us)  {:7.1} GFLOP/s  [wall {:.1}us gpu {:?}]",
         us * n as f64,
-        r.gflops
+        r.gflops,
+        r.wall_ms * 1e3,
+        r.gpu_min_ms
     );
 }
 
@@ -114,6 +116,7 @@ fn bench_rvm_hot() {
             act: Activation::Relu,
             residual: false,
             dt,
+            wdt: dt,
         };
         let wts = XorShift32::new(3).vec_f32((cout * cin) as usize);
         let (wb, _) = pack::pack_weights_conv(&wts, cout, cin, 1, 1, 4, dt);

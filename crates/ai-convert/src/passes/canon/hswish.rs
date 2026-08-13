@@ -10,6 +10,11 @@ const ALPHA_SIXTH: f32 = 1.0 / 6.0;
 
 pub fn run(g: &mut Graph, _ctx: &Ctx) -> Result<PassReport, ConvertError> {
     let mut report = PassReport::default();
+    // opset 14+ export는 HardSwish 단일 op — 내부 이름으로 직행
+    for n in g.nodes.iter_mut().filter(|n| !n.dead && n.op == "HardSwish") {
+        n.op = "hswish".into();
+        report.rewrites += 1;
+    }
     for idx in 0..g.nodes.len() {
         if g.nodes[idx].dead || g.nodes[idx].op != "Mul" {
             continue;

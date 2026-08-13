@@ -15,7 +15,7 @@ use ai_core::{Activation, DType};
 use crate::context::DeviceCaps;
 use crate::kernel::{KernelSpec, StorageDir};
 use crate::kernels::common::writer::fill;
-use crate::kernels::common::{epilogue, gemm_tile, sv4_alias};
+use crate::kernels::common::{epilogue, gemm_tile, type_aliases};
 
 const TEMPLATE_TILED: &str = include_str!("shaders/gemm_pw_tiled.wgsl");
 const TEMPLATE_SMALL: &str = include_str!("shaders/gemm_pw_small.wgsl");
@@ -93,7 +93,10 @@ pub struct GemmPwSpec {
     pub ng: u32,
     pub act: Activation,
     pub residual: bool,
+    /// 활성화 스토리지 dtype
     pub dt: DType,
+    /// 가중치 스토리지 dtype — 활성화와 독립 (conv_igemm과 같은 규약)
+    pub wdt: DType,
 }
 
 impl GemmPwSpec {
@@ -106,13 +109,14 @@ impl GemmPwSpec {
 impl KernelSpec for GemmPwSpec {
     fn cache_key(&self, _caps: &DeviceCaps) -> String {
         format!(
-            "gemm_pw v={:?} M{} KG{} NG{} {} dt={}",
+            "gemm_pw v={:?} M{} KG{} NG{} {} dt={}/w{}",
             self.variant(),
             self.m,
             self.kg,
             self.ng,
             epilogue::key_fragment(true, self.act, self.residual),
-            self.dt.tag()
+            self.dt.tag(),
+            self.wdt.tag()
         )
     }
 
@@ -124,7 +128,7 @@ impl KernelSpec for GemmPwSpec {
         );
         let (res_b, out_b) = gemm_tile::binding_slots(self.residual);
 
-        let types = sv4_alias(self.dt);
+        let types = type_aliases(self.dt, self.wdt);
 
         match self.variant() {
             GemmVariant::Small => {
@@ -266,8 +270,13 @@ mod tests {
         ] {
             for act in ALL {
                 for residual in [false, true] {
-                    for dt in [DType::F32, DType::F16] {
-                        let spec = GemmPwSpec { m, kg, ng, act, residual, dt };
+                    // (활성화, 가중치) 정밀도 조합 — 혼합(f32 활성/f16 가중치) 포함
+                    for (dt, wdt) in [
+                        (DType::F32, DType::F32),
+                        (DType::F32, DType::F16),
+                        (DType::F16, DType::F16),
+                    ] {
+                        let spec = GemmPwSpec { m, kg, ng, act, residual, dt, wdt };
                         validate_wgsl(&spec.wgsl(&caps));
                     }
                 }

@@ -12,7 +12,7 @@ pub struct Opts {
 }
 
 pub fn usage() -> &'static str {
-    "사용법: ai-convert <input.onnx> -o <out.sw> [--size WxH] [--fp16]\n  \
+    "사용법: ai-convert <input.onnx> -o <out.sw> [--size WxH] [--fp16] [--fp16-weights]\n  \
      [--set-input NAME=FLOAT]... [--state IN=OUT]... [--name NAME]\n  \
      [--summary] [--dump-json]"
 }
@@ -51,6 +51,7 @@ pub fn parse(args: &[String]) -> Result<Opts, String> {
                 opts.ctx.states.push((i.to_string(), o.to_string()));
             }
             "--fp16" => opts.ctx.fp16 = true,
+            "--fp16-weights" => opts.ctx.fp16_weights = true,
             "--strip-refiner" => opts.ctx.strip_refiner = true,
             "--name" => opts.name = Some(it.next().ok_or("--name 값 필요")?.clone()),
             "--summary" => opts.summary = true,

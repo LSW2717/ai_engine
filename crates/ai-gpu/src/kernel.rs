@@ -62,11 +62,22 @@ pub struct PendingKernel {
     key: String,
 }
 
+/// 콜드 컴파일 측정용 소스 salt. `AI_WGSL_SALT`로 빌드하면 주석 한 줄이 붙어
+/// 소스 해시가 달라지고, OS/브라우저 셰이더 캐시를 확실히 우회한다.
+/// (이게 없으면 macOS Metal 캐시 때문에 같은 셰이더가 0.3ms~200ms로 널뛰어
+/// "무엇이 비싼가"를 측정할 수 없다 — 실제로 한 번 틀린 결론을 낸 적이 있다.)
+fn salted(src: String) -> String {
+    match option_env!("AI_WGSL_SALT") {
+        Some(s) => format!("// salt {s}\n{src}"),
+        None => src,
+    }
+}
+
 /// 1단계: WGSL codegen + 모듈/BGL 생성 (error scope 없음 — 병렬 팬아웃용.
 /// 오류는 on_uncaptured_error 로그 + 워밍업 디스패치에서 드러난다.)
 pub fn begin_compile(ctx: &GpuContext, spec: &dyn KernelSpec) -> PendingKernel {
     let key = spec.cache_key(&ctx.caps);
-    let src = spec.wgsl(&ctx.caps);
+    let src = salted(spec.wgsl(&ctx.caps));
     let entries = bgl_entries(&spec.bindings());
     let device = &ctx.device;
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {

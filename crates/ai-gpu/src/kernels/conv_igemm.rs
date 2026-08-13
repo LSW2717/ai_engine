@@ -14,13 +14,27 @@ use ai_core::{Activation, DType};
 
 use crate::context::DeviceCaps;
 use crate::kernel::{KernelSpec, StorageDir};
+use crate::kernels::common::source::{self, SrcView};
 use crate::kernels::common::writer::{fill, W};
-use crate::kernels::common::{epilogue, gemm_tile, sv4_alias};
+use crate::kernels::common::{epilogue, gemm_tile, type_aliases};
 use crate::kernels::gemm_pw::{TM, TN_NG};
 
 const TEMPLATE_TILED: &str = include_str!("shaders/conv_igemm_tiled.wgsl");
 const TEMPLATE_DIRECT: &str = include_str!("shaders/conv_igemm_direct.wgsl");
 const TEMPLATE_SPLITK: &str = include_str!("shaders/conv_igemm_splitk.wgsl");
+
+/// codegen이 파트 하나를 읽는 데 필요한 전부
+struct InPart {
+    buf: String,
+    /// 이 파트가 기여하는 채널그룹 수
+    cg: u32,
+    /// 가중치 축(KGP)에서 이 파트가 시작하는 kg
+    woff: u32,
+    /// 백킹 버퍼의 행 stride (채널그룹)
+    stride_cg: u32,
+    /// 백킹 버퍼 안 시작 채널그룹
+    off_cg: u32,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum IgemmVariant {
@@ -45,10 +59,20 @@ pub struct ConvIgemmSpec {
     pub pad: [u32; 4],
     pub act: Activation,
     pub residual: bool,
+    /// 활성화(입력/출력/residual) 스토리지 dtype
     pub dt: DType,
-    /// concat-into-conv 융합 파트별 채널 수 (0 = 미사용, 전부 0 = 단일 입력).
-    /// 파트 시작이 채널그룹 정렬임은 변환기(fuse_concat)가 보장.
-    pub srcs: [u32; 3],
+    /// 가중치 스토리지 dtype — 활성화와 독립. 저해상 심층 conv은 가중치 페치 바운드라
+    /// 여기만 F16으로 낮추면 정확도 거의 그대로 트래픽이 절반이 된다.
+    pub wdt: DType,
+    /// Splitk 기하 (SPLIT, CPW) 강제 지정 (스윕 전용). None이면 `splitk_geometry`.
+    pub force_geom: Option<(u32, u32)>,
+    /// 변형 강제 지정 (스윕 전용). None이면 `variant()`의 정책이 고른다.
+    /// 정책 자체를 실측으로 재튜닝하려면 같은 shape을 변형별로 돌려봐야 한다.
+    pub force_variant: Option<IgemmVariant>,
+    /// 입력 소스들. 2개 이상 채워지면 concat-into-conv 융합, 1개만 채워지면
+    /// "단일 입력이지만 백킹의 채널 구간(뷰)"이라는 뜻, 전부 비면 평범한 단일 입력.
+    /// 파트 시작이 채널그룹 정렬임은 변환기(fuse_concat/chview)가 보장.
+    pub srcs: [SrcView; 3],
 }
 
 impl ConvIgemmSpec {
@@ -69,30 +93,56 @@ impl ConvIgemmSpec {
             act: op.act,
             residual,
             dt,
-            srcs: [0; 3],
+            wdt: dt,
+            force_variant: None,
+            force_geom: None,
+            srcs: [SrcView::NONE; 3],
         }
     }
 
     fn nsrcs(&self) -> u32 {
-        self.srcs.iter().filter(|c| **c > 0).count() as u32
+        self.srcs.iter().filter(|s| s.is_used()).count() as u32
     }
 
-    /// 입력 파트 목록: (버퍼명, 파트 kg 폭, 전역 kg 오프셋). 단일 입력 = 1파트 "IN".
-    fn parts(&self) -> Vec<(String, u32, u32)> {
+    /// 채널 뷰(비복사 Split)를 입력으로 받는가 — Tiled는 입력 stride가 자기 KG라고
+    /// 가정하므로 뷰가 있으면 Direct/Splitk로 몰아야 한다.
+    fn has_offset_src(&self) -> bool {
+        self.srcs.iter().any(|s| s.is_offset())
+    }
+
+    /// 입력 파트 목록. 단일 입력 = 1파트 "IN".
+    /// (버퍼명, 파트 kg 폭, 전역 kg 오프셋(가중치 축), 행 stride kg, 시작 kg 오프셋)
+    fn parts(&self) -> Vec<InPart> {
         if self.nsrcs() <= 1 {
-            return vec![("IN".into(), self.kg(), 0)];
+            // srcs[0]이 채워져 있으면 단일 입력이 뷰라는 뜻 — stride/off를 살린다
+            let s = self.srcs[0];
+            let (stride_cg, off_cg) =
+                if s.is_used() { (s.stride_cg(), s.off_cg()) } else { (self.kg(), 0) };
+            return vec![InPart {
+                buf: "IN".into(),
+                cg: self.kg(),
+                woff: 0,
+                stride_cg,
+                off_cg,
+            }];
         }
         let mut v = Vec::new();
-        let mut off = 0;
-        for (i, c) in self.srcs.iter().enumerate() {
-            if *c == 0 {
+        let mut woff = 0;
+        for (i, s) in self.srcs.iter().enumerate() {
+            if !s.is_used() {
                 break;
             }
-            let cg = c.div_ceil(4);
-            v.push((format!("IN{i}"), cg, off));
-            off += cg;
+            let cg = s.cg();
+            v.push(InPart {
+                buf: format!("IN{i}"),
+                cg,
+                woff,
+                stride_cg: s.stride_cg(),
+                off_cg: s.off_cg(),
+            });
+            woff += cg;
         }
-        debug_assert_eq!(off, self.kg(), "파트 kg 합이 cin과 불일치");
+        debug_assert_eq!(woff, self.kg(), "파트 kg 합이 cin과 불일치");
         v
     }
 
@@ -110,7 +160,7 @@ impl ConvIgemmSpec {
             }
         }
         w.line(format!(
-            "@group(0) @binding({b}) var<storage, read> W: array<sv4>; // [tap][kgp][ng][j]"
+            "@group(0) @binding({b}) var<storage, read> W: array<wv4>; // [tap][kgp][ng][j]"
         ));
         b += 1;
         w.line(format!("@group(0) @binding({b}) var<storage, read> BIAS: array<sv4>;"));
@@ -149,14 +199,18 @@ impl ConvIgemmSpec {
     }
 
     pub fn variant(&self) -> IgemmVariant {
+        if let Some(v) = self.force_variant {
+            return v;
+        }
         // Direct4(4픽셀 블로킹)가 작은 cout(타일 스레드 낭비)과 작은 K(스템)에서 승리.
         // RVM/MNv 계열 디코더는 전부 NG ≤ 20이라 사실상 Direct4가 주력이고,
         // Tiled는 cout·K 모두 큰 미래 shape용으로 유지한다.
         // (실험 기록: 가중치 공유메모리 프리로드(DirectShared)는 Apple에서 완패 —
         // 워크그룹당 8~16KB 공유메모리가 점유율을 붕괴시키고, 동일 주소 전역 로드는
         // 이미 SIMD 브로드캐스트+캐시로 최적이다. webgl2 챔피언도 공유메모리 없음.)
-        // 멀티소스(concat 융합)는 Direct/Splitk만 지원 — Tiled 후보라도 Direct로.
+        // 멀티소스(concat 융합)와 채널 뷰는 Direct/Splitk만 지원 — Tiled 후보라도 Direct로.
         if self.nsrcs() > 1
+            || self.has_offset_src()
             || self.ng() <= 20
             || self.m() < 512
             || self.k * self.k * self.kg() <= 9
@@ -215,10 +269,15 @@ impl ConvIgemmSpec {
                 body.line(format!("    let pos{c} = row + u32(clamp(x{c}, 0, IW - 1));"));
                 body.line(format!("    let m{c} = f32(x{c} >= 0 && x{c} < IW);"));
             }
-            for (pi, (buf, cg, off)) in parts.iter().enumerate() {
+            for (pi, p) in parts.iter().enumerate() {
+                let (buf, cg, off) = (&p.buf, p.cg, p.woff);
                 body.line(format!("    {{ // part {pi} (kg {off}..{})", off + cg));
                 for &c in &used {
-                    body.line(format!("      let q{c} = pos{c} * {cg}u;"));
+                    // 뷰면 백킹 stride로 행을 잡고 시작 채널그룹만큼 민다
+                    body.line(format!(
+                        "      let q{c} = pos{c} * {}u + {}u;",
+                        p.stride_cg, p.off_cg
+                    ));
                 }
                 body.line(format!("      for (var kg = 0u; kg < {cg}u; kg = kg + 1u) {{"));
                 for &c in &used {
@@ -274,10 +333,14 @@ impl ConvIgemmSpec {
 impl KernelSpec for ConvIgemmSpec {
     fn cache_key(&self, _caps: &DeviceCaps) -> String {
         format!(
-            "conv_igemm v={:?}{}{} {}x{} {}->{} k{} s{} d{} p{:?} {} dt={}",
+            "conv_igemm v={:?}{}{} {}x{} {}->{} k{} s{} d{} p{:?} {} dt={}/w{}",
             self.variant(),
-            if self.variant() == IgemmVariant::Direct { format!("/pb{}", self.pb()) } else { String::new() },
-            if self.nsrcs() > 1 { format!(" srcs{:?}", self.srcs) } else { String::new() },
+            match (self.variant(), self.force_geom) {
+                (IgemmVariant::Direct, _) => format!("/pb{}", self.pb()),
+                (IgemmVariant::Splitk, Some((sp, cp))) => format!("/g{sp}x{cp}"),
+                _ => String::new(),
+            },
+            source::key_of(&self.srcs),
             self.ih,
             self.iw,
             self.cin,
@@ -287,7 +350,8 @@ impl KernelSpec for ConvIgemmSpec {
             self.d,
             self.pad,
             epilogue::key_fragment(true, self.act, self.residual),
-            self.dt.tag()
+            self.dt.tag(),
+            self.wdt.tag()
         )
     }
 
@@ -308,7 +372,7 @@ impl KernelSpec for ConvIgemmSpec {
             self.pad[1]
         );
         let (res_b, out_b) = gemm_tile::binding_slots(self.residual);
-        let types = sv4_alias(self.dt);
+        let types = type_aliases(self.dt, self.wdt);
 
         match self.variant() {
             IgemmVariant::Tiled => {
@@ -393,7 +457,12 @@ impl KernelSpec for ConvIgemmSpec {
             }
             IgemmVariant::Splitk => {
                 let cells = m * self.ng();
-                let (split, cpw) = crate::kernels::gemm_pw::splitk_geometry(cells);
+                let (split, cpw) =
+                    self.force_geom.unwrap_or_else(|| crate::kernels::gemm_pw::splitk_geometry(cells));
+                // 셰이더 불변식: 워크그룹 256스레드 = CPW셀 × SPLIT청크, 리덕션이
+                // sh[t + s*CPW] (s<SPLIT)를 읽으므로 곱이 256이 아니면 K를 덜 계산하고
+                // 공유배열 밖을 읽는다 — "빠른데 틀린" 결과가 조용히 나온다.
+                assert_eq!(split * cpw, 256, "splitk 기하 불변식 위반 (SPLIT×CPW)");
                 let (pxt, ngt) = crate::kernels::gemm_pw::splitk_tile(self.ng(), cpw);
                 let ngtc = self.ng().div_ceil(ngt);
                 let kc = self.kg().div_ceil(split);
@@ -411,10 +480,14 @@ impl KernelSpec for ConvIgemmSpec {
                         taps.line(format!("  let ix = ox * S + {dx} - PL;"));
                         taps.line("  if (iy >= 0 && iy < IH && ix >= 0 && ix < IW) {");
                         taps.line("    let pix = u32(iy) * u32(IW) + u32(ix);");
-                        for (pi, (buf, cg, off)) in parts.iter().enumerate() {
+                        for (pi, p) in parts.iter().enumerate() {
+                            let (buf, cg, off) = (&p.buf, p.cg, p.woff);
                             let end = off + cg;
                             taps.line(format!("    {{ // part {pi}"));
-                            taps.line(format!("      let base = pix * {cg}u;"));
+                            taps.line(format!(
+                                "      let base = pix * {}u + {}u;",
+                                p.stride_cg, p.off_cg
+                            ));
                             // 청크 [k0,k1)과 파트 [off,end)의 교집합만 순회
                             if parts.len() == 1 {
                                 taps.line("      for (var kg = k0; kg < k1; kg = kg + 1u) {");
@@ -517,7 +590,10 @@ mod tests {
                             act,
                             residual,
                             dt,
-                            srcs: [0; 3],
+                            force_variant: None,
+                            force_geom: None,
+                            wdt: dt,
+                            srcs: [SrcView::NONE; 3],
                         };
                         validate_wgsl(&spec.wgsl(&caps));
                     }
@@ -540,7 +616,10 @@ mod tests {
             act: Activation::None,
             residual: false,
             dt: DType::F32,
-            srcs: [0; 3],
+            wdt: DType::F32,
+            force_variant: None,
+            force_geom: None,
+            srcs: [SrcView::NONE; 3],
         };
         // 스템: M 크지만 K 극소 → Direct (스레드 충분)
         assert_eq!(mk(72, 128, 3, 3).variant(), IgemmVariant::Direct);
@@ -563,7 +642,10 @@ mod tests {
             act: Activation::None,
             residual: false,
             dt: DType::F32,
-            srcs: [0; 3],
+            wdt: DType::F32,
+            force_variant: None,
+            force_geom: None,
+            srcs: [SrcView::NONE; 3],
         };
         assert_eq!(big.variant(), IgemmVariant::Tiled);
     }

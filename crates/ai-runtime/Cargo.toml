@@ -9,6 +9,10 @@ ai-core.workspace = true
 ai-gpu.workspace = true
 thiserror.workspace = true
 log.workspace = true
+bytemuck.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-time.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 pollster.workspace = true

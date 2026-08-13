@@ -31,6 +31,8 @@ pub struct Ctx {
     /// 순환 상태 쌍 (입력명, 출력명)
     pub states: Vec<(String, String)>,
     pub fp16: bool,
+    /// std conv 가중치만 f16 (활성화는 f32) — 가중치 페치 대역 절반
+    pub fp16_weights: bool,
     pub strip_refiner: bool,
 }
 

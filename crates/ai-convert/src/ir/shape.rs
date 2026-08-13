@@ -42,7 +42,7 @@ pub fn infer(g: &Graph, node: &Node) -> Result<Option<Vec<Vec<i64>>>, ConvertErr
     let one = |s: Vec<i64>| Ok(Some(vec![s]));
     match node.op.as_str() {
         // 단항 (elementwise)
-        "Relu" | "Sigmoid" | "Tanh" | "HardSigmoid" | "Clip" | "Identity" | "Erf"
+        "Relu" | "Sigmoid" | "Tanh" | "HardSigmoid" | "HardSwish" | "Clip" | "Identity" | "Erf"
         | "hswish" => match shape_of(g, &node.inputs[0]) {
             Some(s) => one(s),
             None => Ok(None),
