@@ -7,7 +7,7 @@ use ai_convert::plan::lower::lower;
 use ai_convert::verify::CpuExec;
 use ai_core::rng::XorShift32;
 use ai_gpu::GpuContext;
-use ai_runtime::Model;
+use ai_gpu_runtime::Model;
 
 fn max_err(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max)

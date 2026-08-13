@@ -1,4 +1,4 @@
-//! ai-runtime — .sw 그래프 executor.
+//! ai-gpu-runtime — .sw 그래프 executor.
 //!
 //! 로드: 컨테이너 파싱 → 가중치 단일 버퍼 업로드(memcpy) → 뷰 실체화 계획 →
 //! liveness 슬롯 배정 → 병렬 파이프라인 컴파일 → bind group 사전 생성(even/odd) → 워밍업.

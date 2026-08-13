@@ -4,7 +4,7 @@
 //! - 슬롯 계획: last_use liveness로 중간 텐서 버퍼를 그리디 재사용
 //!   (출력 슬롯을 먼저 할당하고 그 다음 죽은 입력을 해제 — in-place 금지)
 //! - dtype 규약은 GPU lowering과 동일: std conv 가중치만 `dt_weights`,
-//!   dw 가중치·bias·cvec·SeGate는 `dt_default` (ai-runtime/lowering.rs 참조)
+//!   dw 가중치·bias·cvec·SeGate는 `dt_default` (ai-gpu-runtime/lowering.rs 참조)
 //!
 //! 새 op 추가: kernels/<이름>.rs 커널 + 여기 lowering arm 하나 + exec 디스패치 arm.
 

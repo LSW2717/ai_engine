@@ -9,7 +9,7 @@ use ai_convert::passes::{run_full, Ctx};
 use ai_convert::plan::lower::lower;
 use ai_core::format::SwModel;
 use ai_gpu::GpuContext;
-use ai_runtime::lowering;
+use ai_gpu_runtime::lowering;
 use std::collections::BTreeMap;
 
 #[test]

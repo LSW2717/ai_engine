@@ -10,7 +10,7 @@ use ai_convert::passes::{run_full, Ctx};
 use ai_convert::plan::lower::lower;
 use ai_core::rng::XorShift32;
 use ai_gpu::GpuContext;
-use ai_runtime::Model;
+use ai_gpu_runtime::Model;
 
 /// 기본은 **배포되는 그래프**(고정 export, 116 op)다. 공식 export는 변환기가
 /// 25개 op을 더 남기므로(canon 갭) 그걸 프로파일하면 배포판에 없는 op을 튜닝하게 된다.

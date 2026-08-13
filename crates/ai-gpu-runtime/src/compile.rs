@@ -35,7 +35,7 @@ pub async fn compile_all(
         }
     }
     log::info!(
-        "[ai-runtime] 파이프라인 {}개 (고유 신규 {}, 캐시 {})",
+        "[ai-gpu-runtime] 파이프라인 {}개 (고유 신규 {}, 캐시 {})",
         specs.len(),
         unique.len(),
         map.len()
@@ -91,12 +91,12 @@ pub async fn compile_all(
         timings.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
         let t_pipe: f64 = timings.iter().map(|t| t.0).sum();
         log::info!(
-            "[ai-runtime] 셰이더모듈 {t_mod:.0}ms + 파이프라인 {t_pipe:.0}ms = {:.0}ms / {}개",
+            "[ai-gpu-runtime] 셰이더모듈 {t_mod:.0}ms + 파이프라인 {t_pipe:.0}ms = {:.0}ms / {}개",
             t_mod + t_pipe,
             timings.len()
         );
         for (ms, key) in timings.iter().take(10) {
-            log::info!("[ai-runtime]   pipe {ms:7.1}ms  {key}");
+            log::info!("[ai-gpu-runtime]   pipe {ms:7.1}ms  {key}");
         }
     }
 

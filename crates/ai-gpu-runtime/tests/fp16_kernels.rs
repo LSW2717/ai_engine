@@ -32,7 +32,7 @@ fn fp16_compile_all() {
     let mut seen = std::collections::HashSet::new();
     let mut fails = 0;
     for op in &sw2.ops {
-        let lo = match ai_runtime::lowering::lower_op(&sw2, op, &|t| t, &Default::default()) {
+        let lo = match ai_gpu_runtime::lowering::lower_op(&sw2, op, &|t| t, &Default::default()) {
             Ok(lo) => lo,
             Err(e) => {
                 println!("LOWER-FAIL: {e}");

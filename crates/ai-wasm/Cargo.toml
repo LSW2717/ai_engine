@@ -11,7 +11,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 ai-core.workspace = true
 ai-gpu.workspace = true
-ai-runtime.workspace = true
+ai-gpu-runtime.workspace = true
 ai-tasks.workspace = true
 web-time.workspace = true
 wasm-bindgen.workspace = true

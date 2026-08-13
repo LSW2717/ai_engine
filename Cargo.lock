@@ -81,7 +81,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "ai-runtime"
+name = "ai-gpu-runtime"
 version = "0.1.0"
 dependencies = [
  "ai-convert",
@@ -102,7 +102,7 @@ dependencies = [
  "ai-core",
  "ai-cpu",
  "ai-gpu",
- "ai-runtime",
+ "ai-gpu-runtime",
  "bytemuck",
  "log",
  "thiserror",
@@ -115,7 +115,7 @@ version = "0.1.0"
 dependencies = [
  "ai-core",
  "ai-gpu",
- "ai-runtime",
+ "ai-gpu-runtime",
  "ai-tasks",
  "bytemuck",
  "console_error_panic_hook",

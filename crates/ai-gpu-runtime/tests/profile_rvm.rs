@@ -6,7 +6,7 @@ use ai_convert::passes::{run_full, Ctx};
 use ai_convert::plan::lower::lower;
 use ai_core::rng::XorShift32;
 use ai_gpu::GpuContext;
-use ai_runtime::Model;
+use ai_gpu_runtime::Model;
 
 /// export 종류별 IO 이름 적응: 공식(src/r1i~r4i + downsample_ratio, 동적 shape) vs
 /// 고정 export(input_1/r1~r4, 144×256 고정). 반환 = (Ctx, 입력 텐서 이름).

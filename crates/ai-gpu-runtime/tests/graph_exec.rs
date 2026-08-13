@@ -7,7 +7,7 @@ use ai_convert::plan::lower::lower;
 use ai_convert::verify::CpuExec;
 use ai_core::rng::XorShift32;
 use ai_gpu::GpuContext;
-use ai_runtime::Model;
+use ai_gpu_runtime::Model;
 
 #[test]
 fn segm_gpu_matches_cpu_reference() {

@@ -7,7 +7,7 @@
 use ai_core::TensorDesc;
 use ai_gpu::wgpu;
 use ai_gpu::GpuContext;
-use ai_runtime::Model;
+use ai_gpu_runtime::Model;
 
 use crate::clock::{FrameClock, Stats};
 use crate::error::TaskError;

@@ -12,7 +12,7 @@ use ai_convert::passes::{run_full, Ctx};
 use ai_convert::plan::lower::lower;
 use ai_convert::verify::CpuExec;
 use ai_gpu::GpuContext;
-use ai_runtime::Model;
+use ai_gpu_runtime::Model;
 
 #[test]
 #[ignore]

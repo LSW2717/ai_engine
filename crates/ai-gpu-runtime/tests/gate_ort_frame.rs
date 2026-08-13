@@ -12,7 +12,7 @@ use ai_convert::onnx::import::import;
 use ai_convert::passes::{run_full, Ctx};
 use ai_convert::plan::lower::lower;
 use ai_gpu::GpuContext;
-use ai_runtime::Model;
+use ai_gpu_runtime::Model;
 
 const W: usize = 256;
 const H: usize = 144;

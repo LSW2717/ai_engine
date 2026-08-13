@@ -26,7 +26,9 @@ compare에서 `webgl2 ~1.57ms / ai_engine 가중치fp16 ~2.01ms`.
 모델 5종은 CPU·GPU 양쪽에서 다 돈다(§3.5) — 하지만 **calculator 그래프 없이는
 기능이 아니다** (디텍터 출력은 날 앵커/로짓, 랜드마크는 ROI 크롭 입력 전제).
 순서:
-1. **다중모델 핸들 API** (ai-wasm/ai-tasks — vision 워커에 det+lm+게이즈 상주)
+1. **다중모델 핸들 API** (ai-wasm/ai-tasks — vision 워커에 det+lm+게이즈 상주).
+   ⚠ 게이즈도 단독이 아니라 **3모델 체인**: face_detector → face_landmarks(얼굴
+   방향/눈 위치) → 얼굴 크롭을 gaze 448²에 입력. 즉 vision 워커의 최소 상주가 3모델.
 2. **face_detector 후처리**: 앵커 디코드(896×16, SSD 앵커) + NMS → 얼굴 박스
 3. **ROI 파이프라인**: 박스→회전 정규화 크롭→face_landmarks→역변환, 이전 프레임
    ROI 트래킹(검출은 놓쳤을 때만) + OneEuroFilter
@@ -37,13 +39,6 @@ compare에서 `webgl2 ~1.57ms / ai_engine 가중치fp16 ~2.01ms`.
 conv·복소 = 새 커널 계열이라 스파이크 단위가 크고, #4는 이미 변환해둔 5모델을
 기능으로 바꾸는 마지막 조각이라 레버리지가 더 크다. (#3 잔여인 tflite 직접
 임포터도 #4 뒤로.)
-**(B) 브라우저 R11 A/B 배선 — 완료 (2026-08-13 저녁, §2 실측 참조).**
-   `web/demo/cpu-ab.html` — 같은 프레임을 ai-cpu/tflite-simd/ORT wasm 셋에 먹여
-   마스크 3장 + p50/p90 + ai-cpu 대비 diff. ORT와 diff 0.0000(fp32 수치 일치) 확인.
-   COOP/COEP 없는 서버라 셋 다 1T = v-ai 배포 기본 조건과 동일(공정).
-   처음 발견된 2.6배 열세(17.9 vs 6.9ms)는 **같은 날 밤 커널 스프린트로 해소 —
-   wasm 7.1ms = tflite-simd(6.9)와 동률, §2.5 참조.**
-
 v-ai 정찰 전체 지도(런타임·티어·플래그·file:line)는 메모리 `vai-runtime-map` 참조.
 
 ---

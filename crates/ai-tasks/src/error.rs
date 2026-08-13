@@ -15,7 +15,7 @@ pub enum TaskError {
     DeviceLost(String),
     /// 모델 로드/실행 실패
     #[error("런타임: {0}")]
-    Runtime(#[from] ai_runtime::RuntimeError),
+    Runtime(#[from] ai_gpu_runtime::RuntimeError),
     /// GPU 계층 오류 (컴파일·리드백 등)
     #[error("GPU: {0}")]
     Gpu(String),

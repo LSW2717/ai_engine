@@ -10,7 +10,7 @@ webgl2-engine-span.js(~3ms)와 ORT-web WebGPU(~2ms)를 넘는 추론 성능, mem
 |---|---|---|
 | `ai-core` | GPU 무의존 코어: TensorDesc(NHWC-C4), pack/unpack, 활성화 정의, CPU 레퍼런스, 그래프 IR·컨테이너 포맷 타입 | rlib. 변환기·런타임이 공유하는 계약 |
 | `ai-gpu` | wgpu 30 실행 계층: context/caps, arena, params, 커널, 캐시, 프로파일러 | 타겟별 의존성 테이블(native=metal/vulkan/dx12, wasm=webgpu) |
-| `ai-runtime` | 그래프 executor: 컨테이너 로드 → lowering → 상태 텐서 ping-pong | |
+| `ai-gpu-runtime` | 그래프 executor: 컨테이너 로드 → lowering → 상태 텐서 ping-pong | |
 | `ai-tasks` | **공개 API 본체** — 태스크(세그멘테이션/랜드마크/노이즈억제) + 전·후처리 + 합성 + 폴백 정책 | 플랫폼 무관. 바인딩이 여기를 감싸기만 한다 |
 | `ai-convert` | ONNX → 컨테이너 CLI: BN 폴딩·사전 패킹·융합 마킹 | |
 | `ai-bench` | 네이티브 벤치 러너 | wasm 데모와 동일 루틴 |
@@ -18,8 +18,8 @@ webgl2-engine-span.js(~3ms)와 ORT-web WebGPU(~2ms)를 넘는 추론 성능, mem
 | `ai-cpu` | SIMD(NEON/SIMD128) + rayon 스레드 실행 계층 | GPU 미지원·저사양 폴백. mnv4s050 160×288: 1T 37ms / 4T 11.9ms (M2 Pro) |
 | (향후) `ai-ffi` | 모바일 C ABI (`staticlib`+`cdylib`) — **모바일 API** | crate-type은 leaf가 소유 — 플랫폼별 수동 편집 금지 |
 
-의존 그래프: `ai-core ← {ai-gpu, ai-cpu} ← ai-runtime ← ai-tasks ← {ai-wasm, ai-ffi}`, `ai-convert ← ai-core`.
-(`ai-cpu`는 ai-runtime을 거치지 않고 .sw 컨테이너를 직접 실행한다 — ai-tasks가 직접 든다.)
+의존 그래프: `ai-core ← {ai-gpu, ai-cpu} ← ai-gpu-runtime ← ai-tasks ← {ai-wasm, ai-ffi}`, `ai-convert ← ai-core`.
+(`ai-cpu`는 ai-gpu-runtime을 거치지 않고 .sw 컨테이너를 직접 실행한다 — ai-tasks가 직접 든다.)
 
 **바인딩 규칙**: `ai-wasm`/`ai-ffi`에는 분기(`if`)가 없다. 분기가 생겼다면 그건 로직이고
 `ai-tasks`로 내려가야 한다. 이 규칙이 깨지면 웹과 모바일 동작이 갈라진다 — 지금 랜드마크가
@@ -54,7 +54,7 @@ webgl2-engine-span.js(~3ms)와 ORT-web WebGPU(~2ms)를 넘는 추론 성능, mem
 2. `ai-gpu/src/kernels/<이름>.rs` — Spec + KernelSpec impl + naga 테스트 (위 규약)
 3. `ai-core/src/reference/<계열>.rs` — CPU 레퍼런스 (없으면 추가)
 4. `ai-gpu/src/testsuite.rs` — GPU vs CPU 케이스를 그리드에 등록
-5. (Phase 2+) `ai-runtime/src/lowering/<op>.rs` — op → KernelSpec 매핑
+5. (Phase 2+) `ai-gpu-runtime/src/lowering/<op>.rs` — op → KernelSpec 매핑
 
 **CPU 백엔드 짝 (ai-cpu)** — GPU와 대칭 절차:
 1. `ai-cpu/src/kernels/<이름>.rs` — 커널 + `ai-core::reference` 대조 테스트

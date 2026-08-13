@@ -3,13 +3,13 @@
 //!
 //! 사용:
 //!   AI_ONNX=<onnx> AI_ORACLE=<dir> [AI_REPS=20] \
-//!     cargo test --release -p ai-runtime --test gate_models_gpu -- --ignored --nocapture
+//!     cargo test --release -p ai-gpu-runtime --test gate_models_gpu -- --ignored --nocapture
 
 use ai_convert::onnx::import::import;
 use ai_convert::passes::{run_full, Ctx};
 use ai_convert::plan::lower::lower;
 use ai_gpu::GpuContext;
-use ai_runtime::Model;
+use ai_gpu_runtime::Model;
 
 fn read_f32s(p: &std::path::Path) -> Vec<f32> {
     let b = std::fs::read(p).unwrap_or_else(|e| panic!("{p:?}: {e}"));

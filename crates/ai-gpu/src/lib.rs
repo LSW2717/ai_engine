@@ -18,7 +18,7 @@ pub mod testsuite;
 
 pub use context::{DeviceCaps, GpuContext, InitError};
 
-/// 하위 크레이트(ai-runtime 등)가 wgpu 타입을 쓸 수 있게 재수출
+/// 하위 크레이트(ai-gpu-runtime 등)가 wgpu 타입을 쓸 수 있게 재수출
 /// (타겟별 feature 구성은 ai-gpu가 소유 — 중복 선언 방지)
 pub use wgpu;
 
