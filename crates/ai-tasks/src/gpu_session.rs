@@ -1,4 +1,6 @@
-//! 세그멘테이션 태스크 — 모델 수명·프레임 루프·프레임타임 통계를 소유한다.
+//! GPU에 로드된 모델 인스턴스 — 모델 수명·프레임 루프·프레임타임 통계를 소유한다.
+//! 세그·디텍터·랜드마크·게이즈 구분 없이 이 타입 하나다 (태스크별 차이는
+//! 전·후처리 — detect() 같은 메서드나 별도 모듈로 얹는다).
 //!
 //! 바인딩(`ai-wasm`/`ai-ffi`)은 이 타입을 감싸기만 한다. 프레임 한 장의 순서
 //! (업로드 → 추론 제출 → (호스트가 합성) → 완료 대기 → 기록)가 여기 한 곳에만
@@ -10,6 +12,7 @@ use ai_gpu::GpuContext;
 use ai_gpu_runtime::Model;
 
 use crate::clock::{FrameClock, Stats};
+use crate::detect::{Detection, DetectorPost};
 use crate::error::TaskError;
 
 #[cfg(target_arch = "wasm32")]
@@ -17,14 +20,14 @@ use web_time::Instant;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
 
-pub struct Segmenter {
+pub struct GpuSession {
     model: Model,
     clock: FrameClock,
     /// `infer()` 제출 시각 — `finish_frame()`이 여기서부터 잰다
     mark: Option<Instant>,
 }
 
-impl Segmenter {
+impl GpuSession {
     pub async fn load(ctx: &GpuContext, bytes: &[u8]) -> Result<Self, TaskError> {
         let model = Model::load(ctx, bytes).await?;
         Ok(Self { model, clock: FrameClock::new(), mark: None })
@@ -86,6 +89,37 @@ impl Segmenter {
     /// 출력 텐서가 실제로 들어있는 스토리지 버퍼 + desc (리드백 없이 합성용)
     pub fn output_storage(&self, name: &str) -> Option<(&wgpu::Buffer, TensorDesc)> {
         self.model.output_storage(name)
+    }
+
+    /// 디텍터 프레임 1장 (CpuSession::detect의 GPU 짝): 레터박스된 입력 →
+    /// 추론 → 전 출력 리드백 → 디코드+NMS → 원본 프레임 정규화 좌표 검출.
+    /// 디텍터 출력은 KB 단위라 리드백이 싸다 — 세그 마스크와 달리 CPU로 내려와야
+    /// 후속(ROI 크롭) 계산이 가능하다.
+    pub async fn detect(
+        &mut self,
+        ctx: &GpuContext,
+        post: &DetectorPost,
+        rgb: &[f32],
+        src_w: u32,
+        src_h: u32,
+    ) -> Result<Vec<Detection>, TaskError> {
+        self.upload(ctx, rgb)?;
+        self.infer(ctx).await?;
+        let names: Vec<String> = self
+            .model
+            .sw
+            .outputs
+            .iter()
+            .map(|&o| self.model.sw.tensors[o as usize].name.clone())
+            .collect();
+        let mut outs: Vec<Vec<f32>> = Vec::with_capacity(names.len());
+        for n in &names {
+            outs.push(self.read_output(ctx, n).await?);
+        }
+        // 리드백이 이미 GPU 완료를 함의하지만, 프레임타임 기록은 여기서 한다
+        self.finish_frame(ctx).await?;
+        let refs: Vec<&[f32]> = outs.iter().map(|v| v.as_slice()).collect();
+        post.run_projected(&refs, src_w as f32, src_h as f32)
     }
 
     /// 출력을 CPU로 읽는다 (진단·폴백 경로용 — 프레임 루프에서는 쓰지 말 것)

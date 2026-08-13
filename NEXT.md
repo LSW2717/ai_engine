@@ -3,10 +3,11 @@
 ## 5분 안에 상태 확인
 
 ```sh
-cargo test --workspace --release        # 52개 스위트, 전부 ok 여야 한다
+cargo test --workspace --release        # 57개 스위트, 전부 ok 여야 한다
 make build-wasm                         # web/pkg 갱신 (+simd128, 725KB)
 node tools/run_web.mjs compare/index.html   # webgl2 vs 우리 (GPU 다른 앱 닫고)
 node tools/run_web.mjs demo/cpu-ab.html --camera   # R11 CPU 3자 A/B: ai-cpu ~6.8ms < tflite 6.9 / ort 11 (§2.5)
+node tools/run_web.mjs demo/face-ab.html   # face_detector 좌표 diff 게이트: MediaPipe 대비 ≤3px PASS + 3모델 상주 스모크 (§4)
 node tools/profile_web.mjs 'demo/cpu-ab.html?only=ours' --ops   # wasm 스텝별 예산표
 # per-op 예산표 (커널 만졌으면 여기부터):
 AI_ONNX=$(pwd)/models/segm_mnv4s050_s2_160x288_nhwc.onnx \
@@ -21,19 +22,16 @@ compare에서 `webgl2 ~1.57ms / ai_engine 가중치fp16 ~2.01ms`.
 
 ---
 
-## 바로 다음 — 로드맵 #4 (랜드마크 스파이크)
+## 바로 다음 — 로드맵 #4 계속 (ROI 파이프라인)
 
-모델 5종은 CPU·GPU 양쪽에서 다 돈다(§3.5) — 하지만 **calculator 그래프 없이는
-기능이 아니다** (디텍터 출력은 날 앵커/로짓, 랜드마크는 ROI 크롭 입력 전제).
-순서:
-1. **다중모델 핸들 API** (ai-wasm/ai-tasks — vision 워커에 det+lm+게이즈 상주).
-   ⚠ 게이즈도 단독이 아니라 **3모델 체인**: face_detector → face_landmarks(얼굴
-   방향/눈 위치) → 얼굴 크롭을 gaze 448²에 입력. 즉 vision 워커의 최소 상주가 3모델.
-2. **face_detector 후처리**: 앵커 디코드(896×16, SSD 앵커) + NMS → 얼굴 박스
-3. **ROI 파이프라인**: 박스→회전 정규화 크롭→face_landmarks→역변환, 이전 프레임
-   ROI 트래킹(검출은 놓쳤을 때만) + OneEuroFilter
-4. **게이트: MediaPipe wasm과 같은 프레임 좌표 diff** — 파리티 증명 전 교체 금지
-(1~2는 스파이크로 face만 먼저 — hand는 같은 골격 복제.)
+1·2단계는 끝났다(§4 — 핸들 API + face_detector 후처리, 디텍터 좌표 게이트 PASS).
+남은 순서:
+3. **ROI 파이프라인**: 박스+눈 키포인트→회전 정규화 크롭(RectTransformation
+   scale 1.5 square)→face_landmarks 256²→역변환, 이전 프레임 ROI 트래킹
+   (검출은 놓쳤을 때만) + OneEuroFilter
+4. **게이트: MediaPipe wasm과 같은 프레임 랜드마크 좌표 diff** — 파리티 증명 전
+   교체 금지 (디텍터 게이트 face-ab.html과 같은 방식으로 lm까지 확장)
+(face 먼저 — hand는 같은 골격 복제. 게이즈는 lm 다음: face 크롭→gaze 448².)
 
 **fastenhancer(#6, 오디오)는 그다음**: 선행조건(ai-cpu)은 풀렸지만 DFT·1D
 conv·복소 = 새 커널 계열이라 스파이크 단위가 크고, #4는 이미 변환해둔 5모델을
@@ -51,7 +49,7 @@ v-ai 정찰 전체 지도(런타임·티어·플래그·file:line)는 메모리 
 | 1 | 폴백 트리거 3종 | **엔진 쪽 완료** (2026-08-13) — v-ai 연결만 보류, §1 참조 |
 | 2 | `ai-cpu` (SIMD128/NEON + 스레드) + R11 vs tflite-simd A/B | **완료** (2026-08-13) — 브라우저 A/B + 커널 스프린트로 **tflite-simd 동률**, §2·§2.5 |
 | 3 | `Reshape` canon + `PRELU` + `MAX_POOL_2D` | **완료** (2026-08-13) — 5모델 전부 개통+ORT 게이트+벤치, §3.5 |
-| 4 | 랜드마크 스파이크 (face_detector → 좌표 diff) | ← 다음 (모델은 다 돈다 — calculator 그래프 차례) |
+| 4 | 랜드마크 스파이크 (face_detector → 좌표 diff) | **1·2단계 완료** (2026-08-13) — 핸들 API+디텍터 후처리+게이트 PASS, §4. ← ROI 파이프라인이 다음 |
 | 5 | 파이프라인 로직 (ROI 트래킹 / 회전 정규화 / OneEuroFilter / Horn 피팅) | |
 | 6 | 오디오 (DFT / 1D conv / 복소) | |
 
@@ -89,13 +87,14 @@ v-ai 정찰 전체 지도(런타임·티어·플래그·file:line)는 메모리 
 - `Compositor` (`composite.rs` + `shaders/composite.wgsl`) — 합성 셰이더·업샘플·
   스테이징 텍스처·바인드그룹 캐시가 **플랫폼 무관**으로 이관됨.
   `ai-wasm/present.rs`는 442 → 109줄 (서피스 획득 + 웹 프레임 임포트만).
-- `Segmenter` (`segmenter.rs`) — 모델 수명 + 프레임 루프 + **프레임타임 링버퍼(p50/p90)**.
-  `ai-wasm`의 `MODEL` thread_local이 이걸 담는다. 전 export 경로가 이걸 통과한다.
+- `GpuSession` (`gpu_session.rs`, 구 Segmenter — §4에서 리네임) — 모델 수명 + 프레임 루프 +
+  **프레임타임 링버퍼(p50/p90)**. `ai-wasm`의 `MODEL` thread_local이 이걸 담는다.
+  전 export 경로가 이걸 통과한다. 다중 상주는 `Pool<GpuSession>`(핸들 API, §4).
 - `TaskError` — `NoGpu` / `DeviceLost` / `Runtime` / `Gpu` 구조화 (폴백 판정 근거).
 - `model_stats()` wasm export 추가 (p50/p90/last/frames).
 
 **남은 것**
-- `Segmenter::process()` 하나로 묶기 — 지금은 `upload → infer → (호스트 합성) → finish_frame`을
+- `GpuSession::process()` 하나로 묶기 — 지금은 `upload → infer → (호스트 합성) → finish_frame`을
   바인딩이 순서대로 부른다. 합성이 플랫폼 서피스에 걸려 있어 아직 안 묶었다.
   `ai-ffi` 만들 때 같은 순서를 또 쓰게 되면 그때 묶는다.
 - `ai-ffi` 뼈대 (C ABI, `repr(C)`, opaque handle). 모바일 실연결은 나중.
@@ -104,13 +103,21 @@ v-ai 정찰 전체 지도(런타임·티어·플래그·file:line)는 메모리 
 > `ai-wasm` / `ai-ffi`에는 분기(`if`)가 없다. 분기가 생겼다면 로직이고 `ai-tasks`로 내려간다.
 > 플랫폼마다 진짜 다른 것만 바인딩에 남긴다: 서피스 획득, 프레임 임포트, 스레드 모델, 모델 바이트 조달.
 
+**이름 규칙 (2026-08-13, 사용자 확정)**: `GpuSession`/`CpuSession` = 백엔드에 로드된
+**모델 1개 인스턴스**(수명+프레임 루프+통계) — ORT `InferenceSession` 관례이자
+실행기(`ai_cpu::Model`·`ai_gpu_runtime::Model`)와의 위상 구분. `~Task` 이름은 **파이프라인 레벨
+타입에 예약** — 모델 여러 개+전·후처리+트래킹을 묶은 도메인 기능 단위
+(예정: FaceTask = det+lm+ROI트래킹+OneEuroFilter, SegmentTask 등, 로드맵 #4-3/#5).
+ai-tasks 구조 = 세션(GpuSession/CpuSession/Pool, 재료) + 태스크 로직(detect/,
+앞으로 roi·tracking·filter) + 태스크 타입(예정).
+
 ---
 
 ## 1. 폴백 트리거 3종 — 엔진 쪽 끝 (2026-08-13)
 
 1. ✅ **device lost 구독** — `GpuContext::new()`가 `set_device_lost_callback` 등록
    (웹은 `device.lost` 프라미스 경로라 `Error::from_js` panic 이슈와 무관 — 소스로 확인).
-   `ctx.lost_reason()` 폴링, `Segmenter` 프레임 경로 3곳에서 체크 → `TaskError::DeviceLost`,
+   `ctx.lost_reason()` 폴링, `GpuSession` 프레임 경로 3곳에서 체크 → `TaskError::DeviceLost`,
    wasm `device_lost()` export (`null | "사유"`). 테스트: `ai-gpu/tests/device_lost.rs`.
 2. **프레임타임 노출** — `model_stats()` + `model_stats_cpu()` 있음. 호스트가 쓰게 하는 건 v-ai 연결과 한 묶음.
 3. **v-ai 연결 — 사용자가 "나중에"라고 보류함. 착수 전 확인 필수.** 구멍은 그대로:
@@ -129,11 +136,12 @@ v-ai 정찰 전체 지도(런타임·티어·플래그·file:line)는 메모리 
 
 구조 (ARCHITECTURE.md "CPU 백엔드 짝" 절차 참조):
 - `simd.rs` F32x4 (NEON/SIMD128/스칼라 — 커널은 core::arch 모름), `plan.rs`(로드 시
-  가중치 재패킹 + last_use 슬롯 재사용 계획), `exec.rs`(프레임 중 분석·할당 없음),
+  가중치 재패킹 + last_use 슬롯 재사용 계획), `model.rs`(구 exec.rs — 프레임 중 분석·할당 없음),
   `kernels/`(conv=브로드캐스트 GEMM 4px×8cout, dw=채널 벡터화, 나머지 콜드 스칼라).
 - alias/concat 융합은 채널 스트라이드 뷰로 무복사. 상태 ping-pong은 프레임 시작 swap.
 - 스레드: rayon 행 밴드(네이티브 전용, `set_threads`). wasm 스레드는 COOP/COEP 필요 — 미착수.
-- `ai-tasks::CpuSegmenter` + wasm export: `load_model_cpu/infer_frame_cpu/model_stats_cpu/model_io_cpu`.
+- `ai-tasks::CpuSession`(구 CpuSegmenter — §4에서 리네임) + wasm export:
+  `load_model_cpu/infer_frame_cpu/model_stats_cpu/model_io_cpu`.
   Makefile `+simd128` 추가됨. wasm 725KB (vs v-ai 런타임 66MB).
 
 **M2 Pro 실측** (오라클 diff CpuExec 대비 max_err ≤2e-5 전 해상도):
@@ -184,8 +192,8 @@ ORT wasm 11.0 대비 1.6배. 정확도 게이트 전 과정 유지: oracle max_e
 브라우저 ORT diff 0.0000, 전 스위트(89) 그린.
 
 **방법론**: ① 네이티브 — `ai-cpu/tests/prof_cpu.rs` per-op 예산표(rep별 min vs
-이론하한, `CpuModel::infer_profiled`). ② **wasm — `node tools/profile_web.mjs
-'demo/cpu-ab.html?only=ours' --ops`** (`CpuModel::bench_steps` = 스텝당 N회 합산으로
+이론하한, `ai_cpu::Model::infer_profiled`). ② **wasm — `node tools/profile_web.mjs
+'demo/cpu-ab.html?only=ours' --ops`** (`ai_cpu::Model::bench_steps` = 스텝당 N회 합산으로
 100µs 타이머 양자화 우회; V8 CDP 샘플 프로파일은 전 커널이 한 함수로 인라인돼 무용).
 **네이티브 예산표로 wasm을 추정하면 틀린다** — 스템은 wasm에서 1.74배, concat 1.5배로
 뒤틀렸었다. wasm 최적화는 반드시 wasm 스텝벤치를 근거로.
@@ -205,7 +213,7 @@ ORT wasm 11.0 대비 1.6배. 정확도 게이트 전 과정 유지: oracle max_e
 5. **resize**: ox 좌표 테이블(행 불변) + 채널 벡터화 + **c2 픽셀페어 패킹**(`low2_concat`,
    세그 마스크 최종 업샘플 0.35→0.067ms).
 6. **elementwise/mix/concat(copy_view_into) 벡터화**, **슬롯 +4 패딩**(4레인
-   오버리드를 crate 전체에서 안전화 — exec.rs 참조).
+   오버리드를 crate 전체에서 안전화 — model.rs 참조).
 7. **역전 마무리 3종 (wasm 스텝벤치 근거)**: ⓐ **ConvStem** — cin≤4 k>1 conv를
    im2row 패치(`[px][k_pad]`, K=(ky,kx,ic) 연속)로 펴서 1x1 GEMM화 (스템 wasm
    1.03→0.58ms; im2row.rs, 오버런 규약은 파일 머리 주석). ⓑ **PwDot** — cout≤4
@@ -279,6 +287,40 @@ mr1 낭비 제거, hand_lm 21→14ms) ②elementwise dense 플랫 루프. PRelu 
 ②커널 여지 — hand 계열이 15~20 GMAC/s로 낮음(PRelu 비융합 69개, dw 비중,
 Gemm@1x1 — conv+prelu 융합이 1순위), ③MediaPipe e2e 정밀 A/B(같은 프레임 좌표
 diff — 로드맵 #4의 검증 게이트와 한 몸), ④face_blendshapes(잡op 많음, 별도 판단).
+
+## 4. 랜드마크 스파이크 1·2단계 — 완료 (2026-08-13)
+
+**결과**: 다중모델 핸들 API + face_detector 후처리 전체가 CPU·GPU 양 백엔드에서
+돌고, **MediaPipe FaceDetector(wasm, 같은 tflite 가중치) 대비 박스 diff 1.10px /
+키포인트 1.27px / score 0.007** (256×144 프레임, 게이트 tol 3px PASS — CPU와 GPU가
+동일 수치). 3모델 동시 상주(det+lm+게이즈, WebGPU) 스모크 포함.
+
+**구현**:
+- `ai-tasks/src/detect/` — MediaPipe calculator 등가 순수 Rust:
+  `anchors.rs`(SsdAnchors, face 896/palm 2016 프리셋), `decode.rs`(TensorsToDetections,
+  reverse_output_order 고정), `nms.rs`(**가중** NMS — 후보 점수가중 평균, 일반 NMS로
+  바꾸면 박스가 떤다), `letterbox.rs`(keep_aspect 패딩 계산+역투영+`letterbox_u8_rgb`
+  픽셀 헬퍼). 박스/점수 텐서는 이름이 아니라 **원소 수로** 식별 (tf2onnx가 이름을 바꿈).
+- `ai-tasks/src/pool.rs` — `Pool<T>` 핸들 저장소 (핸들 단조증가·재사용 없음,
+  take/put은 wasm async 경계용).
+- wasm exports: `load_model_h`/`unload_model_h`/`model_io_h`/`model_stats_h`/
+  `infer_frame_h` + CPU 짝(`*_cpu_h`) + `detect_gpu`/`detect_cpu(handle, preset,
+  letterboxed_rgb, src_w, src_h)`. 단일 슬롯 exports는 기존 데모 호환으로 유지.
+- **리네임 2건 (사용자 지적)**: ① `ai_tasks::Segmenter`→**`GpuSession`**,
+  `CpuSegmenter`→**`CpuSession`** (gpu_session.rs/cpu_session.rs) — 디텍터·랜드마크·
+  게이즈까지 담는 범용 모델 인스턴스라 세그 이름은 오해였다. ② 실행기 대칭:
+  `ai_cpu::CpuModel`→**`ai_cpu::Model`** (exec.rs→model.rs) — `ai_gpu_runtime::Model`
+  (model.rs)과 크레이트 경로만 다른 같은 이름·같은 파일명이 되도록. 크레이트가
+  네임스페이스다 — 타입 이름에 백엔드 접두사 금지.
+- 게이트 2단: 네이티브 `ai-tasks/tests/face_detect.rs`(구조 게이트, 모델 없으면
+  스킵) + 브라우저 `web/demo/face-ab.html`(좌표 diff, `AI_ENGINE_RESULT` 규약).
+  MediaPipe 비교 상대 자산은 `face_detector.tflite`(Makefile convert-mediapipe가 복사).
+
+**전처리 규약 (파리티의 절반)**: 디텍터 입력은 **[-1,1] + keep_aspect 레터박스
+(검정 패딩=-1)** — MediaPipe ImageToTensor(BORDER_ZERO) 등가. 웹은 검정 캔버스에
+drawImage, 캔버스 없는 호스트는 `letterbox_u8_rgb`. 검출 좌표는 엔진이 레터박스
+역투영까지 해서 원본 프레임 정규화 좌표로 돌려준다. (face_landmarks는 [0,1]
+ROI 크롭 입력 — 3단계에서.)
 
 ## 3~5. 랜드마크 — 조사 끝, 결론
 

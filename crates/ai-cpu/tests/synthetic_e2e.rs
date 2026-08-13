@@ -1,4 +1,4 @@
-//! 손조립 그래프 E2E — CpuModel(계획·슬롯 재사용·뷰) vs CpuExec(순진 오라클).
+//! 손조립 그래프 E2E — Model(계획·슬롯 재사용·뷰) vs CpuExec(순진 오라클).
 //! 컨테이너 직렬화 왕복까지 실전 로드 경로 그대로 태운다.
 //!
 //! 그래프: conv(3→8) → dw(8) → mul 0.5 → resize 2× (+ conv 출력의 채널 뷰에 Act)
@@ -98,9 +98,9 @@ fn synthetic_graph_matches_cpuexec() {
     let want_act = oracle.read(5).unwrap();
     let want_resized = oracle.read(6).unwrap();
 
-    // 실전 경로: 컨테이너 왕복 → CpuModel
+    // 실전 경로: 컨테이너 왕복 → Model
     let container = sw.write_container(&blob).unwrap();
-    let mut m = ai_cpu::CpuModel::load(&container).unwrap();
+    let mut m = ai_cpu::Model::load(&container).unwrap();
     m.set_input("x", &input).unwrap();
     m.infer().unwrap();
     let got_act = m.read_output("act_out").unwrap();

@@ -69,6 +69,8 @@ convert-mediapipe:
 	  web/models/mediapipe/
 	cp $(V_AI)/assets/models/face_landmarker.task $(V_AI)/assets/models/hand_landmarker.task web/models/mediapipe/
 	cp tests/data/frame_256x144.rgb web/models/mediapipe/
+	# face-ab 좌표 diff 게이트의 MediaPipe 비교 상대 (같은 가중치의 원본 tflite)
+	cp models/mediapipe/face/face_detector.tflite web/models/mediapipe/
 
 setup-wasm:
 	rustup target add wasm32-unknown-unknown

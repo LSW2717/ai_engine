@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>face_detector 좌표 diff 게이트 — MediaPipe vs ai_engine</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: ui-sans-serif, system-ui, -apple-system, "Apple SD Gothic Neo", sans-serif;
+    max-width: 1000px; margin: 1.2rem auto; padding: 0 1rem; line-height: 1.5; }
+  h1 { font-size: 1.2rem; margin: 0 0 .25rem; }
+  .note { font-size: .85rem; opacity: .75; margin: 0 0 .9rem; }
+  table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: .35rem .6rem; border-bottom: 1px solid #8883; }
+  td.num { text-align: right; }
+  #status { padding: .5rem .8rem; border-radius: 8px; background: rgba(88,166,255,.12);
+    margin-bottom: .8rem; font-size: .9rem; }
+  #view { image-rendering: pixelated; border: 1px solid #8886; margin-top: .8rem; }
+  .legend span { display: inline-block; margin-right: 1rem; font-size: .85rem; }
+</style>
+</head>
+<body>
+<h1>face_detector 좌표 diff 게이트</h1>
+<p class="note">같은 프레임을 MediaPipe FaceDetector(wasm, 같은 tflite)와 우리
+detect 경로(레터박스→.sw 추론→앵커 디코드→가중 NMS→역투영)에 먹여 박스·키포인트를
+픽셀 단위로 비교한다. 파리티 증명 전 교체 금지 (NEXT.md 로드맵 #4).</p>
+<div id="status">준비 중…</div>
+<table>
+  <thead><tr><th>경로</th><th class="num">검출 수</th><th class="num">score</th>
+    <th class="num">박스 diff px (max)</th><th class="num">키포인트 diff px (max)</th>
+    <th class="num">score diff</th></tr></thead>
+  <tbody id="rows"></tbody>
+</table>
+<div class="legend">
+  <span style="color:#2da44e">■ MediaPipe</span>
+  <span style="color:#d1242f">■ ai_engine CPU</span>
+  <span style="color:#58a6ff">■ ai_engine GPU</span>
+</div>
+<canvas id="view" width="256" height="144" style="width:768px;height:432px"></canvas>
+<script type="module" src="face-ab.js"></script>
+</body>
+</html>

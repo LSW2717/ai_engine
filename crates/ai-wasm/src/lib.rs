@@ -19,9 +19,15 @@ use wasm_bindgen::prelude::*;
 
 thread_local! {
     static ENGINE: RefCell<Option<Rc<GpuContext>>> = const { RefCell::new(None) };
-    static MODEL: RefCell<Option<ai_tasks::Segmenter>> = const { RefCell::new(None) };
+    static MODEL: RefCell<Option<ai_tasks::GpuSession>> = const { RefCell::new(None) };
     // CPU 폴백 티어 — GPU 엔진과 독립 (init_engine 실패 후에도 동작해야 한다)
-    static CPU_MODEL: RefCell<Option<ai_tasks::CpuSegmenter>> = const { RefCell::new(None) };
+    static CPU_MODEL: RefCell<Option<ai_tasks::CpuSession>> = const { RefCell::new(None) };
+    // 핸들 기반 다중모델 풀 — vision 워커(det+lm+게이즈 상주)용.
+    // 단일 슬롯(MODEL/CPU_MODEL)은 기존 데모·세그 경로 호환으로 남긴다.
+    static GPU_MODELS: RefCell<ai_tasks::Pool<ai_tasks::GpuSession>> =
+        RefCell::new(ai_tasks::Pool::new());
+    static CPU_MODELS: RefCell<ai_tasks::Pool<ai_tasks::CpuSession>> =
+        RefCell::new(ai_tasks::Pool::new());
 }
 
 #[wasm_bindgen(start)]
@@ -138,7 +144,7 @@ struct JsBenchSplit {
 #[wasm_bindgen]
 pub async fn load_model(bytes: Vec<u8>) -> Result<JsValue, JsValue> {
     let ctx = engine()?;
-    let seg = ai_tasks::Segmenter::load(&ctx, &bytes)
+    let seg = ai_tasks::GpuSession::load(&ctx, &bytes)
         .await
         .map_err(|e| JsValue::from_str(&e.to_string()))?;
     let model = seg.model();
@@ -342,7 +348,7 @@ pub async fn infer_and_present(
 /// 어떤 모델(R11 등 경량)을 실을지는 호스트가 정한다 — 모델 조달은 호스트 몫.
 #[wasm_bindgen]
 pub fn load_model_cpu(bytes: Vec<u8>) -> Result<JsValue, JsValue> {
-    let seg = ai_tasks::CpuSegmenter::load(&bytes)
+    let seg = ai_tasks::CpuSession::load(&bytes)
         .map_err(|e| JsValue::from_str(&e.to_string()))?;
     let sw = seg.model().sw();
     let report = JsModelReport {
@@ -473,6 +479,246 @@ pub async fn bench_current(frames: u32) -> Result<JsValue, JsValue> {
     .await;
     MODEL.with(|m| *m.borrow_mut() = Some(seg));
     result
+}
+
+// ───────── 핸들 기반 다중모델 API (vision 워커: det+lm+게이즈 상주) ─────────
+//
+// 단일 슬롯 API와 달리 로드가 기존 모델을 밀어내지 않는다. 핸들은 재사용되지
+// 않으며(ai_tasks::Pool), 언로드된 핸들 접근은 구조화된 에러로 실패한다.
+
+fn js_err(e: impl std::fmt::Display) -> JsValue {
+    JsValue::from_str(&e.to_string())
+}
+
+#[derive(serde::Serialize)]
+struct JsLoaded {
+    handle: u32,
+    name: String,
+    ops: usize,
+    unique_pipelines: usize,
+    arena_mb: f64,
+    weights_mb: f64,
+}
+
+#[derive(serde::Serialize)]
+struct JsDetection {
+    score: f32,
+    xmin: f32,
+    ymin: f32,
+    xmax: f32,
+    ymax: f32,
+    keypoints: Vec<[f32; 2]>,
+}
+
+fn js_detections(dets: Vec<ai_tasks::Detection>) -> Result<JsValue, JsValue> {
+    let js: Vec<JsDetection> = dets
+        .into_iter()
+        .map(|d| JsDetection {
+            score: d.score,
+            xmin: d.xmin,
+            ymin: d.ymin,
+            xmax: d.xmax,
+            ymax: d.ymax,
+            keypoints: d.keypoints,
+        })
+        .collect();
+    serde_wasm_bindgen::to_value(&js).map_err(js_err)
+}
+
+/// GPU 모델 로드 → 핸들 반환 (기존 모델은 유지 — 다중 상주)
+#[wasm_bindgen]
+pub async fn load_model_h(bytes: Vec<u8>) -> Result<JsValue, JsValue> {
+    let ctx = engine()?;
+    let seg = ai_tasks::GpuSession::load(&ctx, &bytes).await.map_err(js_err)?;
+    let model = seg.model();
+    let mut report = JsLoaded {
+        handle: 0,
+        name: model.sw.name.clone(),
+        ops: model.report.ops,
+        unique_pipelines: model.report.unique_pipelines,
+        arena_mb: model.report.arena_bytes as f64 / 1e6,
+        weights_mb: model.report.weights_bytes as f64 / 1e6,
+    };
+    report.handle = GPU_MODELS.with(|p| p.borrow_mut().insert(seg));
+    serde_wasm_bindgen::to_value(&report).map_err(js_err)
+}
+
+/// GPU 모델 언로드 — 버퍼·파이프라인 참조 해제
+#[wasm_bindgen]
+pub fn unload_model_h(handle: u32) -> Result<(), JsValue> {
+    GPU_MODELS.with(|p| p.borrow_mut().remove(handle)).map_err(js_err)?;
+    Ok(())
+}
+
+/// 핸들 모델의 입력 크기·이름
+#[wasm_bindgen]
+pub fn model_io_h(handle: u32) -> Result<JsValue, JsValue> {
+    GPU_MODELS.with(|p| {
+        let b = p.borrow();
+        let model = b.get(handle).map_err(js_err)?.model();
+        let t = &model.sw.tensors[model.sw.inputs[0] as usize];
+        let info = JsFrameInfo {
+            h: t.h,
+            w: t.w,
+            c: t.c,
+            input: t.name.clone(),
+            outputs: model
+                .sw
+                .outputs
+                .iter()
+                .map(|&o| model.sw.tensors[o as usize].name.clone())
+                .collect(),
+        };
+        serde_wasm_bindgen::to_value(&info).map_err(js_err)
+    })
+}
+
+/// 핸들 모델의 프레임타임 분포 (강등 판정 입력 — 모델별로 따로 쌓인다)
+#[wasm_bindgen]
+pub fn model_stats_h(handle: u32) -> Result<JsValue, JsValue> {
+    GPU_MODELS.with(|p| {
+        let b = p.borrow();
+        let s = b.get(handle).map_err(js_err)?.stats();
+        serde_wasm_bindgen::to_value(&JsStats {
+            frames: s.frames,
+            p50_ms: s.p50_ms,
+            p90_ms: s.p90_ms,
+            last_ms: s.last_ms,
+        })
+        .map_err(js_err)
+    })
+}
+
+/// 핸들 모델로 프레임 1장 (업로드→추론→리드백) — infer_frame의 핸들판
+#[wasm_bindgen]
+pub async fn infer_frame_h(
+    handle: u32,
+    rgb: Vec<f32>,
+    output: String,
+) -> Result<Vec<f32>, JsValue> {
+    let ctx = engine()?;
+    // RefCell 대여를 await 너머로 못 들고 간다 — 꺼냈다 되돌리는 규약 (Pool 참조)
+    let mut seg = GPU_MODELS.with(|p| p.borrow_mut().take(handle)).map_err(js_err)?;
+    let result: Result<Vec<f32>, JsValue> = async {
+        seg.upload(&ctx, &rgb).map_err(js_err)?;
+        seg.infer(&ctx).await.map_err(js_err)?;
+        let out = seg.read_output(&ctx, &output).await.map_err(js_err)?;
+        seg.finish_frame(&ctx).await.map_err(js_err)?;
+        Ok(out)
+    }
+    .await;
+    GPU_MODELS.with(|p| p.borrow_mut().put(handle, seg));
+    result
+}
+
+/// 디텍터 프레임 1장 (GPU): 레터박스된 입력 → 검출 목록 (원본 프레임 정규화 좌표).
+/// preset: "face"(BlazeFace short-range 128²) | "palm"(192²).
+/// 호스트는 검정 캔버스에 비율 유지 중앙 정렬로 프레임을 그려 [-1,1]로 넘긴다.
+#[wasm_bindgen]
+pub async fn detect_gpu(
+    handle: u32,
+    preset: String,
+    rgb: Vec<f32>,
+    src_w: u32,
+    src_h: u32,
+) -> Result<JsValue, JsValue> {
+    let ctx = engine()?;
+    let post = ai_tasks::detect::preset(&preset).map_err(js_err)?;
+    let mut seg = GPU_MODELS.with(|p| p.borrow_mut().take(handle)).map_err(js_err)?;
+    let result = seg.detect(&ctx, post, &rgb, src_w, src_h).await;
+    GPU_MODELS.with(|p| p.borrow_mut().put(handle, seg));
+    js_detections(result.map_err(js_err)?)
+}
+
+/// CPU 모델 로드 → 핸들 반환 (load_model_cpu의 다중 상주판)
+#[wasm_bindgen]
+pub fn load_model_cpu_h(bytes: Vec<u8>) -> Result<JsValue, JsValue> {
+    let seg = ai_tasks::CpuSession::load(&bytes).map_err(js_err)?;
+    let sw = seg.model().sw();
+    let mut report = JsLoaded {
+        handle: 0,
+        name: sw.name.clone(),
+        ops: sw.ops.len(),
+        unique_pipelines: 0,
+        arena_mb: 0.0,
+        weights_mb: 0.0,
+    };
+    report.handle = CPU_MODELS.with(|p| p.borrow_mut().insert(seg));
+    serde_wasm_bindgen::to_value(&report).map_err(js_err)
+}
+
+#[wasm_bindgen]
+pub fn unload_model_cpu_h(handle: u32) -> Result<(), JsValue> {
+    CPU_MODELS.with(|p| p.borrow_mut().remove(handle)).map_err(js_err)?;
+    Ok(())
+}
+
+#[wasm_bindgen]
+pub fn model_io_cpu_h(handle: u32) -> Result<JsValue, JsValue> {
+    CPU_MODELS.with(|p| {
+        let b = p.borrow();
+        let sw = b.get(handle).map_err(js_err)?.model().sw();
+        let t = &sw.tensors[sw.inputs[0] as usize];
+        let info = JsFrameInfo {
+            h: t.h,
+            w: t.w,
+            c: t.c,
+            input: t.name.clone(),
+            outputs: sw
+                .outputs
+                .iter()
+                .map(|&o| sw.tensors[o as usize].name.clone())
+                .collect(),
+        };
+        serde_wasm_bindgen::to_value(&info).map_err(js_err)
+    })
+}
+
+#[wasm_bindgen]
+pub fn model_stats_cpu_h(handle: u32) -> Result<JsValue, JsValue> {
+    CPU_MODELS.with(|p| {
+        let b = p.borrow();
+        let s = b.get(handle).map_err(js_err)?.stats();
+        serde_wasm_bindgen::to_value(&JsStats {
+            frames: s.frames,
+            p50_ms: s.p50_ms,
+            p90_ms: s.p90_ms,
+            last_ms: s.last_ms,
+        })
+        .map_err(js_err)
+    })
+}
+
+/// 핸들 모델로 CPU 프레임 1장 (동기)
+#[wasm_bindgen]
+pub fn infer_frame_cpu_h(
+    handle: u32,
+    rgb: &[f32],
+    output: &str,
+) -> Result<Vec<f32>, JsValue> {
+    CPU_MODELS.with(|p| {
+        let mut b = p.borrow_mut();
+        let seg = b.get_mut(handle).map_err(js_err)?;
+        seg.infer_frame(rgb).map_err(js_err)?;
+        seg.read_output(output).map_err(js_err)
+    })
+}
+
+/// 디텍터 프레임 1장 (CPU) — detect_gpu와 같은 계약, 동기
+#[wasm_bindgen]
+pub fn detect_cpu(
+    handle: u32,
+    preset: String,
+    rgb: &[f32],
+    src_w: u32,
+    src_h: u32,
+) -> Result<JsValue, JsValue> {
+    let post = ai_tasks::detect::preset(&preset).map_err(js_err)?;
+    let dets = CPU_MODELS.with(|p| {
+        let mut b = p.borrow_mut();
+        b.get_mut(handle).map_err(js_err)?.detect(post, rgb, src_w, src_h).map_err(js_err)
+    })?;
+    js_detections(dets)
 }
 
 /// 공유 벤치마크 실행 — 네이티브 ai-bench와 동일 루틴

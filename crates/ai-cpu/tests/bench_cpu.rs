@@ -40,7 +40,7 @@ fn bench_cpu_model() {
 
     let container = sw.write_container(&blob).unwrap();
     let t_load = std::time::Instant::now();
-    let mut m = ai_cpu::CpuModel::load(&container).unwrap();
+    let mut m = ai_cpu::Model::load(&container).unwrap();
     let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
 
     let threads: usize =

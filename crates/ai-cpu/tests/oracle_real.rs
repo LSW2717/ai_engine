@@ -1,4 +1,4 @@
-//! 실모델 오라클 대조 — 변환기 산출물을 CpuModel과 CpuExec 양쪽에 태워
+//! 실모델 오라클 대조 — 변환기 산출물을 Model과 CpuExec 양쪽에 태워
 //! 전 출력 diff. 상태(state)는 양쪽 다 0 초기화라 1프레임 비교가 유효하다.
 //!
 //! 사용: `AI_ONNX=<경로> cargo test --release -p ai-cpu --test oracle_real -- --ignored --nocapture`
@@ -27,7 +27,7 @@ fn real_model_matches_cpuexec() {
     oracle.run().unwrap();
 
     let container = sw.write_container(&blob).unwrap();
-    let mut m = ai_cpu::CpuModel::load(&container).unwrap();
+    let mut m = ai_cpu::Model::load(&container).unwrap();
     m.set_input(&sw.tensors[in_tid as usize].name.clone(), &input).unwrap();
     m.infer().unwrap();
 

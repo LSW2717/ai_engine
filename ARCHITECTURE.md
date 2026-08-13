@@ -60,7 +60,7 @@ webgl2-engine-span.js(~3ms)와 ORT-web WebGPU(~2ms)를 넘는 추론 성능, mem
 1. `ai-cpu/src/kernels/<이름>.rs` — 커널 + `ai-core::reference` 대조 테스트
    (SIMD는 `simd::F32x4`만 사용 — `core::arch` 직접 금지, 새 아키는 simd.rs에 cfg 블록 하나)
 2. `ai-cpu/src/plan.rs` — SwOp → PlanKind lowering arm (가중치 재패킹 포함)
-3. `ai-cpu/src/exec.rs` — 디스패치 arm (핫 커널이면 행 밴드 병렬 경로도)
+3. `ai-cpu/src/model.rs` — 디스패치 arm (핫 커널이면 행 밴드 병렬 경로도)
 4. 정확도 게이트: `synthetic_e2e`(상시) + `AI_ONNX=<onnx> cargo test -p ai-cpu --test oracle_real -- --ignored`
    — dtype 규약은 GPU lowering과 동일 (std conv 가중치만 `dt_weights`, 나머지 `dt_default`)
 

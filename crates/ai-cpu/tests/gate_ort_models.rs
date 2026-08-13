@@ -1,4 +1,4 @@
-//! **정확도 게이트 (범용)** — onnxruntime 기준값과 CpuModel 전 출력 대조.
+//! **정확도 게이트 (범용)** — onnxruntime 기준값과 Model 전 출력 대조.
 //!
 //! oracle_real은 엔진 자체 레퍼런스(CpuExec)와 비교라 새 op의 lowering이
 //! 양쪽에서 같이 틀리면 통과한다 — MediaPipe 계열(op 3종+canon)을 들일 때는
@@ -29,7 +29,7 @@ fn cpu_outputs_match_ort() {
     run_full(&mut g, &ctx).unwrap();
     let (sw, blob) = lower(&g, &ctx, "gate").unwrap();
     let container = sw.write_container(&blob).unwrap();
-    let mut m = ai_cpu::CpuModel::load(&container).unwrap();
+    let mut m = ai_cpu::Model::load(&container).unwrap();
 
     let in_name = sw.tensors[sw.inputs[0] as usize].name.clone();
     let input = read_f32s(&oracle.join("input_nhwc.f32"));

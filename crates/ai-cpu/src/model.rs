@@ -12,7 +12,7 @@ use crate::plan::{self, Operand, Plan, PlanKind, Step, ViewRef};
 use crate::view::View;
 use crate::CpuError;
 
-pub struct CpuModel {
+pub struct Model {
     sw: SwModel,
     plan: Plan,
     slots: Vec<Vec<f32>>,
@@ -30,7 +30,7 @@ fn view<'s>(slots: &'s [Vec<f32>], vr: ViewRef) -> View<'s> {
     View { data: &slots[vr.slot], c_off: vr.c_off, stride: vr.stride, c: vr.c }
 }
 
-impl CpuModel {
+impl Model {
     pub fn load(bytes: &[u8]) -> Result<Self, CpuError> {
         let (sw, blob) = SwModel::parse_container(bytes)
             .map_err(|e| CpuError::Format(format!("{e:?}")))?;

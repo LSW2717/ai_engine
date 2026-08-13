@@ -27,7 +27,7 @@ fn budget_table() {
     let input = XorShift32::new(7).vec_f32((t.h * t.w * t.c) as usize);
 
     let container = sw.write_container(&blob).unwrap();
-    let mut m = ai_cpu::CpuModel::load(&container).unwrap();
+    let mut m = ai_cpu::Model::load(&container).unwrap();
     m.set_input(&name, &input).unwrap();
     for _ in 0..3 {
         m.infer().unwrap();

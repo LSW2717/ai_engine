@@ -12,12 +12,16 @@
 
 pub mod clock;
 pub mod composite;
+pub mod cpu_session;
+pub mod detect;
 pub mod error;
-pub mod segmenter;
-pub mod segmenter_cpu;
+pub mod gpu_session;
+pub mod pool;
 
 pub use clock::Stats;
 pub use composite::{CompositeOpts, Compositor};
+pub use cpu_session::CpuSession;
+pub use detect::{Detection, DetectorPost};
 pub use error::TaskError;
-pub use segmenter::Segmenter;
-pub use segmenter_cpu::CpuSegmenter;
+pub use gpu_session::GpuSession;
+pub use pool::Pool;
