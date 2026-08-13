@@ -23,12 +23,13 @@ struct P {
     bg_offset: vec2f,
     light_wrap: f32,
     use_fgr: f32,
-    _pad1: f32,
-    _pad2: f32,
+    texel: vec2f,        // 출력(캔버스) 텍셀 — 이미지 배경 자체 블러가 소비
     // 스튜디오 조명 (v-ai RELIGHT 등가): x=enabled, y=ambient, z=aspect
     relight: vec4f,
     // xy=위치, z=radius, w=intensity / rgb=색, w=target(0 인물 1 배경 2 전체)
     lights: array<vec4f, 4>,
+    // 인물 중앙 프레이밍: xyz = scale, cx, cy (scale 1 = 크롭 없음)
+    framing: vec4f,
 }
 @group(0) @binding(5) var<uniform> p: P;
 // RVM 전경색 (매팅) — use_fgr=0이면 미사용 (프레임 뷰가 더미로 바인딩됨)
@@ -56,30 +57,63 @@ fn gray(c: vec3f) -> f32 {
     return dot(c, vec3f(0.299, 0.587, 0.114));
 }
 
+// 이미지 배경 자체 블러 — v-ai blurBackground 등가 (radius mix(1,12,s),
+// 가우시안 exp(-d²/(2r²+1e-4)), 오프셋 texel×2, s≤0.001이면 스킵)
+fn blur_bg_image(uv: vec2f) -> vec3f {
+    let s = clamp(p.blur_strength, 0.0, 1.0);
+    if (s <= 0.001) {
+        return textureSampleLevel(bg_image, samp, uv, 0.0).rgb;
+    }
+    let radius_f = mix(1.0, 12.0, s);
+    let radius = i32(radius_f);
+    var sum = vec3f(0.0);
+    var total = 0.0;
+    for (var x = -12; x <= 12; x += 1) {
+        for (var y = -12; y <= 12; y += 1) {
+            if (abs(x) > radius || abs(y) > radius) {
+                continue;
+            }
+            let off = vec2f(f32(x), f32(y)) * p.texel * 2.0;
+            let d = f32(x * x + y * y);
+            let w = exp(-d / (2.0 * radius_f * radius_f + 1.0e-4));
+            sum += textureSampleLevel(bg_image, samp, uv + off, 0.0).rgb * w;
+            total += w;
+        }
+    }
+    return sum / max(total, 1.0e-4);
+}
+
 @fragment fn fs(in: VsOut) -> @location(0) vec4f {
-    let color = textureSampleLevel(frame, samp, in.uv, 0.0).rgb;
-    let raw = textureSampleLevel(mask_hi, samp, in.uv, 0.0).r;
+    // 인물 중앙 프레이밍 크롭 좌표 — v-ai 규약:
+    //  - image/단색(image 스테이지): **인물 레이어만** 크롭, 배경·조명은 화면 고정
+    //  - 원본/블러(2D transform 등가): 합성 전체 크롭 — 배경·조명도 크롭 좌표
+    let cuv = in.uv * p.framing.x + (p.framing.yz - p.framing.x * 0.5);
+    let whole = p.bg_mode < 2u;
+    let buv = select(in.uv, cuv, whole); // 배경·조명 좌표
+    let color = textureSampleLevel(frame, samp, cuv, 0.0).rgb;
+    let raw = textureSampleLevel(mask_hi, samp, cuv, 0.0).r;
 
     var bg: vec3f;
     if (p.bg_mode == 0u) {
         bg = color;
     } else if (p.bg_mode == 1u) {
-        let blurred = textureSampleLevel(bg_blur, samp, in.uv, 0.0).rgb;
+        let blurred = textureSampleLevel(bg_blur, samp, buv, 0.0).rgb;
         bg = mix(color, blurred, clamp(p.blur_strength, 0.0, 1.0));
     } else if (p.bg_mode == 2u) {
         bg = p.bg_color.rgb;
     } else {
-        bg = textureSampleLevel(bg_image, samp, in.uv * p.bg_scale + p.bg_offset, 0.0).rgb;
+        bg = blur_bg_image(in.uv * p.bg_scale + p.bg_offset);
     }
 
     // 정석 매팅 합성 (RVM): 전경 = fgr — 원래 배경색이 섞인 카메라 픽셀 대신
     // 모델이 복원한 순수 전경색을 쓴다. com = fgr×α + bg×(1−α).
     var fg = color;
     if (p.use_fgr > 0.5) {
-        fg = textureSampleLevel(fgr_tex, samp, in.uv, 0.0).rgb;
+        fg = textureSampleLevel(fgr_tex, samp, cuv, 0.0).rgb;
     }
-    if (p.bg_mode == 3u) {
-        // light wrapping — 배경 빛이 인물 윤곽에 감기는 효과 (screen 블렌드)
+    // light wrapping — 배경 빛이 인물 윤곽에 감기는 효과 (screen 블렌드).
+    // v-ai에선 단색(#hex)도 image 스테이지를 타므로 색/이미지 배경 공통.
+    if (p.bg_mode >= 2u) {
         let lwm = 1.0 - max(0.0, raw - p.cov.y) / (1.0 - p.cov.y);
         let lw = p.light_wrap * lwm * bg;
         fg = 1.0 - (1.0 - fg) * (1.0 - lw);
@@ -89,12 +123,17 @@ fn gray(c: vec3f) -> f32 {
     // 스필 억제/엣지 다크닝은 매팅 모드에서도 살아있는 조정 파라미터다 —
     // fgr가 오염을 원리적으로 줄이지만 잔여 스필(실제 조명 반사·fgr 추정 오차)은
     // 남는다. 끄고 싶으면 파라미터를 0으로 (코드로 막지 않는다).
+    // 단 passthrough(원본 배경)는 v-ai에 스필/엣지 자체가 없다 — 모드로 끈다.
     let edge = clamp(1.0 - abs(pm * 2.0 - 1.0), 0.0, 1.0);
-    fg = mix(fg, vec3f(gray(fg)), edge * clamp(p.spill, 0.0, 1.0));
+    if (p.bg_mode != 0u) {
+        fg = mix(fg, vec3f(gray(fg)), edge * clamp(p.spill, 0.0, 1.0));
+    }
     bg = mix(bg, vec3f(gray(bg)), clamp(p.grayscale, 0.0, 1.0)) * p.brightness;
 
     var fin = mix(bg, fg, pm);
-    fin *= 1.0 - edge * clamp(p.edge_dark, 0.0, 1.0) * 0.06;
-    fin = apply_relight(fin, pm, in.uv);
+    if (p.bg_mode != 0u) {
+        fin *= 1.0 - edge * clamp(p.edge_dark, 0.0, 1.0) * 0.06;
+    }
+    fin = apply_relight(fin, pm, buv);
     return vec4f(fin, 1.0);
 }

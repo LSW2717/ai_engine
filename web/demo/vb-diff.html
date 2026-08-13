@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<title>vb-diff — v-ai GLSL vs ai_engine WGSL 픽셀 diff 게이트</title>
+<style>
+  body { font: 13px/1.5 -apple-system, sans-serif; margin: 16px; background: #111; color: #ddd; }
+  h1 { font-size: 15px; }
+  canvas { border: 1px solid #333; image-rendering: pixelated; }
+  .row { display: flex; gap: 12px; align-items: flex-start; flex-wrap: wrap; }
+  .pane { text-align: center; }
+  .tag { font-size: 11px; color: #8ab; }
+  #log { white-space: pre; font-family: ui-monospace, monospace; font-size: 12px; color: #bda; }
+  .err { color: #f88; }
+</style>
+</head>
+<body>
+<h1>같은 프레임 + 같은 마스크 → v-ai GLSL 스택 vs ai_engine WGSL 스택 (P1 픽셀 diff 게이트)</h1>
+<div id="status">준비</div>
+<div class="row">
+  <div class="pane"><div class="tag">주입 프레임</div><canvas id="srcv" width="640" height="360" style="width:320px"></canvas></div>
+  <div class="pane"><div class="tag">ai_engine (WGSL)</div><canvas id="ours" width="640" height="360" style="width:320px"></canvas></div>
+  <div class="pane"><div class="tag">v-ai (GLSL)</div><canvas id="vai" width="640" height="360" style="width:320px"></canvas></div>
+  <div class="pane"><div class="tag">|diff| ×16</div><canvas id="diffv" width="640" height="360" style="width:320px"></canvas></div>
+</div>
+<div id="log"></div>
+<script type="module" src="vb-diff.js"></script>
+</body>
+</html>

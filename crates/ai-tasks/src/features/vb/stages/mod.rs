@@ -195,6 +195,7 @@ struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f }
 "#;
 
 // ── 스테이지 목록 (1스테이지 = 1파일 + 1wgsl) ──
+pub(crate) mod bbox;
 pub(crate) mod bg_blur;
 pub(crate) mod mask_refine;
 pub(crate) mod compose;

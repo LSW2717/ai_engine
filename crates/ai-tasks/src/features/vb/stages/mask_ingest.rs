@@ -34,11 +34,16 @@ impl MaskIngest {
         MaskIngest { fs, params: ubo(ctx, "video-mask-ingest", 32) }
     }
 
-    pub fn write_params(&self, ctx: &GpuContext, kind: MaskKind) {
-        let (mode, min_a, max_a) = match kind {
+    /// ema=false: min_a=max_a=1 → 출력=현재 프레임 (게이트가 시간 상태를 끊을 때)
+    pub fn write_params(&self, ctx: &GpuContext, kind: MaskKind, ema: bool) {
+        let (mode, mut min_a, mut max_a) = match kind {
             MaskKind::Logits2 => (0u32, 0.03f32, 0.9f32),
             MaskKind::Alpha => (1, 0.6, 0.9),
         };
+        if !ema {
+            min_a = 1.0;
+            max_a = 1.0;
+        }
         let mut b = [0u8; 32];
         b[0..4].copy_from_slice(&mode.to_le_bytes());
         b[16..20].copy_from_slice(&0.3f32.to_le_bytes()); // diff 문턱

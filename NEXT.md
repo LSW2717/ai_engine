@@ -3,14 +3,17 @@
 ## 다음 작업 (우선순위 — 2026-08-14 정리)
 
 **A. P1 마무리 — VideoPipeline 완성** (지금 여기)
-1. **웹 파이프라인 픽셀 diff 게이트** — 같은 프레임+같은 마스크를 v-ai GLSL 스택과
-   우리 WGSL 스택에 넣어 채널별 diff. "상수가 같다"의 증명이 아직 없다 —
-   이게 P1의 완료 조건이다.
-2. **프레이밍(인물 중앙화)** — GPU bbox 리덕션(마스크 해상도 컴퓨트 → 16B 비동기
-   리드백 링) + 순수 Rust 활강(데드밴드 0.045/0.055 · 2s 지속이탈 커밋 · EMA 0.5s ·
-   슬루 0.35/s — 웹 상수) + compose person-crop(이미지 배경은 인물만, 그 외 전체).
-   studio 토글. ⚠ 리드백은 프레임당 16B뿐 — 저사양 원칙 유지.
-3. **mirror/degree + 이미지배경 자체 블러** — compose 확장 (웹 파리티 항목 잔여분).
+1. ~~웹 파이프라인 픽셀 diff 게이트~~ **완료 (2026-08-14)** — 16개 검사 전부
+   채널 diff **max ≤ 1/255**. §"픽셀 diff 게이트" 참조. 이미지배경 자체 블러도
+   이 작업에서 같이 개통(3번의 절반).
+2. ~~프레이밍(인물 중앙화)~~ **완료 (2026-08-14)** — §"프레이밍" 참조.
+   게이트: 크롭 수학 diff PASS(F/color·F/image max 1) + bbox 네이티브 게이트 +
+   framing.rs 단위테스트 5종. ⚠ 잔여: 프레이밍 크롭 중 **페이스 이펙트 좌표 보정**
+   (INTEGRATION.md §2 계약 — studio 3D 아이템이 아직 미보정, P3 오버레이 때 같이).
+3. **mirror/degree** — compose 확장 (웹 파리티 잔여분. 이미지배경 자체 블러는 1에서
+   완료). v-ai는 이미지 스테이지 정점 셰이더의 transform 행렬 + contain 스케일
+   (updateTransform) — 배경 cover 크롭 수학 파리티도 이때 게이트에 추가
+   (지금 게이트는 배경·프레임 종횡비 동일로 크롭 항등).
 4. **studio HUD 정직화** — 지금은 제출 벽시계(허수). rAF 간격 실측 + 5초마다
    동기화 1회 샘플로 교체.
 
@@ -113,9 +116,63 @@ filter 풀해상 변형 또는 입력 해상도 상향(mnv4-RVM 교체 때 결�
 (preprocess enable f16) + 스테이징 rgba16float/bpr 분기. studio에 세그 모델
 셀렉트(R11/RVM) + studio_invalidate(세션 교체 시 바인드그룹 폐기 필수 — 안 하면
 이전 모델 버퍼를 문 채 조용히 오동작). ?model=rvm 헤드리스 PASS.
-**P1 잔여**: 프레이밍(GPU bbox 리덕션), mirror/degree, 이미지배경 blur,
-**웹 파이프라인 픽셀 diff 게이트**, HUD 프레임타임 동기화(지금은 제출 벽시계 — 허수). 3D 렌더 파리티(three.js vs
-WGSL 차이)는 사용자가 보류 확정.
+**P1 잔여**: mirror/degree(+배경 크롭 수학 게이트), HUD 프레임타임 동기화(지금은
+제출 벽시계 — 허수), 프레이밍 중 페이스 이펙트 좌표 보정(P3 오버레이와 한 묶음).
+3D 렌더 파리티(three.js vs WGSL 차이)는 사용자가 보류 확정.
+
+**픽셀 diff 게이트 — 완료 (2026-08-14): WGSL 스택 = v-ai GLSL 스택 픽셀 등가 증명**
+같은 결정적 프레임(640×360)+같은 마스크(256×144)를 양쪽에 주입해 최종 합성 RGBA
+채널별 diff — **16개 검사(모드 7종×마스크 2 + EMA 2프레임) 전부 max ≤ 1/255**.
+재현: `make vai-gate-assets && node tools/run_web.mjs demo/vb-diff.html`.
+- 구조: ai-tasks `process_gpu_mask`(외부 마스크 직주입 — 추론 생략, fgr 강제 off,
+  ema 노브. **P2 B티어의 마스크 인제스트 진입점이 이것**) + `gate.rs` GateHarness
+  (프레임 업로드+오프스크린 타깃+리드백) + wasm `vb_gate_*` 4종. 비교 상대는
+  `web/demo/vai-stack.js` — vendor 사본(video-worker-webgl2.js, gitignore)을
+  **blob import로 열어 스테이지 팩토리를 스탠드얼론 조립** (전역 상태 무의존 확인,
+  v-ai 셰이더가 바뀌면 사본 갱신만으로 게이트가 추종).
+- **게이트가 잡아서 고친 WGSL 불일치 6개** (v-ai가 기준):
+  ①JBF의 저해상 마스크 샘플링은 **NEAREST**(v-ai segmentationTexture 기본값 —
+  Linear면 경계 전 구간 diff) ②refine 블러H 소스(personMask)도 NEAREST
+  ③passthrough(원본 배경)엔 **spill/edge darkening이 없다** — bg_mode 0에서 끔
+  ④**단색(#hex) 배경도 v-ai에선 2×2 이미지로 image 스테이지를 탄다** — Color에
+  이미지급 상수(spill 0.18/edge 0.24/refine 1.2/0.4/0.58)+light wrapping 적용
+  ⑤bg 블러 체인은 **V→H 순서** ×6 (마스크 가중 때문에 순서가 결과에 남는다)
+  ⑥이미지배경 자체 블러 신설(compose에 radius=int(mix(1,12,s)) 가우시안,
+  **texel=(coverScale/W, coverScale/H)** — applyScaleAndOffset 규약).
+  +JBF step/radius는 f64로 계산(JS와 비트 정합 — 1ULP 차로 루프 탭 수가 갈린다).
+- **EMA를 게이트에서 다루는 법** (정찰 결론): softmax 경로 minα=0.03은 8비트
+  history 양자화로 **참값에서 0.065 떨어진 지점에 고착**(0.5/255/α) — 수렴 대기
+  프로토콜은 양쪽 고착점이 달라 못 쓴다. 대신 ①공간 스택은 EMA off+1/255 격자
+  사전 양자화 마스크로 1프레임 결정적 비교 ②EMA는 제로 히스토리 1프레임(diff=curr,
+  0.3 경계는 격자가 비껴감) + |Δprob|≤0.18 설계 2프레임(동적 α 분기 경계 0.3에서
+  마진 0.12 — history 1LSB 차로 분기가 갈리는 픽셀 원천 차단)으로 검증.
+- 함정 기록: v-ai `createTexture`는 **현재 활성 유닛에 새 텍스처를 바인딩**한다 —
+  하네스에서 스테이지를 프레임 바인딩 뒤에 지연 생성하면 TEXTURE0(프레임)이
+  밀려나 JBF가 검정을 가이드로 읽는다 (frame1만 전멸, frame2 정상이 증상).
+  v-ai readPixels는 bottom-up(배경 스테이지만 Y 플립) — 행 반전 필수.
+
+**프레이밍(인물 중앙화) — 완료 (2026-08-14)**: v-ai `_updateFraming` 1:1 이식.
+- 구조: `framing.rs`(순수 로직 — 목표 계산 headroom 0.15/zoomMax 1.7/하단 0.05/
+  가로 1.15 + 데드밴드 0.045/0.055 + 2s 지속이탈 커밋 + EMA 시정수 0.5s + 슬루
+  0.35/s + 소실 2s 홀드 후 복귀, 단위테스트 5종) + `stages/bbox.rs`(컴퓨트 리덕션:
+  워크그룹 공유 atomic 선축약 → 전역 atomic은 워크그룹당 5개, EMA 이후 mask_lo
+  소비, v>0.5 ≡ 웹 u8>127, 1% 문턱) + **리드백 링 2슬롯 20B/프레임**(map_async
+  논블로킹, 쓴 버퍼는 회수 후에만 재기록 — v-ai PBO 링과 같은 규율. v-ai는 37KB
+  마스크를 내려 CPU 스캔하지만 우리는 리덕션을 GPU에서 하고 20B만 내린다).
+- compose 크롭 규약(v-ai 등가, 게이트 검증): **image/단색 = 인물 레이어만**
+  (frame·mask·fgr을 crop 좌표로, 배경·relight는 화면 고정) / **원본·블러 = 합성
+  전체**(배경·relight도 crop 좌표 — v-ai 캔버스 2D transform 등가). 전체 크롭은
+  v-ai가 래스터 후 재샘플(이중 필터)인 반면 우리는 셰이더 단일 필터 — v-ai 자신도
+  스테이지가 지원하면 셰이더 크롭 우선(framingInShader)이므로 의도된 개선.
+  게이트 참고 수치로도 max 2/255 이내.
+- 규율: **invalidate()는 프레이밍 상태를 리셋하지 않는다** (v-ai 주석 — 옵션 조작
+  마다 줌이 1x로 튕겼다 재수렴하는 "띡띡" 방지. 리셋은 스트림 파기에서만).
+  `set_framing_override`(게이트/디버그용 크롭 강제)·`framing_current`·`last_bbox`
+  공개. studio 토글 추가(zoomMax 1.7/headroom 0.15).
+- 게이트: vb-diff F상(고정 크롭 — v-ai GL updateFraming과 diff, max 1 PASS) +
+  vb_pipeline.rs bbox 게이트(사각 마스크 → 정규화 bbox 오차 <0.01 + 0 마스크 →
+  None) + studio 헤드리스(프레이밍 on 스모크 PASS, p50 변화 없음).
+- ⚠ 실인물 눈검증(줌인 활강 UX)은 사용자 몫 — 카메라로 studio 프레이밍 토글 확인.
 
 **실행 계획 (2026-08-13, INTEGRATION.md §3)** — 데모 HTML 주도
 (사용자 제안): `web/demo/studio.html` = 제품 UI 미니어처, 단계마다 효과를 켜며

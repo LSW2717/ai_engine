@@ -163,4 +163,32 @@ fn rvm_mask_appears() {
     assert!(pipe.uses_fgr(), "RVM인데 fgr 매팅 경로 비활성");
     assert!(pha_mean > 0.05, "pha 전멸 — 전처리(f16)/추론 경로 사망");
     assert!(frac > 0.05 && frac < 0.6, "합성 전경 비율 비정상 {frac} — 마스크 스택 사망");
+
+    // ── bbox 리덕션 게이트: 알려진 사각 마스크 주입 → 20B 리드백 → 정규화 bbox ──
+    // (process_gpu_mask + 프레이밍 on — v-ai _scanPersonBBox 등가: v>0.5, 1% 문턱)
+    pipe.apply_json(r#"{"framing":{"enabled":true}}"#).unwrap();
+    let (mw, mh) = (256usize, 144usize);
+    let mut mask = vec![0f32; mw * mh];
+    for y in 36..108 {
+        for x in 64..192 {
+            mask[y * mw + x] = 1.0;
+        }
+    }
+    // 프레임 1: bbox 디스패치+리드백 발행 → 대기(콜백은 poll에서 해소) → 프레임 2: 펌프
+    for _ in 0..3 {
+        pipe.process_gpu_mask(&ctx, &seg, &mask, 1, false, w, h, &tview).unwrap();
+        pollster::block_on(ai_gpu::readback::wait_idle(&ctx)).unwrap();
+    }
+    let bb = pipe.last_bbox().expect("bbox 리드백 미도착 — 링/펌프 사망");
+    println!("bbox {bb:?} (기대 [0.25, 0.75, 0.25, 0.75])");
+    for (got, want) in bb.iter().zip([0.25f32, 0.75, 0.25, 0.75]) {
+        assert!((got - want).abs() < 0.01, "bbox 불일치: {bb:?}");
+    }
+    // 인물 소실: 0 마스크 → 새 스캔이 None (1% 문턱)
+    let zero_mask = vec![0f32; mw * mh];
+    for _ in 0..3 {
+        pipe.process_gpu_mask(&ctx, &seg, &zero_mask, 1, false, w, h, &tview).unwrap();
+        pollster::block_on(ai_gpu::readback::wait_idle(&ctx)).unwrap();
+    }
+    assert!(pipe.last_bbox().is_none(), "0 마스크인데 bbox가 남음 — 1% 문턱 사망");
 }

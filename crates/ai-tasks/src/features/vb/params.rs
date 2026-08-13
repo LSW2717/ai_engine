@@ -78,6 +78,9 @@ pub struct EffectsPatch {
     /// null=조명 해제
     #[serde(deserialize_with = "double")]
     pub studio_light: Option<Option<StudioLightOptions>>,
+    /// null=프레이밍 해제 (인물 중앙화 — framing.rs)
+    #[serde(deserialize_with = "double")]
+    pub framing: Option<Option<crate::features::vb::framing::FramingOptions>>,
 }
 
 /// 해석된 현재 상태 — 파이프라인이 프레임마다 읽는 단일 진실
@@ -88,6 +91,7 @@ pub struct EffectsState {
     pub brightness: f32,
     pub grayscale: f32,
     pub studio_light: Option<StudioLightOptions>,
+    pub framing: Option<crate::features::vb::framing::FramingOptions>,
 }
 
 impl Default for EffectsState {
@@ -98,6 +102,7 @@ impl Default for EffectsState {
             brightness: 1.0,
             grayscale: 0.0,
             studio_light: None,
+            framing: None,
         }
     }
 }
@@ -132,6 +137,9 @@ impl EffectsState {
         if let Some(sl) = &patch.studio_light {
             self.studio_light = sl.clone().filter(|o| o.enabled);
         }
+        if let Some(f) = &patch.framing {
+            self.framing = f.clone().filter(|o| o.enabled);
+        }
     }
 
     /// "#rrggbb" → [r,g,b] (0..1)
@@ -146,10 +154,12 @@ impl EffectsState {
         Ok(())
     }
 
-    /// blur 종속 파생 상수 — 웹 `_computePostProcessingConfig` 등가 (v-ai 파리티 스펙)
+    /// blur 종속 파생 상수 — 웹 `_computePostProcessingConfig` 등가 (v-ai 파리티 스펙).
+    /// ⚠ v-ai에서 `imageBackground = !!config.background` — 단색(#hex)도 2×2 단색
+    /// 이미지로 image 스테이지를 타므로 **Color도 이미지급 상수**다 (게이트로 검증).
     pub fn derived(&self) -> Derived {
         let b = self.blur;
-        let image = matches!(self.background, Background::Image);
+        let image = matches!(self.background, Background::Image | Background::Color(_));
         Derived {
             sigma_space: 2.0 + b * 3.2,
             sigma_color: 0.1 + b * 0.36,

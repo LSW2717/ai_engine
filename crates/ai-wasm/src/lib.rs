@@ -935,6 +935,87 @@ pub async fn studio_frame(
     result
 }
 
+// ───────── vb 픽셀 diff 게이트 — v-ai GLSL 파리티 (web/demo/vb-diff.html) ─────────
+
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static VB_GATE: RefCell<Option<ai_tasks::features::vb::GateHarness>> =
+        const { RefCell::new(None) };
+}
+
+/// 게이트 하네스 생성/전체 리셋 (EffectsState·EMA·배경 이미지 전부 초기화)
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn vb_gate_reset() -> Result<(), JsValue> {
+    let ctx = engine()?;
+    VB_GATE.with(|c| {
+        *c.borrow_mut() = Some(ai_tasks::features::vb::GateHarness::new(&ctx));
+    });
+    Ok(())
+}
+
+/// EffectsPatch JSON 적용 (게이트 파이프라인)
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn vb_gate_config(json: String) -> Result<(), JsValue> {
+    VB_GATE.with(|c| {
+        let mut b = c.borrow_mut();
+        let g = b.as_mut().ok_or_else(|| JsValue::from_str("vb_gate_reset 먼저"))?;
+        g.pipeline.apply_json(&json).map_err(js_err)
+    })
+}
+
+/// 배경 이미지 업로드 (게이트 파이프라인, RGBA8)
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn vb_gate_bg_image(rgba: &[u8], w: u32, h: u32) -> Result<(), JsValue> {
+    let ctx = engine()?;
+    VB_GATE.with(|c| {
+        let mut b = c.borrow_mut();
+        let g = b.as_mut().ok_or_else(|| JsValue::from_str("vb_gate_reset 먼저"))?;
+        g.pipeline.set_background_image(&ctx, rgba, w, h);
+        Ok(())
+    })
+}
+
+/// 게이트: 프레이밍 크롭 강제 고정 (bbox·스무딩 우회 — 크롭 수학 파리티 검증용)
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn vb_gate_framing(scale: f32, cx: f32, cy: f32) -> Result<(), JsValue> {
+    VB_GATE.with(|c| {
+        let mut b = c.borrow_mut();
+        let g = b.as_mut().ok_or_else(|| JsValue::from_str("vb_gate_reset 먼저"))?;
+        g.pipeline.set_framing_override(Some((scale, cx, cy)));
+        Ok(())
+    })
+}
+
+/// 프레임+마스크 주입 1장 → 이펙트 스택(추론 없음) → 최종 RGBA 반환.
+/// ch=1 알파(RVM pha 등가), ch=2 로짓 [bg, person]. 마스크는 모델 마스크 해상도.
+/// ema=false면 시간 상태를 끊는다 (공간 스택 결정적 게이트).
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub async fn vb_gate_frame(
+    seg: u32,
+    frame_rgba: &[u8],
+    fw: u32,
+    fh: u32,
+    mask: &[f32],
+    ch: u32,
+    ema: bool,
+) -> Result<Vec<u8>, JsValue> {
+    let ctx = engine()?;
+    let seg_s = GPU_MODELS.with(|p| p.borrow_mut().take(seg)).map_err(js_err)?;
+    let mut g = VB_GATE.with(|c| c.borrow_mut().take());
+    let result = match g.as_mut() {
+        Some(g) => g.frame(&ctx, &seg_s, frame_rgba, fw, fh, mask, ch, ema).await.map_err(js_err),
+        None => Err(JsValue::from_str("vb_gate_reset 먼저")),
+    };
+    VB_GATE.with(|c| *c.borrow_mut() = g);
+    GPU_MODELS.with(|p| p.borrow_mut().put(seg, seg_s));
+    result
+}
+
 /// 공유 벤치마크 실행 — 네이티브 ai-bench와 동일 루틴
 #[wasm_bindgen]
 pub async fn run_benchmarks() -> Result<JsValue, JsValue> {

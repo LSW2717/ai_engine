@@ -6,6 +6,8 @@
 @group(0) @binding(0) var frame: texture_2d<f32>;
 @group(0) @binding(1) var mask_lo: texture_2d<f32>;
 @group(0) @binding(2) var samp: sampler;
+// v-ai segmentationTexture는 NEAREST — 마스크만 최근접 (프레임 가이드는 선형)
+@group(0) @binding(4) var samp_near: sampler;
 struct P {
     texel: vec2f,       // 출력(프레임) 해상도 텍셀
     step: f32,
@@ -30,7 +32,7 @@ fn gauss(x: f32, sigma: f32) -> f32 {
         for (var j = -p.radius + p.offset; j <= p.radius; j += p.step) {
             let coord = in.uv + vec2f(j, i) * p.texel;
             let fc = textureSampleLevel(frame, samp, coord, 0.0).rgb;
-            let m = textureSampleLevel(mask_lo, samp, coord, 0.0).r;
+            let m = textureSampleLevel(mask_lo, samp_near, coord, 0.0).r;
             let w = gauss(distance(in.uv, coord), p.sigma_texel)
                 * gauss(distance(center, fc), p.sigma_color);
             den += w;

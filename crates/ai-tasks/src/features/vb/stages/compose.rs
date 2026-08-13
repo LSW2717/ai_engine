@@ -23,10 +23,11 @@ impl Compose {
             target,
             &[Bind::Tex, Bind::Tex, Bind::Tex, Bind::Tex, Bind::Sampler, Bind::Uniform, Bind::Tex],
         );
-        Compose { fs, params: ubo(ctx, "video-compose", 160) }
+        Compose { fs, params: ubo(ctx, "video-compose", 176) }
     }
 
-    /// bg_dims: 업로드된 배경 이미지 크기 (cover 크롭 계산용)
+    /// bg_dims: 업로드된 배경 이미지 크기 (cover 크롭 계산용).
+    /// framing: 인물 중앙 프레이밍 (scale, cx, cy — scale 1 = off)
     pub fn write_params(
         &self,
         ctx: &GpuContext,
@@ -34,6 +35,7 @@ impl Compose {
         (fw, fh): (u32, u32),
         bg_dims: Option<(u32, u32)>,
         use_fgr: bool,
+        framing: (f32, f32, f32),
     ) {
         let d = st.derived();
         let (mode, color) = match &st.background {
@@ -62,7 +64,11 @@ impl Compose {
         for v in [color[0], color[1], color[2], 1.0] {
             b.extend_from_slice(&v.to_le_bytes());
         }
-        for v in [sx, sy, (1.0 - sx) * 0.5, (1.0 - sy) * 0.5, d.light_wrapping, if use_fgr { 1.0 } else { 0.0 }, 0.0, 0.0] {
+        // texel = 이미지 배경 자체 블러 오프셋 — v-ai applyScaleAndOffset가
+        // (scale/W, scale/H)로 쓴다 (cover 크롭 축이 좁아지면 오프셋도 좁게)
+        for v in [sx, sy, (1.0 - sx) * 0.5, (1.0 - sy) * 0.5, d.light_wrapping,
+            if use_fgr { 1.0 } else { 0.0 }, sx / fw as f32, sy / fh as f32]
+        {
             b.extend_from_slice(&v.to_le_bytes());
         }
         // 스튜디오 조명: relight vec4 + lights 4×vec4 (2광원 × [pos/radius/int, color/target])
@@ -88,6 +94,9 @@ impl Compose {
             for v in pr.into_iter().chain(ct) {
                 b.extend_from_slice(&v.to_le_bytes());
             }
+        }
+        for v in [framing.0, framing.1, framing.2, 0.0] {
+            b.extend_from_slice(&v.to_le_bytes());
         }
         ctx.queue.write_buffer(&self.params, 0, &b);
     }

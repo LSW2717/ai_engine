@@ -37,6 +37,8 @@ function currentPatch() {
           ],
         }
       : null,
+    // 인물 중앙 프레이밍 (웹 기본값 zoomMax 1.7 / headroom 0.15)
+    framing: $('framing').checked ? { enabled: true, zoomMax: 1.7, headroom: 0.15 } : null,
   });
 }
 
@@ -67,7 +69,7 @@ function wireControls() {
     }
     push();
   });
-  for (const id of ['light', 'blur', 'bright', 'gray']) $(id).addEventListener('input', push);
+  for (const id of ['light', 'framing', 'blur', 'bright', 'gray']) $(id).addEventListener('input', push);
   $('item').addEventListener('input', () => setItem($('item').value).catch(console.warn));
   $('bgfile').addEventListener('change', async () => {
     const f = $('bgfile').files[0];
@@ -249,6 +251,10 @@ async function main() {
       $('bg').dispatchEvent(new Event('input'));
       $('light').checked = true;
       $('light').dispatchEvent(new Event('input'));
+      // 프레이밍 — bbox 리덕션+20B 리드백 링 경로 스모크 (가짜 카메라라 크롭
+      // 목표는 안 잡힐 수 있음 — 크래시 없이 도는지가 목적)
+      $('framing').checked = true;
+      $('framing').dispatchEvent(new Event('input'));
       // 3D 아이템은 얼굴이 있어야 의미가 있다 — 가짜 카메라(무얼굴)에선 배경만 검증
 
     }

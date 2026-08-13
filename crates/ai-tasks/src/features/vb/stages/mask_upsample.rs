@@ -20,12 +20,15 @@ impl MaskUpsample {
             "video-mask-upsample",
             &src,
             wgpu::TextureFormat::R8Unorm,
-            &[Bind::Tex, Bind::Tex, Bind::Sampler, Bind::Uniform],
+            // 마지막 Sampler = binding 4 (마스크 최근접 샘플러 — v-ai NEAREST 파리티)
+            &[Bind::Tex, Bind::Tex, Bind::Sampler, Bind::Uniform, Bind::Sampler],
         );
         MaskUpsample { fs, params: ubo(ctx, "video-mask-upsample", 32) }
     }
 
-    /// 웹 updateSigmaSpace 등가 — σ를 업샘플 배율로 스케일하고 스텝/반경을 유도
+    /// 웹 updateSigmaSpace 등가 — σ를 업샘플 배율로 스케일하고 스텝/반경을 유도.
+    /// 계산은 f64 (웹 JS와 비트 정합 — step이 1 ULP 다르면 루프 탭 수가 달라져
+    /// 픽셀 diff 게이트가 흔들린다).
     pub fn write_params(
         &self,
         ctx: &GpuContext,
@@ -34,14 +37,21 @@ impl MaskUpsample {
         (fw, fh): (u32, u32),
         (mw, mh): (u32, u32),
     ) {
-        let sigma = sigma_space * (fw as f32 / mw as f32).max(fh as f32 / mh as f32);
+        let sigma = sigma_space as f64 * (fw as f64 / mw as f64).max(fh as f64 / mh as f64);
         let step = (sigma.sqrt() * 0.66).max(1.0);
         let offset = if step > 1.0 { step * 0.5 } else { 0.0 };
-        let (tx, ty) = (1.0 / fw as f32, 1.0 / fh as f32);
-        let p: [f32; 8] =
-            [tx, ty, step, sigma, offset, tx.max(ty) * sigma, sigma_color, 0.0];
+        let (tx, ty) = (1.0 / fw as f64, 1.0 / fh as f64);
         // wgsl 필드 순서: texel, step, radius, offset, sigma_texel, sigma_color
-        let p = [p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]];
+        let p: [f32; 8] = [
+            tx as f32,
+            ty as f32,
+            step as f32,
+            sigma as f32,
+            offset as f32,
+            (tx.max(ty) * sigma) as f32,
+            sigma_color,
+            0.0,
+        ];
         ctx.queue.write_buffer(&self.params, 0, bytemuck::cast_slice(&p));
     }
 }

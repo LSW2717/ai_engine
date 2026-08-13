@@ -34,3 +34,6 @@ target
 # macOS / 에디터
 .DS_Store
 .vscode/
+
+# vb-diff 게이트 비교 상대 (v-ai 원본 사본 — make vai-gate-assets)
+/web/demo/vendor/

@@ -80,6 +80,14 @@ clean:
 	cargo clean
 	rm -rf web/pkg
 
+# vb-diff 픽셀 diff 게이트 비교 상대 — v-ai 비디오 워커 원본 사본 (바이트 동일,
+# gitignore). vai-stack.js가 blob import로 스테이지를 꺼내 스탠드얼론 구동한다.
+vai-gate-assets:
+	mkdir -p web/demo/vendor
+	cp $(V_AI)/src/virtual-background/video-worker-webgl2.js \
+	   $(V_AI)/src/virtual-background/background-fit.js \
+	   $(V_AI)/src/virtual-background/webgl2-engine-span.js web/demo/vendor/
+
 # studio 데모 실제 제품 에셋 (배경 이미지 + 3D GLB) — v-ai/v-room에서 복사 (gitignore)
 V_ROOM ?= ../../vcxreact/packages/v-room
 studio-assets:
