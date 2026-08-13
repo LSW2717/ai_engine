@@ -10,10 +10,14 @@ test:
 bench:
 	cargo run --release -p ai-bench
 
+# +simd128: ai-cpu 폴백 커널의 SIMD128 경로 (없으면 스칼라로 조용히 떨어진다).
+# 모든 모던 브라우저가 지원 (2021+).
 build-wasm:
+	RUSTFLAGS="-C target-feature=+simd128" \
 	wasm-pack build crates/ai-wasm --target web --release --out-dir ../../web/pkg --out-name ai_engine
 
 build-wasm-dev:
+	RUSTFLAGS="-C target-feature=+simd128" \
 	wasm-pack build crates/ai-wasm --target web --dev --out-dir ../../web/pkg --out-name ai_engine
 
 # 기본은 VS Code Live Server 사용 (web/index.html 우클릭 → Open with Live Server).

@@ -4,13 +4,12 @@
 //! (업로드 → 추론 제출 → (호스트가 합성) → 완료 대기 → 기록)가 여기 한 곳에만
 //! 있어야 웹과 모바일이 같은 동작을 한다.
 
-use std::collections::VecDeque;
-
 use ai_core::TensorDesc;
 use ai_gpu::wgpu;
 use ai_gpu::GpuContext;
 use ai_runtime::Model;
 
+use crate::clock::{FrameClock, Stats};
 use crate::error::TaskError;
 
 #[cfg(target_arch = "wasm32")]
@@ -18,27 +17,9 @@ use web_time::Instant;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
 
-/// 프레임타임 분포 — 런타임 강등 판정의 입력.
-///
-/// 평균이 아니라 **p90**을 쓴다: 평균은 가끔 튀는 프레임을 감춘다. 그리고
-/// 강등 기준은 "프레임 예산"이 아니라 "마스크 갱신율 하한"이어야 한다 —
-/// 벽시계엔 GPU 큐 대기와 이벤트루프 대기가 섞이기 때문이다
-/// (v-ai가 66ms/2윈도우 연속을 쓰는 이유와 같다).
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Stats {
-    pub frames: u32,
-    pub p50_ms: f32,
-    pub p90_ms: f32,
-    pub last_ms: f32,
-}
-
-/// 통계 창 길이 — 30fps에서 4초.
-const WINDOW: usize = 120;
-
 pub struct Segmenter {
     model: Model,
-    times: VecDeque<f32>,
-    frames: u32,
+    clock: FrameClock,
     /// `infer()` 제출 시각 — `finish_frame()`이 여기서부터 잰다
     mark: Option<Instant>,
 }
@@ -46,7 +27,7 @@ pub struct Segmenter {
 impl Segmenter {
     pub async fn load(ctx: &GpuContext, bytes: &[u8]) -> Result<Self, TaskError> {
         let model = Model::load(ctx, bytes).await?;
-        Ok(Self { model, times: VecDeque::with_capacity(WINDOW), frames: 0, mark: None })
+        Ok(Self { model, clock: FrameClock::new(), mark: None })
     }
 
     pub fn model(&self) -> &Model {
@@ -58,8 +39,18 @@ impl Segmenter {
         &self.model.sw.tensors[self.model.sw.inputs[0] as usize].name
     }
 
+    /// 디바이스 유실이면 DeviceLost — 호스트 강등 판정의 근거라 프레임 경로
+    /// 진입마다 확인한다 (정상 경로 비용은 원자 로드 1회).
+    fn ensure_device(ctx: &GpuContext) -> Result<(), TaskError> {
+        match ctx.lost_reason() {
+            Some(msg) => Err(TaskError::DeviceLost(msg)),
+            None => Ok(()),
+        }
+    }
+
     /// 논리 NHWC f32 프레임 업로드
     pub fn upload(&self, ctx: &GpuContext, rgb: &[f32]) -> Result<(), TaskError> {
+        Self::ensure_device(ctx)?;
         let name = self.input_name().to_string();
         self.model.upload_input(ctx, &name, rgb)?;
         Ok(())
@@ -67,6 +58,7 @@ impl Segmenter {
 
     /// 추론 **제출**만 한다 (대기 없음). 합성은 호출자가 이 뒤에 붙인다.
     pub async fn infer(&mut self, ctx: &GpuContext) -> Result<(), TaskError> {
+        Self::ensure_device(ctx)?;
         self.mark = Some(Instant::now());
         self.model.infer(ctx).await?;
         Ok(())
@@ -79,31 +71,16 @@ impl Segmenter {
     /// 대기가 밀린 큐 전체를 기다려 측정값이 계속 커진다. 사파리에서 실제로
     /// 그랬다 (추론 3.13 → 10.00ms 단조 증가).
     pub async fn finish_frame(&mut self, ctx: &GpuContext) -> Result<(), TaskError> {
+        Self::ensure_device(ctx)?;
         ai_gpu::readback::wait_idle(ctx).await.map_err(TaskError::Gpu)?;
         if let Some(t0) = self.mark.take() {
-            let ms = t0.elapsed().as_secs_f64() as f32 * 1e3;
-            if self.times.len() == WINDOW {
-                self.times.pop_front();
-            }
-            self.times.push_back(ms);
-            self.frames = self.frames.wrapping_add(1);
+            self.clock.record(t0.elapsed().as_secs_f64() as f32 * 1e3);
         }
         Ok(())
     }
 
     pub fn stats(&self) -> Stats {
-        if self.times.is_empty() {
-            return Stats::default();
-        }
-        let mut v: Vec<f32> = self.times.iter().copied().collect();
-        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let pick = |q: f32| v[((v.len() as f32 - 1.0) * q).round() as usize];
-        Stats {
-            frames: self.frames,
-            p50_ms: pick(0.5),
-            p90_ms: pick(0.9),
-            last_ms: *self.times.back().unwrap(),
-        }
+        self.clock.stats()
     }
 
     /// 출력 텐서가 실제로 들어있는 스토리지 버퍼 + desc (리드백 없이 합성용)

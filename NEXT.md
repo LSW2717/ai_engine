@@ -3,13 +3,34 @@
 ## 5분 안에 상태 확인
 
 ```sh
-cargo test --workspace --release        # 46개 스위트, 전부 ok 여야 한다
-make build-wasm                         # web/pkg 갱신
+cargo test --workspace --release        # 52개 스위트, 전부 ok 여야 한다
+make build-wasm                         # web/pkg 갱신 (+simd128, 725KB)
 node tools/run_web.mjs compare/index.html   # webgl2 vs 우리 (GPU 다른 앱 닫고)
+# ai-cpu 정확도 (R11):
+AI_ONNX=/Users/foxcom/Desktop/segm-ft/export/mnv4/r11/segm_mnv4s050_s2_160x288.onnx \
+  cargo test --release -p ai-cpu --test oracle_real -- --ignored --nocapture   # max_err ~1.4e-5
 ```
 
 기대: ORT 게이트 `fp32 max_err <5e-5 / 가중치f16 6e-4 / 전경 18.5%`,
 compare에서 `webgl2 ~1.57ms / ai_engine 가중치fp16 ~2.01ms`.
+
+---
+
+## 바로 다음 — 둘 중 하나 (사용자 선택 대기)
+
+**(A) 로드맵 #3: `Reshape` canon + `PRELU` + `MAX_POOL_2D`** ← 가치 상승.
+   랜드마크 핵심 4모델에 더해 **게이즈 MobileOne-S0(v-ai에서 ORT wasm 1T로 도는 것)가
+   `Reshape` 하나로 열린다** — 변환기에 직접 넣어 확정한 사실:
+   ```
+   mobileone_s0_gaze.onnx  → 미지원 op: Reshape (딱 하나)
+   fastenhancer_b_16k.onnx → 미지원 op: DFT (오디오는 어차피 CPU, 로드맵 #6)
+   ```
+**(B) 브라우저 R11 A/B 배선** — web 데모에 CPU 경로(`load_model_cpu`/`infer_frame_cpu`)
+   호출 추가 → tflite-simd·ORT wasm과 같은 페이지 비교. 눈검증·실행은 사용자 몫.
+   ⚠ v-ai 멀티스레드는 전부 `crossOriginIsolated` 게이트(webgl2.js:405) — 배포 헤더에
+   COOP/COEP 없으면 저쪽도 1T. A/B 조건 먼저 확인.
+
+v-ai 정찰 전체 지도(런타임·티어·플래그·file:line)는 메모리 `vai-runtime-map` 참조.
 
 ---
 
@@ -18,12 +39,17 @@ compare에서 `webgl2 ~1.57ms / ai_engine 가중치fp16 ~2.01ms`.
 | # | 항목 | 상태 |
 |---|---|---|
 | 0 | `ai-tasks` 크레이트 (공개 API 본체) | **진행 중 — 아래 참조** |
-| 1 | 폴백 트리거 3종 | 다음 |
-| 2 | `ai-cpu` (SIMD128/NEON + 스레드) + R11 vs tflite-simd A/B | |
-| 3 | `Reshape` canon + `PRELU` + `MAX_POOL_2D` | |
+| 1 | 폴백 트리거 3종 | **엔진 쪽 완료** (2026-08-13) — v-ai 연결만 보류, §1 참조 |
+| 2 | `ai-cpu` (SIMD128/NEON + 스레드) + R11 vs tflite-simd A/B | **구현 완료, 네이티브 실측 끝** — 브라우저 A/B 남음, §2 참조 |
+| 3 | `Reshape` canon + `PRELU` + `MAX_POOL_2D` | 후보 A — 게이즈도 Reshape 하나로 열림 |
 | 4 | 랜드마크 스파이크 (face_detector → 좌표 diff) | |
 | 5 | 파이프라인 로직 (ROI 트래킹 / 회전 정규화 / OneEuroFilter / Horn 피팅) | |
 | 6 | 오디오 (DFT / 1D conv / 복소) | |
+
+**폴백 사다리 (사용자 확정, 2026-08-13)**: ①로드 시 GPU 체크(`NoGpu`) → ②돌렸을 때
+프레임 실제로 나오는지(DeviceLost는 됨, "조용히 안 나옴" 헬스체크는 미구현) →
+③안 되면 R11을 CPU로(`ai-cpu`) → ④CPU도 안 되면 구조화 에러 → 호스트가 "호환 안 됨"
+팝업. 모든 비전 태스크 공통. 전환 스위치는 호스트(모델 조달이 호스트 몫).
 
 성능 추격(webgl2 대비 1.28배)은 **mnv4 기반 RVM으로 교체한 뒤에** 재개하기로 함.
 
@@ -53,16 +79,14 @@ compare에서 `webgl2 ~1.57ms / ai_engine 가중치fp16 ~2.01ms`.
 
 ---
 
-## 1. 폴백 트리거 3종 (바로 다음)
+## 1. 폴백 트리거 3종 — 엔진 쪽 끝 (2026-08-13)
 
-지금 있는 것: `is_supported()`, `InitError{NoAdapter, RequestDevice}`.
-**없는 것**:
-
-1. **device lost 구독** — `ai-gpu/context.rs`에서 `device.lost` 미구독.
-   wasm은 `on_uncaptured_error`조차 미등록(wgpu 30 웹 백엔드 `Error::from_js` panic 회피).
-   → `TaskError::DeviceLost`로 올려 호스트가 강등하게.
-2. **프레임타임 노출** — `model_stats()`는 만들었다. 남은 건 호스트가 이걸 **쓰게** 하는 것.
-3. **v-ai 연결** — 여기가 진짜 구멍이다:
+1. ✅ **device lost 구독** — `GpuContext::new()`가 `set_device_lost_callback` 등록
+   (웹은 `device.lost` 프라미스 경로라 `Error::from_js` panic 이슈와 무관 — 소스로 확인).
+   `ctx.lost_reason()` 폴링, `Segmenter` 프레임 경로 3곳에서 체크 → `TaskError::DeviceLost`,
+   wasm `device_lost()` export (`null | "사유"`). 테스트: `ai-gpu/tests/device_lost.rs`.
+2. **프레임타임 노출** — `model_stats()` + `model_stats_cpu()` 있음. 호스트가 쓰게 하는 건 v-ai 연결과 한 묶음.
+3. **v-ai 연결 — 사용자가 "나중에"라고 보류함. 착수 전 확인 필수.** 구멍은 그대로:
    ```
    vcxreact/packages/v-ai/src/virtual-background/video-worker-webgl2.js
      :444  _recordCycle(dt)        — p90 > 66ms 2윈도우 연속이면 _demoteSegTier
@@ -74,23 +98,37 @@ compare에서 `webgl2 ~1.57ms / ai_engine 가중치fp16 ~2.01ms`.
 
 ---
 
-## 2. `ai-cpu` — 측정된 출발점
+## 2. `ai-cpu` — 구현 완료 (2026-08-13), 네이티브 실측 끝
 
-`CpuExec`(순진 스칼라 f32, 1스레드) 실측, `segm_mnv4s050_s2_160x288`(0.134 GMAC):
+구조 (ARCHITECTURE.md "CPU 백엔드 짝" 절차 참조):
+- `simd.rs` F32x4 (NEON/SIMD128/스칼라 — 커널은 core::arch 모름), `plan.rs`(로드 시
+  가중치 재패킹 + last_use 슬롯 재사용 계획), `exec.rs`(프레임 중 분석·할당 없음),
+  `kernels/`(conv=브로드캐스트 GEMM 4px×8cout, dw=채널 벡터화, 나머지 콜드 스칼라).
+- alias/concat 융합은 채널 스트라이드 뷰로 무복사. 상태 ping-pong은 프레임 시작 swap.
+- 스레드: rayon 행 밴드(네이티브 전용, `set_threads`). wasm 스레드는 COOP/COEP 필요 — 미착수.
+- `ai-tasks::CpuSegmenter` + wasm export: `load_model_cpu/infer_frame_cpu/model_stats_cpu/model_io_cpu`.
+  Makefile `+simd128` 추가됨. wasm 725KB (vs v-ai 런타임 66MB).
 
-> **119.1 ms (1.1 GMAC/s)**
+**M2 Pro 실측** (오라클 diff CpuExec 대비 max_err ≤2e-5 전 해상도):
 
-M2 Pro 코어 1개 NEON f32 피크가 ~14 GMAC/s → 지금 SIMD를 전혀 못 쓰고 있다.
-현실적 목표: +SIMD128 ~30~40ms → +4스레드 ~10~15ms.
-참고선(ncnn, 손튜닝, M2 Pro, RVM 144×256): CPU 4T fp16 12.3ms / fp32 19.6ms.
+| R11 (mnv4s050_s2) | 1T | 4T | 순진 CpuExec |
+|---|---|---|---|
+| 144×256 | 8.07ms | **2.94ms** | — |
+| 160×288 | 10.08ms | **3.57ms** | 119.1ms (33×) |
+| 192×320 | 13.29ms | **4.51ms** | — |
+
+참고선(ncnn 손튜닝, RVM 144×256): 4T fp32 19.6ms. 목표(10~15ms) 초과 달성.
 
 재현:
 ```sh
-AI_ONNX=<onnx> [AI_REPS=5] cargo test --release -p ai-convert --test bench_cpu -- --ignored --nocapture
+AI_ONNX=<onnx> cargo test --release -p ai-cpu --test oracle_real -- --ignored --nocapture  # 정확도
+AI_ONNX=<onnx> AI_THREADS=4 AI_REPS=100 cargo test --release -p ai-cpu --test bench_cpu -- --ignored --nocapture
+# R11: /Users/foxcom/Desktop/segm-ft/export/mnv4/r11/segm_mnv4s050_s2_<res>.onnx
 ```
 
-**ai-cpu의 값어치는 속도가 아니라 의존성 제거다** — v-ai가 지금 싣는 AI 런타임이
-**66MB** (ORT 50MB + mediapipe 11MB + tflite 5.2MB). 우리 wasm은 0.65MB.
+**남은 것**: ①브라우저에서 tflite-simd와 A/B (데모 페이지에 CPU 경로 배선 필요 —
+ab.html은 아직 GPU 경로만 부른다), ②wasm 스레드(코옵 헤더 요구라 v-ai 배포 환경 확인 먼저),
+③"조용히 프레임 안 나옴" 첫 프레임 헬스체크(NaN/전부0/시간 상한).
 
 ---
 

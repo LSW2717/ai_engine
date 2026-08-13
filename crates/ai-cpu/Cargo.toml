@@ -1,0 +1,17 @@
+[package]
+name = "ai-cpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ai-core = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+
+# 스레드 실행은 네이티브 전용 — wasm 스레드(COOP/COEP + atomics)는 별도 단계
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rayon = "1"
+
+[dev-dependencies]
+ai-convert = { path = "../ai-convert" }

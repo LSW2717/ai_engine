@@ -10,10 +10,14 @@
 //! 플랫폼마다 **진짜** 다른 것만 바인딩에 남긴다:
 //! 서피스 획득, 프레임 임포트, 스레드 모델, 모델 바이트 조달.
 
+pub mod clock;
 pub mod composite;
 pub mod error;
 pub mod segmenter;
+pub mod segmenter_cpu;
 
+pub use clock::Stats;
 pub use composite::{CompositeOpts, Compositor};
 pub use error::TaskError;
-pub use segmenter::{Segmenter, Stats};
+pub use segmenter::Segmenter;
+pub use segmenter_cpu::CpuSegmenter;

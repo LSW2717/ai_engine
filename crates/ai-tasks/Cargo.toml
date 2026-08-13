@@ -11,6 +11,7 @@ license.workspace = true
 
 [dependencies]
 ai-core.workspace = true
+ai-cpu.workspace = true
 ai-gpu.workspace = true
 ai-runtime.workspace = true
 bytemuck.workspace = true

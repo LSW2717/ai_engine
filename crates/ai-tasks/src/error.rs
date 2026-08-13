@@ -19,6 +19,9 @@ pub enum TaskError {
     /// GPU 계층 오류 (컴파일·리드백 등)
     #[error("GPU: {0}")]
     Gpu(String),
+    /// CPU 폴백 계층 오류 — 이것마저 실패하면 호스트는 "호환 안 됨" 판정
+    #[error("CPU: {0}")]
+    Cpu(String),
     #[error("{0}")]
     Other(String),
 }

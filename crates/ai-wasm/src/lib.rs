@@ -20,6 +20,8 @@ use wasm_bindgen::prelude::*;
 thread_local! {
     static ENGINE: RefCell<Option<Rc<GpuContext>>> = const { RefCell::new(None) };
     static MODEL: RefCell<Option<ai_tasks::Segmenter>> = const { RefCell::new(None) };
+    // CPU 폴백 티어 — GPU 엔진과 독립 (init_engine 실패 후에도 동작해야 한다)
+    static CPU_MODEL: RefCell<Option<ai_tasks::CpuSegmenter>> = const { RefCell::new(None) };
 }
 
 #[wasm_bindgen(start)]
@@ -78,6 +80,14 @@ pub async fn init_engine() -> Result<JsValue, JsValue> {
     };
     ENGINE.with(|e| *e.borrow_mut() = Some(Rc::new(ctx)));
     serde_wasm_bindgen::to_value(&info).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// 디바이스 유실 여부 — null(정상) 또는 사유 문자열("{reason}: {message}").
+/// 호스트가 프레임 루프에서 폴링해 폴백 티어로 강등하는 근거.
+/// (유실 후 infer 계열은 "디바이스 유실: ..." 에러로도 실패한다 — 이건 즉답 폴링용)
+#[wasm_bindgen]
+pub fn device_lost() -> Result<Option<String>, JsValue> {
+    Ok(engine()?.lost_reason())
 }
 
 /// 공유 정확도 스위트 실행 — 네이티브 `cargo test`와 같은 케이스·같은 시드
@@ -326,6 +336,73 @@ pub async fn infer_and_present(
     .await;
     MODEL.with(|m| *m.borrow_mut() = Some(seg));
     result
+}
+
+/// CPU 폴백 모델 로드 — GPU 엔진 불필요 (init_engine 실패 시의 경로).
+/// 어떤 모델(R11 등 경량)을 실을지는 호스트가 정한다 — 모델 조달은 호스트 몫.
+#[wasm_bindgen]
+pub fn load_model_cpu(bytes: Vec<u8>) -> Result<JsValue, JsValue> {
+    let seg = ai_tasks::CpuSegmenter::load(&bytes)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let sw = seg.model().sw();
+    let report = JsModelReport {
+        name: sw.name.clone(),
+        ops: sw.ops.len(),
+        unique_pipelines: 0,
+        arena_mb: 0.0,
+        weights_mb: 0.0,
+    };
+    CPU_MODEL.with(|m| *m.borrow_mut() = Some(seg));
+    serde_wasm_bindgen::to_value(&report).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// CPU 프레임 1장: 논리 NHWC 입력 → 추론 → 지정 출력 반환 (동기)
+#[wasm_bindgen]
+pub fn infer_frame_cpu(rgb: Vec<f32>, output: String) -> Result<Vec<f32>, JsValue> {
+    CPU_MODEL.with(|m| {
+        let mut b = m.borrow_mut();
+        let seg = b.as_mut().ok_or_else(|| JsValue::from_str("CPU 모델 미로드"))?;
+        seg.infer_frame(&rgb).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        seg.read_output(&output).map_err(|e| JsValue::from_str(&e.to_string()))
+    })
+}
+
+/// CPU 티어 프레임타임 분포 — GPU와 같은 강등 판정 입력 형식
+#[wasm_bindgen]
+pub fn model_stats_cpu() -> Result<JsValue, JsValue> {
+    CPU_MODEL.with(|m| {
+        let b = m.borrow();
+        let s = b.as_ref().ok_or_else(|| JsValue::from_str("CPU 모델 미로드"))?.stats();
+        serde_wasm_bindgen::to_value(&JsStats {
+            frames: s.frames,
+            p50_ms: s.p50_ms,
+            p90_ms: s.p90_ms,
+            last_ms: s.last_ms,
+        })
+        .map_err(|e| JsValue::from_str(&e.to_string()))
+    })
+}
+
+/// CPU 모델의 입력 크기·이름 (model_io의 CPU 짝)
+#[wasm_bindgen]
+pub fn model_io_cpu() -> Result<JsValue, JsValue> {
+    CPU_MODEL.with(|m| {
+        let b = m.borrow();
+        let sw = b.as_ref().ok_or_else(|| JsValue::from_str("CPU 모델 미로드"))?.model().sw();
+        let t = &sw.tensors[sw.inputs[0] as usize];
+        let info = JsFrameInfo {
+            h: t.h,
+            w: t.w,
+            c: t.c,
+            input: t.name.clone(),
+            outputs: sw
+                .outputs
+                .iter()
+                .map(|&o| sw.tensors[o as usize].name.clone())
+                .collect(),
+        };
+        serde_wasm_bindgen::to_value(&info).map_err(|e| JsValue::from_str(&e.to_string()))
+    })
 }
 
 /// 지금 올라가 있는 입력 그대로 N프레임 실행하고 **마지막에 한 번만** 동기화한다.

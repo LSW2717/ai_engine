@@ -6,6 +6,9 @@
 //! limits는 `Limits::default()`(WebGPU 이식성 기본값)만 요청한다. adapter limits를
 //! 요청하면 네이티브에서는 되고 웹에서 깨지는 커널이 침묵 속에 만들어진다.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
 use thiserror::Error;
 
 /// init 실패의 구조화된 이유 — 호스트가 폴백 티어 결정에 사용한다.
@@ -33,12 +36,22 @@ pub struct DeviceCaps {
     pub storage_align: u32,
 }
 
+/// device.lost 신호 — 콜백(네이티브: 별도 스레드, 웹: JS 마이크로태스크)이 쓰고
+/// 프레임 루프가 읽는다. msg를 flag보다 먼저 쓰고(Release) 읽기는 flag 확인
+/// 후(Acquire)라 빈 사유를 볼 일이 없다.
+#[derive(Default)]
+struct LostSignal {
+    flag: AtomicBool,
+    msg: Mutex<String>,
+}
+
 pub struct GpuContext {
     pub instance: wgpu::Instance,
     pub adapter: wgpu::Adapter,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub caps: DeviceCaps,
+    lost: Arc<LostSignal>,
     /// 프로세스 수명 파이프라인 캐시 (cache_key → 컴파일 완료 커널).
     /// 재로드·다중 모델이 같은 shape 커널을 공유한다 — 로드 시간의 지배 항목이
     /// 파이프라인 컴파일이라 2회차 로드가 버퍼 비용만 남는다.
@@ -84,6 +97,20 @@ impl GpuContext {
             .await
             .map_err(|e| InitError::RequestDevice(e.to_string()))?;
 
+        // device.lost 구독 — 탭 백그라운드·드라이버 리셋·GPU 프로세스 크래시를
+        // 프레임 루프가 TaskError::DeviceLost로 올려 호스트가 강등하게 한다.
+        // 웹 백엔드는 device.lost 프라미스를 그대로 쓴다 (Error::from_js 경로 아님 —
+        // on_uncaptured_error를 막는 panic 이슈와 무관).
+        let lost = Arc::new(LostSignal::default());
+        {
+            let lost = lost.clone();
+            device.set_device_lost_callback(move |reason, msg| {
+                *lost.msg.lock().unwrap() = format!("{reason:?}: {msg}");
+                lost.flag.store(true, Ordering::Release);
+                log::error!("[ai-gpu] device lost: {reason:?}: {msg}");
+            });
+        }
+
         // error scope 밖에서 새는 오류도 침묵하지 않도록.
         // 단 wasm에서는 등록하지 않는다: wgpu 30 웹 백엔드의 Error::from_js가
         // Validation/OOM 외 타입(GPUInternalError 등)에서 panic!("Unexpected error")로
@@ -110,7 +137,17 @@ impl GpuContext {
             caps.timestamps
         );
 
-        Ok(Self { instance, adapter, device, queue, caps, kernel_cache: Default::default() })
+        Ok(Self { instance, adapter, device, queue, caps, lost, kernel_cache: Default::default() })
+    }
+
+    /// 디바이스가 유실됐으면 사유("{reason}: {message}")를 반환.
+    /// 프레임 루프가 매 프레임 폴링한다 — 정상 경로 비용은 원자 로드 1회.
+    pub fn lost_reason(&self) -> Option<String> {
+        if self.lost.flag.load(Ordering::Acquire) {
+            Some(self.lost.msg.lock().unwrap().clone())
+        } else {
+            None
+        }
     }
 
     /// 네이티브 전용 블로킹 래퍼. wasm에는 존재하지 않는다(블로킹 poll 불가).

@@ -15,10 +15,11 @@ webgl2-engine-span.js(~3ms)와 ORT-web WebGPU(~2ms)를 넘는 추론 성능, mem
 | `ai-convert` | ONNX → 컨테이너 CLI: BN 폴딩·사전 패킹·융합 마킹 | |
 | `ai-bench` | 네이티브 벤치 러너 | wasm 데모와 동일 루틴 |
 | `ai-wasm` | wasm-bindgen 경계 (`cdylib`) — **웹 API** | 서피스·프레임 임포트·타입 변환만 |
-| (향후) `ai-cpu` | SIMD128/NEON + 스레드 실행 계층 | GPU 미지원·저사양 폴백 |
+| `ai-cpu` | SIMD(NEON/SIMD128) + rayon 스레드 실행 계층 | GPU 미지원·저사양 폴백. mnv4s050 160×288: 1T 37ms / 4T 11.9ms (M2 Pro) |
 | (향후) `ai-ffi` | 모바일 C ABI (`staticlib`+`cdylib`) — **모바일 API** | crate-type은 leaf가 소유 — 플랫폼별 수동 편집 금지 |
 
-의존 그래프: `ai-core ← ai-gpu ← ai-runtime ← ai-tasks ← {ai-wasm, ai-ffi}`, `ai-convert ← ai-core`.
+의존 그래프: `ai-core ← {ai-gpu, ai-cpu} ← ai-runtime ← ai-tasks ← {ai-wasm, ai-ffi}`, `ai-convert ← ai-core`.
+(`ai-cpu`는 ai-runtime을 거치지 않고 .sw 컨테이너를 직접 실행한다 — ai-tasks가 직접 든다.)
 
 **바인딩 규칙**: `ai-wasm`/`ai-ffi`에는 분기(`if`)가 없다. 분기가 생겼다면 그건 로직이고
 `ai-tasks`로 내려가야 한다. 이 규칙이 깨지면 웹과 모바일 동작이 갈라진다 — 지금 랜드마크가
@@ -54,6 +55,14 @@ webgl2-engine-span.js(~3ms)와 ORT-web WebGPU(~2ms)를 넘는 추론 성능, mem
 3. `ai-core/src/reference/<계열>.rs` — CPU 레퍼런스 (없으면 추가)
 4. `ai-gpu/src/testsuite.rs` — GPU vs CPU 케이스를 그리드에 등록
 5. (Phase 2+) `ai-runtime/src/lowering/<op>.rs` — op → KernelSpec 매핑
+
+**CPU 백엔드 짝 (ai-cpu)** — GPU와 대칭 절차:
+1. `ai-cpu/src/kernels/<이름>.rs` — 커널 + `ai-core::reference` 대조 테스트
+   (SIMD는 `simd::F32x4`만 사용 — `core::arch` 직접 금지, 새 아키는 simd.rs에 cfg 블록 하나)
+2. `ai-cpu/src/plan.rs` — SwOp → PlanKind lowering arm (가중치 재패킹 포함)
+3. `ai-cpu/src/exec.rs` — 디스패치 arm (핫 커널이면 행 밴드 병렬 경로도)
+4. 정확도 게이트: `synthetic_e2e`(상시) + `AI_ONNX=<onnx> cargo test -p ai-cpu --test oracle_real -- --ignored`
+   — dtype 규약은 GPU lowering과 동일 (std conv 가중치만 `dt_weights`, 나머지 `dt_default`)
 
 ## 새 모델 추가 절차 (Phase 2+)
 
