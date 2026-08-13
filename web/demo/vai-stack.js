@@ -161,6 +161,11 @@ void main() { gl_Position = vec4(a_position, 0.0, 1.0); v_texCoord = a_texCoord;
       bgStage.updateRelight?.(cfg.studioLight || { enabled: false });
     },
 
+    // mirror/degree 배경 보정 — image 스테이지만 (v-ai updateTransform 그대로)
+    setTransform(mirror, rotationRad) {
+      bgStage.updateTransform?.({ mirror, rotation: rotationRad });
+    },
+
     // 인물 프레이밍 크롭 강제 — image 스테이지(image/단색 배경)만 지원.
     // blur/passthrough의 전체 크롭은 v-ai에선 캔버스 2D transform — 게이트 페이지가
     // 출력에 2D 크롭을 걸어 재현한다 (_compositeFrame 등가).

@@ -75,6 +75,11 @@ pub struct EffectsPatch {
     pub brightness: Option<f32>,
     /// 0..1 (배경에만 적용)
     pub grayscale: Option<f32>,
+    /// 좌우 반전 — 프레임 자체는 호스트가 추론 전에 뒤집는다(좌표계 계약).
+    /// 엔진 몫은 이미지 배경 좌표 보정뿐 (v-ai updateTransform 등가)
+    pub mirror: Option<bool>,
+    /// 회전 각도(도, 0/90/180/270 등 — %360 정규화). 프레임 회전은 호스트 몫
+    pub degree: Option<f32>,
     /// null=조명 해제
     #[serde(deserialize_with = "double")]
     pub studio_light: Option<Option<StudioLightOptions>>,
@@ -92,6 +97,9 @@ pub struct EffectsState {
     pub grayscale: f32,
     pub studio_light: Option<StudioLightOptions>,
     pub framing: Option<crate::features::vb::framing::FramingOptions>,
+    pub mirror: bool,
+    /// 도 단위, %360 정규화 저장
+    pub degree: f32,
 }
 
 impl Default for EffectsState {
@@ -103,6 +111,8 @@ impl Default for EffectsState {
             grayscale: 0.0,
             studio_light: None,
             framing: None,
+            mirror: false,
+            degree: 0.0,
         }
     }
 }
@@ -139,6 +149,12 @@ impl EffectsState {
         }
         if let Some(f) = &patch.framing {
             self.framing = f.clone().filter(|o| o.enabled);
+        }
+        if let Some(m) = patch.mirror {
+            self.mirror = m;
+        }
+        if let Some(d) = patch.degree {
+            self.degree = d.rem_euclid(360.0);
         }
     }
 

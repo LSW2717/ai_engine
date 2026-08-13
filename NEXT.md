@@ -10,18 +10,36 @@
    게이트: 크롭 수학 diff PASS(F/color·F/image max 1) + bbox 네이티브 게이트 +
    framing.rs 단위테스트 5종. ⚠ 잔여: 프레이밍 크롭 중 **페이스 이펙트 좌표 보정**
    (INTEGRATION.md §2 계약 — studio 3D 아이템이 아직 미보정, P3 오버레이 때 같이).
-3. **mirror/degree** — compose 확장 (웹 파리티 잔여분. 이미지배경 자체 블러는 1에서
-   완료). v-ai는 이미지 스테이지 정점 셰이더의 transform 행렬 + contain 스케일
-   (updateTransform) — 배경 cover 크롭 수학 파리티도 이때 게이트에 추가
-   (지금 게이트는 배경·프레임 종횡비 동일로 크롭 항등).
-4. **studio HUD 정직화** — 지금은 제출 벽시계(허수). rAF 간격 실측 + 5초마다
-   동기화 1회 샘플로 교체.
+3. ~~mirror/degree~~ **완료 (2026-08-14)** — §"mirror/degree" 참조. 게이트 T상
+   6종(cover wide/tall·mirror·90/180·쿼터턴) 전부 **max=0 완전 일치**.
+   잔여: 배경 종횡비 반전(cropFactor≥1.6)의 blur-fill 사전합성
+   (fitBackgroundForCanvas)은 미이관 — 세로 프레임 대응 때 host/엔진 배치 결정.
+4. ~~studio HUD 정직화~~ **완료 (2026-08-14)** — HUD = rAF 간격 p50(체감 스루풋)
+   + GPU 실측(5s 논블로킹 `gpu_sync`=onSubmittedWorkDone 샘플 — 루프 무정지)
+   + 제출 벽시계(허수 참고). **정직화가 즉시 드러낸 것 (M1 Pro, 1280×720)**:
+   제출은 내내 0.3ms지만 실측 GPU는 기본 6.6ms / blur60 22.6ms /
+   이미지배경+blur60+조명+프레이밍 **64.3ms** — p90>66ms 강등 문턱 코앞.
+   지배 후보는 **이미지배경 인셰이더 블러**(radius 7 → 225탭 × 720p ≈ 2억 샘플/
+   프레임 — v-ai 파리티 비용이지만 우리 타깃은 저사양). ⚠ P2 최적화 카드:
+   배경 이미지는 정적 — 업로드/블러값 변경 시 **1회 사전 블러 베이크** 텍스처로
+   바꾸면 프레임당 비용이 사라진다 (수학 동일 → 파리티 게이트 유지 가능).
+   측정 주의: gpu 수치는 큐 대기 포함(밀리면 커진다) — 강등 판정엔 오히려 옳은
+   신호 (v-ai p90도 같은 성격).
 
 **B. P2 티어 — 저사양이 제품 타깃 (사용자 최우선 강조, target-hardware-lowend)**
-5. **B 티어(CPU 추론 + GPU 합성)**: ai-cpu 마스크를 write_texture로 인제스트
-   (스테이징 진입점 이미 있음 — 37KB/프레임 업로드뿐) + **p90>66ms 2윈도우 강등**
-   (승격 없음) + 효과별 최소 티어 게이팅. studio에 티어 강제 토글+현재 티어 표시.
-   완료 기준: GPU 추론을 인위로 막아도 배경·블러·조명이 산다.
+5. **B 티어 코어 완료 (2026-08-14)** — 완료 기준 충족: 헤드리스에서 GPU 추론을
+   막고(tier=b 강제) 배경·블러·조명·프레이밍 생존 확인 (`tier=B cpu_infer=7ms`).
+   - 경로: studio.js가 src를 288×160으로 축소 → `infer_frame_cpu`(R11) 로짓 →
+     `studio_frame_mask`(신설 export — 캔버스 임포트+`process_gpu_mask` ch=2).
+     `process_gpu_mask`에 **마스크 치수 파라미터** 추가 — CPU 마스크(288×160)가
+     GPU 모델 해상도(RVM 256×144)와 달라도 ingest가 textureLoad로 리샘플.
+   - 강등: auto 티어 = gpu 실측(5s 샘플) 66ms 초과 **2연속 → B, 승격 없음**.
+     studio에 티어 셀렉트(auto/A/B) + 현재 티어·강등 표시 + cpu_infer HUD.
+   - ⚠ 잔여: ①ensure()가 아직 GPU 세션을 요구 (B티어도 RVM 세션을 물고 있어야
+     리소스가 생긴다 — GPU 완전 부재(C티어/NoGpu) 경로는 세션 없는 ensure 분리
+     필요) ②강등 판정을 v-ai처럼 창(p90) 기반으로 정밀화 + 엔진 이관 여부는
+     P4 연결 때 ③이미지배경 블러 사전 베이크 카드 ④효과별 최소 티어 게이팅은
+     C 티어(소프트 합성) 생기면.
 
 **C. P3 얼굴 스택 — 아바타(표정 포함 인물 교체)의 전제**
 6. **blendshape 모델 개통** — face_blendshapes.tflite 변환+게이트. 아바타
@@ -105,9 +123,12 @@ caps로 게이트 — 디바이스 기능(SHADER_F16) 미요청 기기에선 생
 다크닝은 매팅 모드에서도 **파라미터로 유지** (사용자 지적 — 정석은 합성식이지
 노브 차단이 아니다; 잔여 스필은 실제 조명 반사·fgr 오차로도 남는다). fgr은 c==3
 출력 자동 탐색(fgr_output, 256정렬 확인), 스테이징은 dtype 규약 동일,
-pipe.uses_fgr() 게이트 단언 포함. ⚠ 한계 기록: fgr은 모델 해상도(256×144)라
-카메라가 더 크면 인물이 모델 해상도로 소프트해짐 — 원리적 해결은 RVM guided
-filter 풀해상 변형 또는 입력 해상도 상향(mnv4-RVM 교체 때 결정).
+pipe.uses_fgr() 게이트 단언 포함. ⚠ 한계+수리 (2026-08-14, 사용자 발견): fgr은
+모델 해상도(256×144)라 전면 사용하면 카메라가 크면 인물이 통째로 소프트해진다
+(src 1280 수리 후 5배 업스케일로 육안 확인). → **경계 한정 fgr**로 수리:
+`fg = mix(fgr, color, smoothstep(cov.y, 1, raw))` — 알파 확실 내부는 카메라
+원본(풀해상), 매팅의 실익(배경색 오염 제거)이 있는 경계만 fgr. 원리적 해결
+(풀해상 fgr — guided filter 변형/입력 상향)은 mnv4-RVM 교체 때.
 
 **RVM 개통 (2026-08-14)**: studio에 RVM(fp16)이 안 돌던 원인 3개 수리 — ① 마스크
 출력을 outputs[0](RVM은 fgr) 하드코딩 → **c==1(pha)>c==2(로짓) 자동 선택**
@@ -116,9 +137,10 @@ filter 풀해상 변형 또는 입력 해상도 상향(mnv4-RVM 교체 때 결�
 (preprocess enable f16) + 스테이징 rgba16float/bpr 분기. studio에 세그 모델
 셀렉트(R11/RVM) + studio_invalidate(세션 교체 시 바인드그룹 폐기 필수 — 안 하면
 이전 모델 버퍼를 문 채 조용히 오동작). ?model=rvm 헤드리스 PASS.
-**P1 잔여**: mirror/degree(+배경 크롭 수학 게이트), HUD 프레임타임 동기화(지금은
-제출 벽시계 — 허수), 프레이밍 중 페이스 이펙트 좌표 보정(P3 오버레이와 한 묶음).
-3D 렌더 파리티(three.js vs WGSL 차이)는 사용자가 보류 확정.
+**P1 본편 완료 (2026-08-14)** — 남은 이월분: 프레이밍 중 페이스 이펙트 좌표 보정
+(P3 오버레이와 한 묶음), 배경 종횡비 반전 blur-fill 사전합성(세로 프레임 대응 때),
+이미지배경 블러 사전 베이크(P2 최적화 카드 — HUD 정직화가 발굴).
+3D 렌더 파리티(three.js vs WGSL 차이)는 사용자가 보류 확정. **다음은 B(P2 티어)**.
 
 **픽셀 diff 게이트 — 완료 (2026-08-14): WGSL 스택 = v-ai GLSL 스택 픽셀 등가 증명**
 같은 결정적 프레임(640×360)+같은 마스크(256×144)를 양쪽에 주입해 최종 합성 RGBA
@@ -172,7 +194,34 @@ filter 풀해상 변형 또는 입력 해상도 상향(mnv4-RVM 교체 때 결�
 - 게이트: vb-diff F상(고정 크롭 — v-ai GL updateFraming과 diff, max 1 PASS) +
   vb_pipeline.rs bbox 게이트(사각 마스크 → 정규화 bbox 오차 <0.01 + 0 마스크 →
   None) + studio 헤드리스(프레이밍 on 스모크 PASS, p50 변화 없음).
+- **bbox 백엔드 이원화 (사용자 지시, 2026-08-14)**: 마스크가 있는 곳에서 스캔 —
+  GPU 추론(process_gpu) = GPU 리덕션+20B 링 / CPU 마스크(process_gpu_mask, B/C
+  티어) = `framing::scan_bbox_cpu`(리드백 0·지연 0). CPU 스캔은 16px 청크
+  자동벡터화 형태(비교+any+count 핫루프에 데이터 의존 min/max 없음 — NEON/SSE/
+  wasm+simd128). 게이트: rect 정밀(CPU) + 실추론 GPU 리덕션 vs pha CPU 스캔
+  교차검증(EMA 차이 2px 허용). **프레이밍은 가상배경 없이도 독립 동작** —
+  passthrough 판정에 framing 포함 (INTEGRATION.md §2에 계약 추가).
 - ⚠ 실인물 눈검증(줌인 활강 UX)은 사용자 몫 — 카메라로 studio 프레이밍 토글 확인.
+
+**mirror/degree — 완료 (2026-08-14)**: 역할 분담이 v-ai 그대로 —
+- **프레임 변환은 호스트 몫** (추론 **전** 2D 캔버스 preprocess, v-ai
+  `_prepareSourceElement` 등가 — translate(center)→scale(-1,1)→rotate(rad)→draw.
+  좌표계 계약: 랜드마크·마스크가 화면 좌표와 일치). studio tick()에 이식,
+  미러 체크박스+회전 셀렉트(0/90/180/270).
+- **엔진 몫은 이미지 배경 좌표 보정**만: compose에 2×2 행렬(열우선, 쿼터턴+미러
+  특례 부호반전)·aspect 보정(updateAspectComp)·contain 스케일(회전 콘텐츠가 화면
+  안에 — transformScaleMultiplier가 effective scale/offset/texel에 반영) —
+  updateTransform/applyScaleAndOffset 1:1, 계산은 f64(JS 정합). EffectsPatch
+  mirror(bool)/degree(도, %360) 추가. 단색(#hex)도 image 스테이지 규약이라 동일
+  경로(색상 불변이라 시각 영향 없음).
+- 게이트 T상: cover-wide(1040×450)/cover-tall(800×630)/mirror/90/180/mirror-90 —
+  전부 **max=0**. 이걸로 "배경 cover 크롭 수학 게이트" 항목도 소화 (S상은 종횡비
+  동일이라 크롭 항등이었음). ⚠ cropFactor≥1.6은 v-ai가 blur-fill 사전합성
+  (background-fit.js)을 타는데 미이관 — 게이트 픽스처도 1.6 미만으로 제한.
+- **studio 화질 함정 (사용자 발견, 2026-08-14)**: ①src 캔버스(엔진 입력)가
+  640×360으로 남아 카메라 1280×720을 줄였다 출력에서 재확대 → src를
+  video.videoWidth/Height로 동기화 ②출력 캔버스 백킹=CSS 크기면 레티나(dpr 2)에서
+  브라우저가 2배 업스케일 → **백킹 1280×720 + CSS 640×360** (디바이스 픽셀 1:1).
 
 **실행 계획 (2026-08-13, INTEGRATION.md §3)** — 데모 HTML 주도
 (사용자 제안): `web/demo/studio.html` = 제품 UI 미니어처, 단계마다 효과를 켜며

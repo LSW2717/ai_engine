@@ -164,8 +164,9 @@ fn rvm_mask_appears() {
     assert!(pha_mean > 0.05, "pha 전멸 — 전처리(f16)/추론 경로 사망");
     assert!(frac > 0.05 && frac < 0.6, "합성 전경 비율 비정상 {frac} — 마스크 스택 사망");
 
-    // ── bbox 리덕션 게이트: 알려진 사각 마스크 주입 → 20B 리드백 → 정규화 bbox ──
-    // (process_gpu_mask + 프레이밍 on — v-ai _scanPersonBBox 등가: v>0.5, 1% 문턱)
+    // ── bbox 게이트 1 (CPU 스캔 경로): 사각 마스크 주입 → 정규화 bbox 정밀 ──
+    // process_gpu_mask는 마스크가 CPU에 있으므로 GPU 리덕션 없이 즉시 스캔한다
+    // (v-ai _scanPersonBBox CPU 힙 경로 등가: v>0.5, 1% 문턱, 리드백 0)
     pipe.apply_json(r#"{"framing":{"enabled":true}}"#).unwrap();
     let (mw, mh) = (256usize, 144usize);
     let mut mask = vec![0f32; mw * mh];
@@ -174,21 +175,29 @@ fn rvm_mask_appears() {
             mask[y * mw + x] = 1.0;
         }
     }
-    // 프레임 1: bbox 디스패치+리드백 발행 → 대기(콜백은 poll에서 해소) → 프레임 2: 펌프
-    for _ in 0..3 {
-        pipe.process_gpu_mask(&ctx, &seg, &mask, 1, false, w, h, &tview).unwrap();
-        pollster::block_on(ai_gpu::readback::wait_idle(&ctx)).unwrap();
-    }
-    let bb = pipe.last_bbox().expect("bbox 리드백 미도착 — 링/펌프 사망");
-    println!("bbox {bb:?} (기대 [0.25, 0.75, 0.25, 0.75])");
+    pipe.process_gpu_mask(&ctx, &seg, &mask, 1, 256, 144, false, w, h, &tview).unwrap();
+    let bb = pipe.last_bbox().expect("CPU bbox 스캔 실패");
+    println!("bbox(cpu) {bb:?} (기대 [0.25, 0.75, 0.25, 0.75])");
     for (got, want) in bb.iter().zip([0.25f32, 0.75, 0.25, 0.75]) {
-        assert!((got - want).abs() < 0.01, "bbox 불일치: {bb:?}");
+        assert!((got - want).abs() < 0.01, "CPU bbox 불일치: {bb:?}");
     }
-    // 인물 소실: 0 마스크 → 새 스캔이 None (1% 문턱)
+    // 인물 소실: 0 마스크 → None (1% 문턱)
     let zero_mask = vec![0f32; mw * mh];
-    for _ in 0..3 {
-        pipe.process_gpu_mask(&ctx, &seg, &zero_mask, 1, false, w, h, &tview).unwrap();
+    pipe.process_gpu_mask(&ctx, &seg, &zero_mask, 1, 256, 144, false, w, h, &tview).unwrap();
+    assert!(pipe.last_bbox().is_none(), "0 마스크인데 bbox가 남음 — 1% 문턱 사망");
+
+    // ── bbox 게이트 2 (GPU 리덕션 경로): 실추론 마스크 → 20B 리드백 링 →
+    // pha CPU 스캔과 교차검증 (GPU는 EMA 이후 마스크라 경계 1~2px 차 허용) ──
+    for _ in 0..4 {
+        pollster::block_on(pipe.process_gpu(&ctx, &mut seg, w, h, &tview)).unwrap();
         pollster::block_on(ai_gpu::readback::wait_idle(&ctx)).unwrap();
     }
-    assert!(pipe.last_bbox().is_none(), "0 마스크인데 bbox가 남음 — 1% 문턱 사망");
+    let gpu_bb = pipe.last_bbox().expect("GPU bbox 리드백 미도착 — 링/펌프 사망");
+    let pha = pollster::block_on(seg.read_output(&ctx, "pha")).unwrap();
+    let cpu_bb = ai_tasks::features::vb::framing::scan_bbox_cpu(&pha, mw, mh, 1)
+        .expect("pha에 인물 없음");
+    println!("bbox(gpu) {gpu_bb:?} vs pha cpu 스캔 {cpu_bb:?}");
+    for (g, c) in gpu_bb.iter().zip(cpu_bb) {
+        assert!((g - c).abs() <= 0.021, "GPU/CPU bbox 불일치: {gpu_bb:?} vs {cpu_bb:?}");
+    }
 }

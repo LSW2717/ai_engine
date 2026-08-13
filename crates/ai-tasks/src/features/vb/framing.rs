@@ -29,6 +29,77 @@ impl Default for FramingOptions {
 /// 정규화 인물 bbox — [x0, x1, y0, y1] (y0 = 화면 위쪽)
 pub type BBox = [f32; 4];
 
+/// CPU 마스크에서 인물 bbox 스캔 — v-ai `_scanPersonBBox`의 CPU 힙 경로 등가.
+/// ch=1: 알파 v > 0.5, ch=2: [bg, person] 로짓 — person > bg (⇔ prob > 0.5).
+/// 인물 픽셀 1% 미만이면 노이즈로 None (웹 규칙).
+///
+/// 마스크가 CPU에 있는 티어(B/C — ai-cpu 추론, process_gpu_mask 주입)는 이걸
+/// 쓴다 — GPU 리덕션·리드백이 아예 없다. GPU 추론 티어만 stages/bbox.rs.
+///
+/// 구현: 고정폭(16px) 청크의 비교+any+count는 분기 없는 고정 루프라 자동
+/// 벡터화된다(NEON/SSE, wasm은 +simd128 빌드) — min/max x의 픽셀 단위 갱신은
+/// **히트가 있는 청크에만** 들어간다 (행당 엣지 청크 몇 개뿐). 데이터 의존
+/// min/max를 핫루프에 두면 벡터화가 깨지는 것을 피하는 구조.
+pub fn scan_bbox_cpu(mask: &[f32], w: usize, h: usize, ch: usize) -> Option<BBox> {
+    match ch {
+        2 => scan::<2>(mask, w, h),
+        _ => scan::<1>(mask, w, h),
+    }
+}
+
+#[inline(always)]
+fn person<const CH: usize>(px: &[f32]) -> bool {
+    if CH == 2 {
+        px[1] > px[0]
+    } else {
+        px[0] > 0.5
+    }
+}
+
+fn scan<const CH: usize>(mask: &[f32], w: usize, h: usize) -> Option<BBox> {
+    const C: usize = 16; // 청크 폭 (픽셀)
+    let (mut min_x, mut max_x, mut min_y, mut max_y) = (w, 0usize, h, 0usize);
+    let mut count = 0usize;
+    for y in 0..h {
+        let row = &mask[y * w * CH..(y + 1) * w * CH];
+        let mut row_any = false;
+        for (ci, chunk) in row.chunks(C * CH).enumerate() {
+            let mut any = false;
+            let mut cnt = 0usize;
+            for px in chunk.chunks_exact(CH) {
+                let p = person::<CH>(px);
+                any |= p;
+                cnt += p as usize;
+            }
+            count += cnt;
+            if !any {
+                continue;
+            }
+            row_any = true;
+            let base = ci * C;
+            for (j, px) in chunk.chunks_exact(CH).enumerate() {
+                if person::<CH>(px) {
+                    min_x = min_x.min(base + j);
+                    max_x = max_x.max(base + j);
+                }
+            }
+        }
+        if row_any {
+            min_y = min_y.min(y);
+            max_y = max_y.max(y);
+        }
+    }
+    if count < w * h / 100 {
+        return None;
+    }
+    Some([
+        min_x as f32 / w as f32,
+        (max_x + 1) as f32 / w as f32,
+        min_y as f32 / h as f32,
+        (max_y + 1) as f32 / h as f32,
+    ])
+}
+
 const COMMIT_MS: f64 = 2000.0;
 const DEAD_CENTER: f32 = 0.045;
 const DEAD_SCALE: f32 = 0.055;
@@ -179,6 +250,34 @@ mod tests {
             t += 33.0;
         }
         t
+    }
+
+    #[test]
+    fn cpu_scan_matches_rect_and_threshold() {
+        let (w, h) = (64usize, 36usize);
+        // ch=1 사각
+        let mut m = vec![0f32; w * h];
+        for y in 9..27 {
+            for x in 16..48 {
+                m[y * w + x] = 1.0;
+            }
+        }
+        let bb = scan_bbox_cpu(&m, w, h, 1).unwrap();
+        assert_eq!(bb, [0.25, 0.75, 0.25, 0.75]);
+        // ch=2 로짓 — person > bg
+        let mut l = vec![0f32; w * h * 2];
+        for y in 9..27 {
+            for x in 16..48 {
+                l[(y * w + x) * 2 + 1] = 3.0; // person 로짓
+            }
+        }
+        assert_eq!(scan_bbox_cpu(&l, w, h, 2).unwrap(), [0.25, 0.75, 0.25, 0.75]);
+        // 1% 문턱 — 픽셀 수 미달이면 None
+        let mut tiny = vec![0f32; w * h];
+        for i in 0..(w * h / 100).saturating_sub(1) {
+            tiny[i] = 1.0;
+        }
+        assert!(scan_bbox_cpu(&tiny, w, h, 1).is_none());
     }
 
     #[test]

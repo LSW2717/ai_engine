@@ -41,6 +41,7 @@ impl GateHarness {
 
     /// 프레임 1장 주입 → 이펙트 스택 → 최종 RGBA (행 패딩 제거된 fw×fh×4).
     /// ema=false면 시간 상태(EMA)를 끊는다 — 공간 스택만 결정적으로 게이트.
+    #[allow(clippy::too_many_arguments)]
     pub async fn frame(
         &mut self,
         ctx: &GpuContext,
@@ -50,6 +51,8 @@ impl GateHarness {
         fh: u32,
         mask: &[f32],
         ch: u32,
+        mask_w: u32,
+        mask_h: u32,
         ema: bool,
     ) -> Result<Vec<u8>, TaskError> {
         if frame_rgba.len() != (fw * fh * 4) as usize {
@@ -97,7 +100,8 @@ impl GateHarness {
             );
         })?;
         let t = self.tgt.as_ref().unwrap();
-        self.pipeline.process_gpu_mask(ctx, seg, mask, ch, ema, fw, fh, &t.view)?;
+        self.pipeline
+            .process_gpu_mask(ctx, seg, mask, ch, mask_w, mask_h, ema, fw, fh, &t.view)?;
         let mut enc = ctx
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("vb-gate") });

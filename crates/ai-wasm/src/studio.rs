@@ -82,4 +82,56 @@ impl Studio {
         drop(frame); // present
         Ok(())
     }
+
+    /// B티어 프레임: 소스 캔버스 + **외부(CPU 추론) 마스크** → 이펙트 스택 → 서피스.
+    /// GPU 추론이 없다 — 마스크 업로드(수십 KB)가 프레임당 CPU→GPU 트래픽 전부.
+    #[allow(clippy::too_many_arguments)]
+    pub fn frame_mask(
+        &mut self,
+        ctx: &GpuContext,
+        seg: &GpuSession,
+        source: &web_sys::HtmlCanvasElement,
+        mask: &[f32],
+        ch: u32,
+        mask_w: u32,
+        mask_h: u32,
+    ) -> Result<(), String> {
+        let (fw, fh) = (source.width().max(1), source.height().max(1));
+        let src = wgpu::wgt::CopyExternalImageSourceInfo {
+            source: wgpu::wgt::ExternalImageSource::HTMLCanvasElement(source.clone()),
+            origin: wgpu::Origin2d::ZERO,
+            flip_y: false,
+        };
+        self.pipeline
+            .with_frame_texture(ctx, seg, fw, fh, |tex| {
+                ctx.queue.copy_external_image_to_texture(
+                    &src,
+                    wgpu::wgt::CopyExternalImageDestInfo {
+                        texture: tex,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                        color_space: wgpu::wgt::PredefinedColorSpace::Srgb,
+                        premultiplied_alpha: false,
+                    },
+                    wgpu::Extent3d { width: fw, height: fh, depth_or_array_layers: 1 },
+                );
+            })
+            .map_err(|e| e.to_string())?;
+        let frame = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(t)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+            other => {
+                log::warn!("[studio] 서피스 {other:?} — 재구성 후 스킵");
+                self.surface.configure(&ctx.device, &self.config);
+                return Ok(());
+            }
+        };
+        let view = frame.texture.create_view(&Default::default());
+        self.pipeline
+            .process_gpu_mask(ctx, seg, mask, ch, mask_w, mask_h, true, fw, fh, &view)
+            .map_err(|e| e.to_string())?;
+        drop(frame); // present
+        Ok(())
+    }
 }

@@ -39,6 +39,9 @@ function currentPatch() {
       : null,
     // 인물 중앙 프레이밍 (웹 기본값 zoomMax 1.7 / headroom 0.15)
     framing: $('framing').checked ? { enabled: true, zoomMax: 1.7, headroom: 0.15 } : null,
+    // 프레임 변환은 tick()의 2D preprocess가 하고, 엔진은 이미지 배경 좌표 보정만
+    mirror: $('mirror').checked,
+    degree: Number($('degree').value),
   });
 }
 
@@ -69,7 +72,9 @@ function wireControls() {
     }
     push();
   });
-  for (const id of ['light', 'framing', 'blur', 'bright', 'gray']) $(id).addEventListener('input', push);
+  for (const id of ['light', 'framing', 'mirror', 'degree', 'blur', 'bright', 'gray']) {
+    $(id).addEventListener('input', push);
+  }
   $('item').addEventListener('input', () => setItem($('item').value).catch(console.warn));
   $('bgfile').addEventListener('change', async () => {
     const f = $('bgfile').files[0];
@@ -93,6 +98,31 @@ const ITEM_FIT = {
   glasses1: ['eyes', 1.15, 0], glasses_heart: ['eyes', 1.2, 0],
   mustache1: ['mouth', 0.6, 0],
 };
+
+// ── B티어: CPU 추론(R11) + GPU 합성 ──
+// 폴백 사다리 §1.5: 추론이 CPU로 떨어져도 합성 GPU가 살아있으면 효과 전부 산다.
+// CPU→GPU 트래픽 = 로짓 업로드(288×160×2 f32 ≈ 360KB → 엔진이 Rg32Float 업로드)뿐.
+let cpuSeg = null; // { io, canvas, ctx2d, rgb }
+async function loadCpuSeg() {
+  try {
+    const resp = await fetch('../models/segm_r11_160x288.sw');
+    if (!resp.ok) throw new Error(`R11 없음(${resp.status}) — make convert-r11-web`);
+    aiMod.load_model_cpu(new Uint8Array(await resp.arrayBuffer()));
+    const io = aiMod.model_io_cpu();
+    const c = document.createElement('canvas');
+    c.width = io.w;
+    c.height = io.h;
+    cpuSeg = {
+      io,
+      canvas: c,
+      ctx2d: c.getContext('2d', { willReadFrequently: true }),
+      rgb: new Float32Array(io.w * io.h * 3),
+    };
+    log(`studio cpu-tier ready (R11 ${io.w}x${io.h})`);
+  } catch (e) {
+    log('studio cpu-tier unavailable: ' + String(e).slice(0, 120));
+  }
+}
 
 async function ensureFaceTask() {
   if (face) return;
@@ -181,7 +211,7 @@ function clearItem() {
 async function main() {
   say('카메라 여는 중…');
   const stream = await navigator.mediaDevices.getUserMedia({
-    video: { width: 640, height: 360 },
+    video: { width: 1280, height: 720 },
   });
   const video = document.createElement('video');
   video.srcObject = stream;
@@ -198,18 +228,116 @@ async function main() {
   const seg = (await aiMod.load_model_h(bytes)).handle;
   aiMod.studio_attach($('out'));
   wireControls();
+  await loadCpuSeg(); // B티어 준비 (없으면 강제 B만 비활성 — A는 그대로 산다)
   log('studio init ok');
 
   const src = $('src');
+  // ⚠ src = 엔진 입력 해상도. 카메라 실해상도로 동기화 — 안 하면 카메라를
+  // src 크기로 줄였다가 출력 서피스로 다시 업스케일해 화질이 뭉개진다 (실제로 당함)
+  src.width = video.videoWidth || 1280;
+  src.height = video.videoHeight || 720;
   const sctx = src.getContext('2d');
-  const times = [];
+  // ── HUD 정직화 ──
+  // times(제출 벽시계)는 허수다 — WebGPU 제출은 즉시 리턴한다 (측정 규율).
+  // 정직한 수치 2개: ①rAF 간격(체감 스루풋, 항상) ②GPU 실측(5초마다 논블로킹
+  // onSubmittedWorkDone 샘플 — 루프를 세우지 않는다).
+  const times = [];   // 제출 벽시계 (참고용 유지)
+  const rafIv = [];   // 프레임 간격 실측
+  let lastTick = 0;
+  let gpuMs = null;
+  let gpuPending = false;
+  let lastGpuSample = 0;
   let frames = 0;
+  // 티어: auto는 gpu 실측 66ms 초과 2연속 샘플이면 B로 강등 (승격 없음 — v-ai 규약)
+  let demoted = false;
+  let badSamples = 0;
+  let curTier = 'A';
+  let cpuMs = null;
+  const p50 = (a) => (a.length ? [...a].sort((x, y) => x - y)[a.length >> 1] : NaN);
+  const hudStats = () =>
+    `tier=${curTier}${demoted ? '(강등)' : ''}` +
+    ` 간격 p50 ${p50(rafIv.slice(-60)).toFixed(1)}ms` +
+    `(~${Math.round(1000 / Math.max(1, p50(rafIv.slice(-60))))}fps)` +
+    ` gpu=${gpuMs ? gpuMs.toFixed(2) + 'ms' : '측정중'}` +
+    (curTier === 'B' && cpuMs !== null ? ` cpu_infer=${cpuMs.toFixed(1)}ms` : '') +
+    ` submit_p50=${p50(times.slice(-25)).toFixed(2)}ms`;
   say('가동 중');
   const tick = async () => {
-    sctx.drawImage(video, 0, 0, src.width, src.height);
+    const now0 = performance.now();
+    if (lastTick) {
+      rafIv.push(now0 - lastTick);
+      if (rafIv.length > 120) rafIv.shift();
+    }
+    lastTick = now0;
+    // mirror/degree는 추론 전 프레임에 적용 (v-ai _prepareSourceElement 등가 —
+    // 좌표계 계약: 랜드마크·마스크가 화면 좌표와 일치해야 한다)
+    const deg = Number($('degree').value);
+    const mir = $('mirror').checked;
+    if (mir || deg) {
+      sctx.setTransform(1, 0, 0, 1, 0, 0);
+      sctx.clearRect(0, 0, src.width, src.height);
+      sctx.translate(src.width / 2, src.height / 2);
+      if (mir) sctx.scale(-1, 1);
+      if (deg) sctx.rotate((deg * Math.PI) / 180);
+      sctx.drawImage(video, -src.width / 2, -src.height / 2, src.width, src.height);
+      sctx.setTransform(1, 0, 0, 1, 0, 0);
+    } else {
+      sctx.drawImage(video, 0, 0, src.width, src.height);
+    }
     const t0 = performance.now();
+    // GPU 실측 샘플 — t0(제출 시작)부터 GPU 큐가 빌 때까지. 등록만 하고 안 기다린다
+    // 헤드리스(90프레임)에서도 단계별 gpu 수치가 잡히게 15/45/75에 강제 샘플
+    const wantSample =
+      !gpuPending &&
+      (frames === 15 || frames === 45 || frames === 75 || now0 - lastGpuSample > 5000);
+    // 유효 티어 결정 (전환 스위치는 호스트 몫 — 폴백 사다리 규약)
+    const sel = $('tier').value;
+    const useCpu = !!cpuSeg && (sel === 'b' || (sel === 'auto' && demoted));
+    curTier = useCpu ? 'B' : 'A';
+    $('tierv').textContent = curTier + (demoted ? ' (강등됨)' : '');
     try {
-      await aiMod.studio_frame(seg, src);
+      if (useCpu) {
+        // B티어: CPU 추론(R11) → 로짓을 엔진에 주입 → GPU 합성 (효과 전부 생존)
+        const { io, ctx2d, rgb } = cpuSeg;
+        ctx2d.drawImage(src, 0, 0, io.w, io.h);
+        const d = ctx2d.getImageData(0, 0, io.w, io.h).data;
+        for (let p = 0, q = 0; p < d.length; p += 4, q += 3) {
+          rgb[q] = d[p] / 255;
+          rgb[q + 1] = d[p + 1] / 255;
+          rgb[q + 2] = d[p + 2] / 255;
+        }
+        const tc = performance.now();
+        // view 대신 복사 반환 — 반환 뷰를 곧장 wasm 호출에 되넘기면 힙 성장 시
+        // detach 위험 (infer_frame_cpu_view 규약: 뷰는 다음 호출 전 소비)
+        const logits = aiMod.infer_frame_cpu(rgb, io.outputs[0]);
+        cpuMs = performance.now() - tc;
+        aiMod.studio_frame_mask(seg, src, logits, 2, io.w, io.h);
+      } else {
+        await aiMod.studio_frame(seg, src);
+      }
+      if (wantSample) {
+        gpuPending = true;
+        lastGpuSample = now0;
+        aiMod
+          .gpu_sync()
+          .then(() => {
+            gpuMs = performance.now() - t0;
+            gpuPending = false;
+            // auto 강등 판정 (66ms 초과 2연속 — 승격 없음)
+            if (gpuMs > 66) {
+              badSamples++;
+              if (badSamples >= 2 && !demoted) {
+                demoted = true;
+                log(`studio demote → B (gpu ${gpuMs.toFixed(1)}ms × ${badSamples})`);
+              }
+            } else {
+              badSamples = 0;
+            }
+          })
+          .catch(() => {
+            gpuPending = false;
+          });
+      }
       // 3D 아이템 — FaceTask 랜드마크로 오버레이 갱신
       // (FaceTask 입력이 아직 u8 프레임이라 여기만 CPU 픽셀 경유 — P3에서 GPU화)
       if ($('item').value !== 'none' && face) {
@@ -237,14 +365,12 @@ async function main() {
     frames++;
     if (frames === 30) {
       // 워밍업 후 30프레임 시점에 통계 보고 (헤드리스 게이트)
-      const s = [...times.slice(-25)].sort((a, b) => a - b);
-      log(`studio frames=30 p50=${s[s.length >> 1].toFixed(2)}ms blur_test start`);
+      log(`studio frames=30 ${hudStats()} blur_test start`);
       $('blur').value = 60;
       $('blur').dispatchEvent(new Event('input'));
     }
     if (frames === 60) {
-      const s = [...times.slice(-25)].sort((a, b) => a - b);
-      log(`studio blur p50=${s[s.length >> 1].toFixed(2)}ms`);
+      log(`studio blur ${hudStats()}`);
       // 실제 제품 배경 + 3D 아이템 경로 (가짜 카메라엔 얼굴이 없어 오버레이는
       // null 경로를 탄다 — 크래시 없이 도는지가 스모크 목적)
       $('bg').value = 'asset:1';
@@ -255,18 +381,18 @@ async function main() {
       // 목표는 안 잡힐 수 있음 — 크래시 없이 도는지가 목적)
       $('framing').checked = true;
       $('framing').dispatchEvent(new Event('input'));
+      // B티어 강제 — 완료 기준 검증: GPU 추론 없이 배경·블러·조명·프레이밍 생존
+      if (cpuSeg) $('tier').value = 'b';
       // 3D 아이템은 얼굴이 있어야 의미가 있다 — 가짜 카메라(무얼굴)에선 배경만 검증
 
     }
     if (frames === 90) {
-      const s = [...times.slice(-25)].sort((a, b) => a - b);
-      log(`studio asset-bg+item p50=${s[s.length >> 1].toFixed(2)}ms face=${face ? 'loaded' : 'off'}`);
+      log(`studio asset-bg+item ${hudStats()} face=${face ? 'loaded' : 'off'}`);
       log('studio verdict PASS');
       log('studio-done');
     }
-    const s = [...times.slice(-30)].sort((a, b) => a - b);
     $('hud').textContent =
-      `frame ${frames} | p50 ${s.length ? s[s.length >> 1].toFixed(2) : '-'}ms (업로드+전처리+추론+합성 벽시계)`;
+      `frame ${frames} | ${hudStats()} — 간격=체감 스루풋, gpu=제출→GPU 완료 실측(5s 샘플), submit=제출 벽시계(허수 참고)`;
     requestAnimationFrame(tick);
   };
   requestAnimationFrame(tick);

@@ -30,6 +30,10 @@ struct P {
     lights: array<vec4f, 4>,
     // 인물 중앙 프레이밍: xyz = scale, cx, cy (scale 1 = 크롭 없음)
     framing: vec4f,
+    // mirror/degree 배경 보정 (v-ai updateTransform): 2×2 행렬 열우선 [c0x,c0y,c1x,c1y]
+    bg_mat: vec4f,
+    // xy = aspect 보정 (v-ai updateAspectComp)
+    bg_aspect: vec4f,
 }
 @group(0) @binding(5) var<uniform> p: P;
 // RVM 전경색 (매팅) — use_fgr=0이면 미사용 (프레임 뷰가 더미로 바인딩됨)
@@ -102,14 +106,25 @@ fn blur_bg_image(uv: vec2f) -> vec3f {
     } else if (p.bg_mode == 2u) {
         bg = p.bg_color.rgb;
     } else {
-        bg = blur_bg_image(in.uv * p.bg_scale + p.bg_offset);
+        // 이미지 배경 좌표 — v-ai image 스테이지 정점 셰이더 등가:
+        // 중심 좌표계에서 aspect 보정 → mirror/rotation 행렬 → cover scale+offset
+        var c = in.uv * 2.0 - 1.0;
+        c *= p.bg_aspect.xy;
+        c = vec2f(p.bg_mat.x * c.x + p.bg_mat.z * c.y, p.bg_mat.y * c.x + p.bg_mat.w * c.y);
+        c /= p.bg_aspect.xy;
+        bg = blur_bg_image((c * 0.5 + 0.5) * p.bg_scale + p.bg_offset);
     }
 
-    // 정석 매팅 합성 (RVM): 전경 = fgr — 원래 배경색이 섞인 카메라 픽셀 대신
-    // 모델이 복원한 순수 전경색을 쓴다. com = fgr×α + bg×(1−α).
+    // 매팅 합성 (RVM): fgr = 모델이 복원한 순수 전경색 — 단 **모델 해상도**
+    // (256×144)라 전면 사용하면 인물이 통째로 소프트해진다 (1280 입력에서 5배
+    // 업스케일 — 실제로 눈에 띄어 수리). 매팅의 실익(머리카락에 옛 배경이 배는
+    // 오염 제거)은 경계 불확실 구간에만 있으므로: 알파가 확실한 내부는 카메라
+    // 원본(풀해상), 경계만 fgr. 원리적 해결(풀해상 fgr)은 mnv4-RVM 교체 때.
     var fg = color;
     if (p.use_fgr > 0.5) {
-        fg = textureSampleLevel(fgr_tex, samp, cuv, 0.0).rgb;
+        let f = textureSampleLevel(fgr_tex, samp, cuv, 0.0).rgb;
+        let interior = smoothstep(p.cov.y, 1.0, raw);
+        fg = mix(f, color, interior);
     }
     // light wrapping — 배경 빛이 인물 윤곽에 감기는 효과 (screen 블렌드).
     // v-ai에선 단색(#hex)도 image 스테이지를 타므로 색/이미지 배경 공통.

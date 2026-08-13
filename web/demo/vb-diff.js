@@ -52,17 +52,18 @@ function makeFrame() {
   return d;
 }
 
-// 배경 이미지 (image 모드) — 프레임과 같은 종횡비 800×450 (cover 항등,
-// fitBackgroundForCanvas 비개입 — 크롭 수학 파리티는 mirror/degree 작업에서)
+// 배경 이미지 — S상은 프레임과 같은 종횡비 800×450(cover 항등), T상은 종횡비를
+// 달리해 cover 크롭 수학을 자극. ⚠ cropFactor ≥ 1.6이면 v-ai가 blur-fill
+// 사전합성(fitBackgroundForCanvas)을 타므로 그 아래로만 (사전합성은 미이관)
 const BGW = 800, BGH = 450;
-function makeBgImage() {
-  const d = new Uint8Array(BGW * BGH * 4);
-  for (let y = 0; y < BGH; y++) {
-    for (let x = 0; x < BGW; x++) {
-      const i = (y * BGW + x) * 4;
+function makeBgImage(w = BGW, h = BGH) {
+  const d = new Uint8Array(w * h * 4);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = (y * w + x) * 4;
       d[i] = Math.round(128 + 100 * Math.sin(x * 0.03));
       d[i + 1] = Math.round(128 + 100 * Math.sin(y * 0.05));
-      d[i + 2] = Math.round((1 - y / BGH) * 200);
+      d[i + 2] = Math.round((1 - y / h) * 200);
       d[i + 3] = 255;
     }
   }
@@ -243,7 +244,7 @@ async function main() {
     vai.reset();
     vai.configure(cfg, cfg.background === 'image' ? { data: bgImg, w: BGW, h: BGH } : null);
     for (const [mn, mask] of [['A', maskA], ['B', maskB]]) {
-      const ours = await aiMod.vb_gate_frame(seg, frame, FW, FH, mask, 1, false);
+      const ours = await aiMod.vb_gate_frame(seg, frame, FW, FH, mask, 1, MW, MH, false);
       const theirs = vai.frame(frame, mask, 1);
       check(`S/${name}/${mn}`, ours, theirs);
     }
@@ -265,7 +266,7 @@ async function main() {
       vai.reset();
       vai.configure(cfg, cfg.background === 'image' ? { data: bgImg, w: BGW, h: BGH } : null);
       vai.setFraming(...FR);
-      const ours = await aiMod.vb_gate_frame(seg, frame, FW, FH, maskA, 1, false);
+      const ours = await aiMod.vb_gate_frame(seg, frame, FW, FH, maskA, 1, MW, MH, false);
       const theirs = vai.frame(frame, maskA, 1);
       check(`F/${name}/person-crop`, ours, theirs);
     }
@@ -277,13 +278,43 @@ async function main() {
       aiMod.vb_gate_framing(...FR);
       vai.reset();
       vai.configure(cfg, null);
-      const ours = await aiMod.vb_gate_frame(seg, frame, FW, FH, maskA, 1, false);
+      const ours = await aiMod.vb_gate_frame(seg, frame, FW, FH, maskA, 1, MW, MH, false);
       const theirs = crop2d(vai.frame(frame, maskA, 1), ...FR);
       const d = diffReport(ours, theirs);
       log(
         `vbdiff F/blur/whole-crop(참고) max=${d.max} mean=${d.mean.toFixed(3)} ` +
           `over2=${(d.over2frac * 100).toFixed(3)}% (판정 제외 — 이중 필터 차)`
       );
+    }
+  }
+
+  // ── [T] 배경 transform (image 스테이지): cover 크롭 수학 + mirror/degree ──
+  // 프레임 자체의 mirror/degree는 호스트 preprocess 몫(양쪽 동일 입력 전제) —
+  // 여기선 엔진 몫인 배경 좌표 보정(행렬·aspect·contain)만 v-ai와 diff.
+  {
+    const cases = [
+      ['cover-wide', 1040, 450, false, 0],   // 가로 크롭 (cropFactor 1.3 < 1.6)
+      ['cover-tall', 800, 630, false, 0],    // 세로 크롭 (1.4 < 1.6)
+      ['mirror', 800, 450, true, 0],
+      ['degree-90', 800, 450, false, 90],
+      ['degree-180', 800, 450, false, 180],
+      ['mirror-90', 800, 450, true, 90],     // 쿼터턴 특례 분기
+    ];
+    for (const [name, bw, bh, mir, deg] of cases) {
+      const bg = makeBgImage(bw, bh);
+      const cfg = {
+        background: 'image', blur: 0, brightness: 1, grayscale: 0,
+        studioLight: null, mirror: mir, degree: deg,
+      };
+      aiMod.vb_gate_reset();
+      aiMod.vb_gate_bg_image(bg, bw, bh);
+      aiMod.vb_gate_config(JSON.stringify(cfg));
+      vai.reset();
+      vai.configure(cfg, { data: bg, w: bw, h: bh });
+      vai.setTransform(mir, (deg * Math.PI) / 180);
+      const ours = await aiMod.vb_gate_frame(seg, frame, FW, FH, maskA, 1, MW, MH, false);
+      const theirs = vai.frame(frame, maskA, 1);
+      check(`T/${name}`, ours, theirs);
     }
   }
 
@@ -296,10 +327,10 @@ async function main() {
     vai.configure(cfg, null);
     const logitsA = makeLogitsA(maskA);
     const logitsB = makeLogitsB(logitsA);
-    let ours = await aiMod.vb_gate_frame(seg, frame, FW, FH, logitsA, 2, true);
+    let ours = await aiMod.vb_gate_frame(seg, frame, FW, FH, logitsA, 2, MW, MH, true);
     let theirs = vai.frame(frame, logitsA, 2);
     check('E/blur/f1-zero-history', ours, theirs);
-    ours = await aiMod.vb_gate_frame(seg, frame, FW, FH, logitsB, 2, true);
+    ours = await aiMod.vb_gate_frame(seg, frame, FW, FH, logitsB, 2, MW, MH, true);
     theirs = vai.frame(frame, logitsB, 2);
     check('E/blur/f2-small-delta', ours, theirs);
   }

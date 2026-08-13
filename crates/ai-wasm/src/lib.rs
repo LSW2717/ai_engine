@@ -991,10 +991,11 @@ pub fn vb_gate_framing(scale: f32, cx: f32, cy: f32) -> Result<(), JsValue> {
 }
 
 /// 프레임+마스크 주입 1장 → 이펙트 스택(추론 없음) → 최종 RGBA 반환.
-/// ch=1 알파(RVM pha 등가), ch=2 로짓 [bg, person]. 마스크는 모델 마스크 해상도.
-/// ema=false면 시간 상태를 끊는다 (공간 스택 결정적 게이트).
+/// ch=1 알파(RVM pha 등가), ch=2 로짓 [bg, person]. 마스크 해상도는 자유
+/// (mask_w×mask_h). ema=false면 시간 상태를 끊는다 (공간 스택 결정적 게이트).
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
 pub async fn vb_gate_frame(
     seg: u32,
     frame_rgba: &[u8],
@@ -1002,16 +1003,56 @@ pub async fn vb_gate_frame(
     fh: u32,
     mask: &[f32],
     ch: u32,
+    mask_w: u32,
+    mask_h: u32,
     ema: bool,
 ) -> Result<Vec<u8>, JsValue> {
     let ctx = engine()?;
     let seg_s = GPU_MODELS.with(|p| p.borrow_mut().take(seg)).map_err(js_err)?;
     let mut g = VB_GATE.with(|c| c.borrow_mut().take());
     let result = match g.as_mut() {
-        Some(g) => g.frame(&ctx, &seg_s, frame_rgba, fw, fh, mask, ch, ema).await.map_err(js_err),
+        Some(g) => g
+            .frame(&ctx, &seg_s, frame_rgba, fw, fh, mask, ch, mask_w, mask_h, ema)
+            .await
+            .map_err(js_err),
         None => Err(JsValue::from_str("vb_gate_reset 먼저")),
     };
     VB_GATE.with(|c| *c.borrow_mut() = g);
+    GPU_MODELS.with(|p| p.borrow_mut().put(seg, seg_s));
+    result
+}
+
+/// 제출된 GPU 작업 완료 시 resolve (onSubmittedWorkDone — **논블로킹**).
+/// HUD 정직화의 주기 샘플용: JS가 fire-and-forget으로 걸고 .then에서 시각을 재면
+/// 렌더 루프를 세우지 않고 실제 GPU 레이턴시를 얻는다.
+#[wasm_bindgen]
+pub async fn gpu_sync() -> Result<(), JsValue> {
+    let ctx = engine()?;
+    ai_gpu::readback::wait_idle(&ctx).await.map_err(js_err)
+}
+
+/// B티어 프레임: 소스 캔버스 + 외부(CPU 추론) 마스크 → 이펙트 스택 → 캔버스.
+/// seg = GPU 세션 핸들(리소스 치수용 — 추론은 안 돈다). ch=2면 [bg, person] 로짓.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn studio_frame_mask(
+    seg: u32,
+    source: web_sys::HtmlCanvasElement,
+    mask: &[f32],
+    ch: u32,
+    mask_w: u32,
+    mask_h: u32,
+) -> Result<(), JsValue> {
+    let ctx = engine()?;
+    let seg_s = GPU_MODELS.with(|p| p.borrow_mut().take(seg)).map_err(js_err)?;
+    let mut st = STUDIO.with(|c| c.borrow_mut().take());
+    let result = match st.as_mut() {
+        Some(s) => {
+            s.frame_mask(&ctx, &seg_s, &source, mask, ch, mask_w, mask_h).map_err(js_err)
+        }
+        None => Err(JsValue::from_str("studio_attach 먼저")),
+    };
+    STUDIO.with(|c| *c.borrow_mut() = st);
     GPU_MODELS.with(|p| p.borrow_mut().put(seg, seg_s));
     result
 }

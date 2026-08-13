@@ -29,10 +29,12 @@
 <div id="status">대기 — 시작을 누르세요</div>
 <button id="start">시작</button>
 <div class="row" style="margin-top:.8rem">
+  <!-- 백킹 1280×720, CSS 표시 640×360 — 레티나(dpr 2)에서 디바이스 픽셀 1:1.
+       백킹=표시 크기로 두면 브라우저가 2배 업스케일해 화질이 뭉개진다 -->
   <div style="position:relative; width:640px; height:360px">
-    <canvas id="out" width="640" height="360"></canvas>
-    <canvas id="fx" width="640" height="360"
-      style="position:absolute; left:0; top:0; pointer-events:none; border:none"></canvas>
+    <canvas id="out" width="1280" height="720" style="width:640px; height:360px"></canvas>
+    <canvas id="fx" width="1280" height="720"
+      style="position:absolute; left:0; top:0; width:640px; height:360px; pointer-events:none; border:none"></canvas>
   </div>
   <div class="panel">
     <label>배경</label>
@@ -59,8 +61,22 @@
       <option value="glasses_heart">하트 안경</option>
       <option value="mustache1">콧수염</option>
     </select>
+    <label>티어</label>
+    <select id="tier">
+      <option value="auto">auto (66ms 강등)</option>
+      <option value="a">A — GPU 추론</option>
+      <option value="b">B — CPU 추론+GPU 합성</option>
+    </select><span id="tierv"></span>
     <label>조명</label><input type="checkbox" id="light" /><span></span>
     <label>프레이밍</label><input type="checkbox" id="framing" /><span id="framingv"></span>
+    <label>미러</label><input type="checkbox" id="mirror" /><span></span>
+    <label>회전</label>
+    <select id="degree">
+      <option value="0">0°</option>
+      <option value="90">90°</option>
+      <option value="180">180°</option>
+      <option value="270">270°</option>
+    </select><span></span>
     <label>블러</label><input type="range" id="blur" min="0" max="100" value="0" /><span id="blurv">0</span>
     <label>밝기(배경)</label><input type="range" id="bright" min="0" max="200" value="100" /><span id="brightv">100</span>
     <label>흑백(배경)</label><input type="range" id="gray" min="0" max="100" value="0" /><span id="grayv">0</span>

@@ -149,6 +149,12 @@ bilateral 가이드 업샘플 + 엣지 정제** 스택(현 웹·모바일 공통
 - `destroyCustomVideoStream`은 **모델을 파기하지 않는다** (웜 워커 재사용 — 카메라 토글 지연).
 - 시간 EMA(diff>0.3 ? 0.9 : 0.03) — RVM류(pha 직출)는 0.6/0.9.
 - 프레이밍 스무딩: 데드밴드 0.045/0.055 + 2s 지속이탈 커밋 + EMA 0.5s + 슬루 0.35/s.
+- 프레이밍은 **가상배경 없이도 독립 동작** (사용자 확정, 2026-08-14): 배경 효과가
+  전부 꺼져도 framing이 켜져 있으면 세그 추론+프레이밍은 산다 —
+  `processWorkerFrame` passthrough/파이프라인 활성 판정에 framing 포함.
+- 프레이밍 bbox는 **마스크가 있는 곳에서** (사용자 확정): GPU 추론 티어 = GPU
+  리덕션+20B 리드백 링, CPU 마스크 티어(B/C — process_gpu_mask 주입) = CPU 스캔
+  (`scan_bbox_cpu`, 리드백 0). 스무딩 로직은 한 벌(framing.rs) 공유.
 - 모바일 renderMask: in-place, stride 보존, width/height 음수 허용.
 - 프로세스당 1인스턴스 제약(모바일)은 다중 스트림 로드맵 확정 전까지 유지 가능.
 

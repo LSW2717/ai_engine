@@ -66,9 +66,11 @@ struct Res {
     in_w: u32,
     in_h: u32,
     in_cg: u32,
-    /// 외부 마스크 주입(픽셀 diff 게이트 · P2 B티어) 스테이징 — (ch, 텍스처,
-    /// 인제스트 바인드 핑퐁). 지연 생성 (주입 경로를 안 쓰면 비용 0)
-    ext_mask: Option<(u32, wgpu::Texture, Vec<wgpu::BindGroup>)>,
+    /// 외부 마스크 주입(픽셀 diff 게이트 · P2 B티어) 스테이징 — (ch, w, h, 텍스처,
+    /// 인제스트 바인드 핑퐁). 지연 생성 (주입 경로를 안 쓰면 비용 0).
+    /// 치수는 호출자 마스크 기준(CPU 모델 해상도) — ingest가 textureLoad로 자기
+    /// 해상도를 읽어 mask_lo(GPU 모델 해상도)로 리샘플하므로 달라도 된다
+    ext_mask: Option<(u32, u32, u32, wgpu::Texture, Vec<wgpu::BindGroup>)>,
     /// bbox 리덕션 바인드 (mask_lo[p] — EMA 이후 마스크 소비) [parity]
     bbox_bind: Vec<wgpu::BindGroup>,
 }
@@ -209,8 +211,8 @@ impl VideoPipeline {
         self.last_bbox
     }
 
-    /// 프레임 시작 프레이밍 틱: 리드백 회수 → 스무딩 → 이번 프레임 발행 슬롯.
-    /// 프레이밍 off면 발행 없음 (비용 0)
+    /// 프레임 시작 프레이밍 틱 (GPU 추론 경로): 리드백 회수 → 스무딩 →
+    /// 이번 프레임 발행 슬롯. 프레이밍 off면 발행 없음 (비용 0)
     fn framing_tick(&mut self, ctx: &GpuContext) -> Option<usize> {
         let (mw, mh) = {
             let r = self.res.as_ref().unwrap();
@@ -226,6 +228,21 @@ impl VideoPipeline {
         } else {
             None
         }
+    }
+
+    /// 프레이밍 틱 (CPU 마스크 경로 — process_gpu_mask): 마스크가 이미 CPU에
+    /// 있으므로 GPU 리덕션·리드백 없이 즉시 스캔 (지연 0, 리드백 0)
+    fn framing_tick_cpu(&mut self, mask: &[f32], ch: u32, mask_w: u32, mask_h: u32) {
+        if self.state.framing.is_some() {
+            self.last_bbox = super::framing::scan_bbox_cpu(
+                mask,
+                mask_w as usize,
+                mask_h as usize,
+                ch as usize,
+            );
+        }
+        let now = self.epoch.elapsed().as_secs_f64() * 1e3;
+        self.framing.update(self.state.framing.as_ref(), self.last_bbox, now);
     }
 
     fn ensure(
@@ -600,16 +617,21 @@ impl VideoPipeline {
     }
 
     /// 외부 마스크 주입 경로 (픽셀 diff 게이트 · P2 B티어 진입점): 추론을 건너뛰고
-    /// 모델 마스크 해상도의 f32 마스크를 직접 업로드해 이펙트 스택만 돌린다.
-    /// ch=1 알파 직출(RVM pha 등가, EMA 0.6/0.9), ch=2 로짓 [bg, person]
-    /// (softmax 경로, EMA 0.03/0.9). ema=false면 시간 상태를 끊는다(게이트 재현성).
+    /// mask_w×mask_h f32 마스크를 직접 업로드해 이펙트 스택만 돌린다.
+    /// 마스크 해상도는 GPU 모델과 달라도 된다 (B티어: CPU R11 288×160 등 —
+    /// ingest가 EMA 해상도로 리샘플). ch=1 알파 직출(RVM pha 등가, EMA 0.6/0.9),
+    /// ch=2 로짓 [bg, person] (softmax 경로, EMA 0.03/0.9).
+    /// ema=false면 시간 상태를 끊는다(게이트 재현성).
     /// fgr(매팅)은 쓰지 않는다 — v-ai 파리티 기준.
+    #[allow(clippy::too_many_arguments)]
     pub fn process_gpu_mask(
         &mut self,
         ctx: &GpuContext,
         seg: &GpuSession,
         mask: &[f32],
         ch: u32,
+        mask_w: u32,
+        mask_h: u32,
         ema: bool,
         fw: u32,
         fh: u32,
@@ -617,25 +639,26 @@ impl VideoPipeline {
     ) -> Result<(), TaskError> {
         self.ensure(ctx, seg, fw, fh)?;
         let p = self.parity;
-        let bbox_slot = self.framing_tick(ctx);
         {
             let r = self.res.as_mut().unwrap();
-            if !(ch == 1 || ch == 2) || mask.len() != (r.mw * r.mh * ch) as usize {
+            if !(ch == 1 || ch == 2) || mask.len() != (mask_w * mask_h * ch) as usize {
                 return Err(TaskError::Other(format!(
-                    "외부 마스크 불일치: len {} ≠ {}×{}×{ch}",
-                    mask.len(),
-                    r.mw,
-                    r.mh
+                    "외부 마스크 불일치: len {} ≠ {mask_w}×{mask_h}×{ch}",
+                    mask.len()
                 )));
             }
-            if r.ext_mask.as_ref().map(|(c, ..)| *c != ch).unwrap_or(true) {
+            if r.ext_mask
+                .as_ref()
+                .map(|(c, w, h, ..)| (*c, *w, *h) != (ch, mask_w, mask_h))
+                .unwrap_or(true)
+            {
                 let fmt = if ch == 1 {
                     wgpu::TextureFormat::R32Float
                 } else {
                     wgpu::TextureFormat::Rg32Float
                 };
                 let (tex, view) =
-                    tex2d(ctx, "vb-ext-mask", r.mw, r.mh, fmt, wgpu::TextureUsages::COPY_DST);
+                    tex2d(ctx, "vb-ext-mask", mask_w, mask_h, fmt, wgpu::TextureUsages::COPY_DST);
                 let binds = (0..2)
                     .map(|pp| {
                         ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -660,9 +683,9 @@ impl VideoPipeline {
                         })
                     })
                     .collect();
-                r.ext_mask = Some((ch, tex, binds));
+                r.ext_mask = Some((ch, mask_w, mask_h, tex, binds));
             }
-            let (_, tex, _) = r.ext_mask.as_ref().unwrap();
+            let (.., tex, _) = r.ext_mask.as_ref().unwrap();
             ctx.queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: tex,
@@ -673,12 +696,14 @@ impl VideoPipeline {
                 bytemuck::cast_slice(mask),
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(r.mw * 4 * ch),
-                    rows_per_image: Some(r.mh),
+                    bytes_per_row: Some(mask_w * 4 * ch),
+                    rows_per_image: Some(mask_h),
                 },
-                wgpu::Extent3d { width: r.mw, height: r.mh, depth_or_array_layers: 1 },
+                wgpu::Extent3d { width: mask_w, height: mask_h, depth_or_array_layers: 1 },
             );
         }
+        // 프레이밍: 마스크가 CPU에 있다 — GPU 리덕션 대신 즉시 스캔
+        self.framing_tick_cpu(mask, ch, mask_w, mask_h);
         let r = self.res.as_ref().unwrap();
         self.write_stack_params_ema(
             ctx,
@@ -690,12 +715,9 @@ impl VideoPipeline {
         let mut enc = ctx
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("video-ext") });
-        let (_, _, binds) = r.ext_mask.as_ref().unwrap();
-        self.encode_stack(&mut enc, r, p, &binds[p], bbox_slot, target);
+        let (.., binds) = r.ext_mask.as_ref().unwrap();
+        self.encode_stack(&mut enc, r, p, &binds[p], None, target);
         ctx.queue.submit([enc.finish()]);
-        if let Some(s) = bbox_slot {
-            self.bbox.map(s);
-        }
         self.parity = 1 - p;
         Ok(())
     }
