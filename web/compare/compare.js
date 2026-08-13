@@ -193,15 +193,22 @@ async function benchTfjs(backend) {
 }
 
 // ---- C) ai_engine (.sw) ----
-async function benchOurs() {
+async function benchOurs(url = '../models/rvm_256x144.sw') {
   await initWasm();
   await init_engine();
   const t0 = performance.now();
-  const resp = await fetch('../models/rvm_256x144.sw');
+  const resp = await fetch(url);
   const bytes = new Uint8Array(await resp.arrayBuffer());
+  const tFetch = performance.now() - t0;
   const report = await load_model(bytes);
   const load = performance.now() - t0;
   const bench = await model_bench(FRAMES); // 내부: 시드 입력, 워밍업 3, 상태 ping-pong
+  // 콜드 첫 로드가 웹 체감을 지배한다 — fetch와 파이프라인 컴파일을 나눠서 본다
+  console.log(
+    `AI_ENGINE_RESULT: loadbreak ${url} fetch ${tFetch.toFixed(0)}ms ` +
+      `compile+setup ${(load - tFetch).toFixed(0)}ms total ${load.toFixed(0)}ms ` +
+      `pipelines ${report.unique_pipelines} ops ${report.ops} bytes ${bytes.length}`
+  );
   return { ms: bench.ms_per_frame, load, report };
 }
 
@@ -246,11 +253,25 @@ async function main() {
     addRow('webgl2-engine-span.js', 'ERR', '-', String(e).slice(0, 300));
   }
   try {
-    say('4/4 ai_engine (.sw) 실행 중…');
+    say('6/7 ai_engine (.sw, fp32) 실행 중…');
     const r = await benchOurs();
     addRow('ai_engine (wgpu, fp32)', r.ms, r.load, `${r.report.ops} ops`);
   } catch (e) {
     addRow('ai_engine (wgpu, fp32)', 'ERR', '-', String(e).slice(0, 300));
+  }
+  try {
+    say('8/8 ai_engine (고정 export, 가중치 fp16) 실행 중…');
+    const r = await benchOurs('../models/rvm_fixed_fp16w.sw');
+    addRow('ai_engine (고정 export, 가중치 fp16)', r.ms, r.load, `${r.report.ops} ops`);
+  } catch (e) {
+    addRow('ai_engine (고정 export)', 'ERR', '-', String(e).slice(0, 200));
+  }
+  try {
+    say('7/8 ai_engine (.sw, 가중치 fp16) 실행 중…');
+    const r = await benchOurs('../models/rvm_256x144_fp16w.sw');
+    addRow('ai_engine (wgpu, 가중치 fp16)', r.ms, r.load, `${r.report.ops} ops, 블롭 절반`);
+  } catch (e) {
+    addRow('ai_engine (wgpu, 가중치 fp16)', 'ERR', '-', String(e).slice(0, 300));
   }
   say('완료');
   console.log('AI_ENGINE_RESULT: compare-done');

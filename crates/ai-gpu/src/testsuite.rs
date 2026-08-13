@@ -207,7 +207,10 @@ async fn ew_case(
     let scalar_val = 0.7f32;
 
     let spec =
-        ElementwiseSpec { op, operand, act, len_vec4: desc.vec4_len() as u32, dt: desc.dt };
+        ElementwiseSpec { op, operand, act, len_vec4: desc.vec4_len() as u32, dt: desc.dt,
+            views: [crate::kernels::common::source::SrcView::NONE; 3],
+            out_cg: 0,
+        };
     let name = format!("{} {}x{}x{}", spec.cache_key(&ctx.caps), desc.h, desc.w, desc.c);
 
     let a_buf = storage_in(ctx, &pack::pack_nhwc(&a, desc));
@@ -302,7 +305,7 @@ async fn pw_case(
     let op = Conv2d::pointwise(cin, cout, act);
     let want = reference::conv::conv2d(&op, h, w, &input, &wts, Some(&bias), res.as_deref());
 
-    let spec = GemmPwSpec { m: h * w, kg: din.cg(), ng: dout.cg(), act, residual, dt };
+    let spec = GemmPwSpec { m: h * w, kg: din.cg(), ng: dout.cg(), act, residual, dt, wdt: dt };
     let name = format!("{} ({}x{} {}->{})", spec.cache_key(&ctx.caps), h, w, cin, cout);
 
     let (wbytes, _kg_pad) = pack::pack_weights_conv(&wts, cout, cin, 1, 1, 4, dt);
@@ -646,7 +649,7 @@ async fn igemm_concat_case(
 
     let mut spec = ConvIgemmSpec::from_op(&op, ih, iw, residual, DType::F32);
     for (i, c) in part_cs.iter().enumerate() {
-        spec.srcs[i] = *c;
+        spec.srcs[i] = crate::kernels::common::source::SrcView::plain(*c);
     }
     let name = spec.cache_key(&ctx.caps);
 
@@ -782,7 +785,7 @@ pub async fn run_pool_resize(ctx: &GpuContext) -> Result<Vec<CaseResult>, String
         let mut rng = XorShift32::new(seed);
         let input = rng.vec_f32(din.elems());
         let want = reference::resize::resize_bilinear(&rop, ih, iw, c, &input);
-        let spec = ResizeBilinearSpec { ih, iw, c, oh, ow, mode, dt: DType::F32, srcs: [0; 3] };
+        let spec = ResizeBilinearSpec { ih, iw, c, oh, ow, mode, dt: DType::F32, srcs: [crate::kernels::common::source::SrcView::NONE; 3] };
         let in_buf = storage_in(ctx, &pack::pack_nhwc(&input, &din));
         let out_buf = storage_out(ctx, dout.size_bytes());
         let bytes =
@@ -891,8 +894,7 @@ pub async fn run_mobilenet_block(ctx: &GpuContext) -> Result<Vec<CaseResult>, St
         ng: d_exp.cg(),
         act: Activation::Hardswish,
         residual: false,
-        dt: DType::F32,
-    };
+        dt: DType::F32, wdt: DType::F32 };
     let s_dw = ConvDwSpec::from_op(&op_dw, h, w, false, DType::F32);
     let s_gp = GpoolSpec { h, w, c: cexp, dt: DType::F32 };
     let s_sq = GemmPwSpec {
@@ -901,31 +903,30 @@ pub async fn run_mobilenet_block(ctx: &GpuContext) -> Result<Vec<CaseResult>, St
         ng: d_vec_sq.cg(),
         act: Activation::Relu,
         residual: false,
-        dt: DType::F32,
-    };
+        dt: DType::F32, wdt: DType::F32 };
     let s_ex = GemmPwSpec {
         m: 1,
         kg: d_vec_sq.cg(),
         ng: d_vec_exp.cg(),
         act: Activation::Hardsigmoid,
         residual: false,
-        dt: DType::F32,
-    };
+        dt: DType::F32, wdt: DType::F32 };
     let s_scale = ElementwiseSpec {
         op: BinaryOp::Mul,
         operand: EwOperand::ChannelVector,
         act: Activation::None,
         len_vec4: d_exp.vec4_len() as u32,
         dt: DType::F32,
-    };
+            views: [crate::kernels::common::source::SrcView::NONE; 3],
+            out_cg: 0,
+        };
     let s_proj = GemmPwSpec {
         m,
         kg: d_exp.cg(),
         ng: d_in.cg(),
         act: Activation::None,
         residual: true,
-        dt: DType::F32,
-    };
+        dt: DType::F32, wdt: DType::F32 };
 
     // 파이프라인 캐시 경유 컴파일 (동일 시그니처 공유 확인 겸)
     let mut cache = PipelineCache::new();
@@ -1108,7 +1109,9 @@ pub async fn run_elementwise_arena(ctx: &GpuContext) -> Result<Vec<CaseResult>, 
         act: Activation::Relu,
         len_vec4: len,
         dt: desc.dt,
-    };
+            views: [crate::kernels::common::source::SrcView::NONE; 3],
+            out_cg: 0,
+        };
     let spec2 = ElementwiseSpec { op: BinaryOp::Mul, act: Activation::None, ..spec1 };
 
     let mut cache = PipelineCache::new();

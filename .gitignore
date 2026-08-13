@@ -29,3 +29,7 @@ target
 /target
 /models/
 /web/models/
+
+# macOS / 에디터
+.DS_Store
+.vscode/

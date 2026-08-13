@@ -24,7 +24,7 @@ impl KernelSpec for UniformW {
     }
     fn wgsl(&self, caps: &DeviceCaps) -> String {
         self.base.wgsl(caps).replace(
-            "var<storage, read> W: array<sv4>;",
+            "var<storage, read> W: array<wv4>;",
             &format!("var<uniform> W: array<vec4f, {}>;", self.n_vec4),
         )
     }

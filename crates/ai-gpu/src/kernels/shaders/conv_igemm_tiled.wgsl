@@ -8,7 +8,7 @@
 //@TYPES
 
 @group(0) @binding(1) var<storage, read> IN: array<sv4>;
-@group(0) @binding(2) var<storage, read> W: array<sv4>; // [tap][kgp][ng][j]
+@group(0) @binding(2) var<storage, read> W: array<wv4>; // [tap][kgp][ng][j]
 @group(0) @binding(3) var<storage, read> BIAS: array<sv4>;
 //@RES_BINDING
 //@OUT_BINDING

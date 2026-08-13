@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>RVM 가상배경 A/B — ai_engine vs webgl2</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: ui-sans-serif, system-ui, -apple-system, "Apple SD Gothic Neo", sans-serif;
+    max-width: 1400px; margin: 1.2rem auto; padding: 0 1rem; line-height: 1.5; }
+  h1 { font-size: 1.2rem; margin: 0 0 .25rem; }
+  .note { font-size: .85rem; opacity: .75; margin: 0 0 .9rem; }
+  .bar { display: flex; gap: .75rem; align-items: center; flex-wrap: wrap; margin-bottom: .8rem; }
+  button, select { font: inherit; padding: .4rem .7rem; border-radius: 8px;
+    border: 1px solid #8886; background: #8881; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  #pair { display: grid; grid-template-columns: 1fr 1fr; gap: .6rem; }
+  .pane { position: relative; }
+  .pane canvas { width: 100%; display: block; background: #0002; border-radius: 10px; }
+  .tag { position: absolute; left: .5rem; top: .5rem; padding: .25rem .55rem; border-radius: 6px;
+    background: #000a; color: #fff; font-size: .8rem; font-weight: 600; }
+  .metrics { display: flex; gap: 1rem; font-size: .82rem; opacity: .85; margin-top: .35rem;
+    font-variant-numeric: tabular-nums; }
+  #status { padding: .5rem .8rem; border-radius: 8px; background: rgba(88,166,255,.12);
+    margin-bottom: .8rem; font-size: .9rem; }
+  .err { color: #d1242f; }
+</style>
+</head>
+<body>
+  <h1>같은 프레임, 두 엔진 — ai_engine(WebGPU) vs webgl2-engine-span</h1>
+  <p class="note">한 카메라 프레임을 256×144로 줄여 <b>양쪽에 동일하게</b> 먹인다.
+    각 엔진의 알파를 각자 합성해 좌우로 보여준다. <b>이 페이지는 정확도(마스크가 같은가)
+    비교용이다.</b></p>
+  <p class="note">두 엔진 모두 <b>마스크를 CPU로 꺼내지 않는다</b> — 각자 GPU에서 알파를
+    캔버스로 바로 그리고, 합성도 캔버스 GPU 합성이다(휘도 방식).
+    <b>추론</b> = 3초마다 각 엔진을 단독으로 N프레임 돌려 마지막에 한 번만 동기화해 잰
+    실제 GPU 시간(양쪽 동일 방법론). <b>제출</b> = CPU가 명령을 다 낸 시점이라
+    엔진 비교에 쓰면 안 되는 값이다.</p>
+
+  <div id="status">대기 — “시작”을 누르면 카메라 권한을 요청합니다.</div>
+
+  <div class="bar">
+    <button id="start">시작</button>
+    <button id="stop" disabled>정지</button>
+    <label>ai_engine 모델
+      <select id="model">
+        <option value="../models/rvm_256x144_fp16w.sw">가중치 fp16 (7.8MB)</option>
+        <option value="../models/rvm_256x144.sw">fp32 (15.1MB)</option>
+      </select>
+    </label>
+    <label>배경
+      <select id="bg">
+        <option value="gradient">그라디언트</option>
+        <option value="blur">원본 블러</option>
+        <option value="black">검정</option>
+      </select>
+    </label>
+    <label><input type="checkbox" id="showMask" /> 마스크만 보기</label>
+    <button id="bench">GPU 시간 측정 (등가)</button>
+  </div>
+  <div id="benchout" class="metrics" style="margin-bottom:.6rem"></div>
+
+  <div id="pair">
+    <div>
+      <div class="pane"><span class="tag">ai_engine (WebGPU)</span><canvas id="outA"></canvas></div>
+      <div class="metrics"><span id="a-fps">– fps</span><span id="a-infer">– ms</span></div>
+      <!-- present가 그린 WebGPU 캔버스 원본. 여기가 검으면 present 자체가 실패한 것이고,
+           여기는 나오는데 위 패널이 검으면 drawImage 쪽 문제다. -->
+      <div class="metrics"><span>present 원본 →</span><span id="rawslot"></span></div>
+    </div>
+    <div>
+      <div class="pane"><span class="tag">webgl2-engine-span</span><canvas id="outB"></canvas></div>
+      <div class="metrics"><span id="b-fps">– fps</span><span id="b-infer">– ms</span></div>
+    </div>
+  </div>
+
+  <div class="metrics" style="margin-top:.6rem">
+    <span id="diff">알파 평균 절대차: –</span>
+  </div>
+
+  <script type="module" src="./ab.js"></script>
+</body>
+</html>

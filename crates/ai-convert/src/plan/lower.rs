@@ -43,7 +43,10 @@ fn unary_act(op: &str) -> Option<Activation> {
 
 struct Lowerer<'a> {
     g: &'a Graph,
+    /// 활성화 dtype
     dt: DType,
+    /// std conv 가중치 dtype (dw 가중치·bias는 `dt`를 쓴다 — BN 접힘 레인지)
+    wdt: DType,
     tids: HashMap<String, u32>,
     tensors: Vec<SwTensor>,
     blob: BlobBuilder,
@@ -125,7 +128,7 @@ impl<'a> Lowerer<'a> {
             (pack::pack_weights_dw(&wvals, cout, kh, kw, self.dt), 0, cout)
         } else if group == 1 {
             let cin = cin_g;
-            let (b, kg) = pack::pack_weights_conv(&wvals, cout, cin, kh, kw, 4, self.dt);
+            let (b, kg) = pack::pack_weights_conv(&wvals, cout, cin, kh, kw, 4, self.wdt);
             (b, kg, cin)
         } else {
             return Err(ConvertError::Unsupported(vec![format!(
@@ -205,7 +208,10 @@ impl<'a> Lowerer<'a> {
 /// 패스 완료된 그래프 → (.sw 모델, 블롭)
 pub fn lower(g: &Graph, ctx: &Ctx, name: &str) -> Result<(SwModel, Vec<u8>), ConvertError> {
     let dt = if ctx.fp16 { DType::F16 } else { DType::F32 };
-    let mut lw = Lowerer { g, dt, tids: HashMap::new(), tensors: Vec::new(), blob: BlobBuilder::new() };
+    // 가중치만 f16: 활성화 f32를 유지하면서 std conv 가중치 트래픽만 절반으로
+    let wdt = if ctx.fp16 || ctx.fp16_weights { DType::F16 } else { DType::F32 };
+    let mut lw =
+        Lowerer { g, dt, wdt, tids: HashMap::new(), tensors: Vec::new(), blob: BlobBuilder::new() };
 
     // 그래프 입력 먼저 등록 (tid 안정성)
     for i in &g.inputs {
@@ -295,7 +301,7 @@ pub fn lower(g: &Graph, ctx: &Ctx, name: &str) -> Result<(SwModel, Vec<u8>), Con
                 let c_mid = node.attr_i("c_mid").unwrap() as u32;
                 let act1 = parse_act(node.attr_s("act1"))?;
                 let w1v = lw.const_f32s(&node.inputs[1])?;
-                let (w1b, _) = pack::pack_weights_conv(&w1v, c_mid, cin, 1, 1, 4, lw.dt);
+                let (w1b, _) = pack::pack_weights_conv(&w1v, c_mid, cin, 1, 1, 4, lw.wdt);
                 let w1 = lw.blob.push(&w1b);
                 let b1v = lw.const_f32s(&node.inputs[2])?;
                 let b1 = lw.blob.push(&pack::pack_bias(&b1v, c_mid, lw.dt));
@@ -304,7 +310,7 @@ pub fn lower(g: &Graph, ctx: &Ctx, name: &str) -> Result<(SwModel, Vec<u8>), Con
                         let c_out = c_out as u32;
                         let act2 = parse_act(node.attr_s("act2"))?;
                         let w2v = lw.const_f32s(&node.inputs[3])?;
-                        let (w2b, _) = pack::pack_weights_conv(&w2v, c_out, c_mid, 1, 1, 4, lw.dt);
+                        let (w2b, _) = pack::pack_weights_conv(&w2v, c_out, c_mid, 1, 1, 4, lw.wdt);
                         let w2 = lw.blob.push(&w2b);
                         let b2v = lw.const_f32s(&node.inputs[4])?;
                         let b2 = lw.blob.push(&pack::pack_bias(&b2v, c_out, lw.dt));
@@ -463,6 +469,7 @@ pub fn lower(g: &Graph, ctx: &Ctx, name: &str) -> Result<(SwModel, Vec<u8>), Con
         name: name.to_string(),
         size,
         dt_default: dt,
+        dt_weights: Some(wdt),
         tensors,
         inputs,
         outputs,

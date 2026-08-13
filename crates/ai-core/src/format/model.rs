@@ -208,6 +208,15 @@ pub struct SwModel {
     /// 변환 시점 입력 크기 (정보용)
     pub size: SwSize,
     pub dt_default: DType,
+    /// std conv(igemm/pw) 가중치 스토리지 dtype. 생략 시 `dt_default`와 같다.
+    ///
+    /// 활성화와 독립인 축인 이유: 저해상 심층 conv은 가중치 재사용이 픽셀 수 M으로
+    /// 묶여 가중치 페치가 대역을 지배한다. 여기만 F16으로 낮추면 트래픽이 절반이
+    /// 되면서 활성화는 F32라 정확도 손실이 거의 없다.
+    /// **dw 가중치와 모든 bias는 이 축을 따르지 않고 `dt_default`를 쓴다** — BN 접힘
+    /// 다이내믹 레인지 때문. 런타임 lowering이 같은 규약을 지켜야 블롭 해석이 맞는다.
+    #[serde(default)]
+    pub dt_weights: Option<DType>,
     /// index = tid
     pub tensors: Vec<SwTensor>,
     pub inputs: Vec<u32>,
@@ -259,6 +268,7 @@ mod tests {
             name: "t".into(),
             size: SwSize { h: 4, w: 4 },
             dt_default: DType::F32,
+            dt_weights: None,
             tensors: vec![
                 SwTensor { name: "x".into(), h: 4, w: 4, c: 3, dt: DType::F32, alias: None, last_use: 0 },
                 SwTensor { name: "y".into(), h: 4, w: 4, c: 8, dt: DType::F32, alias: None, last_use: 1 },

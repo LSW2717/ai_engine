@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>RVM 가상배경 데모</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: ui-sans-serif, system-ui, -apple-system, "Apple SD Gothic Neo", sans-serif;
+    max-width: 1000px; margin: 1.5rem auto; padding: 0 1rem; line-height: 1.5; }
+  h1 { font-size: 1.25rem; margin: 0 0 .25rem; }
+  .note { font-size: .85rem; opacity: .75; margin: 0 0 1rem; }
+  .bar { display: flex; gap: .75rem; align-items: center; flex-wrap: wrap; margin-bottom: .75rem; }
+  button, select { font: inherit; padding: .4rem .7rem; border-radius: 8px;
+    border: 1px solid #8886; background: #8881; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  #stage { position: relative; width: 100%; aspect-ratio: 16 / 9; background: #0002;
+    border-radius: 12px; overflow: hidden; }
+  #out { width: 100%; height: 100%; display: block; }
+  #stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: .5rem; margin-top: .75rem; }
+  .stat { background: #8881; border-radius: 8px; padding: .5rem .7rem; }
+  .stat b { display: block; font-size: 1.2rem; font-variant-numeric: tabular-nums; }
+  .stat span { font-size: .78rem; opacity: .75; }
+  #status { padding: .5rem .8rem; border-radius: 8px; background: rgba(88,166,255,.12);
+    margin-bottom: .75rem; font-size: .9rem; }
+  .err { color: #d1242f; }
+</style>
+</head>
+<body>
+  <h1>RVM 가상배경 — ai_engine (wgpu/WebGPU)</h1>
+  <p class="note">카메라 영상을 144×256으로 줄여 RVM 매팅을 돌리고, 알파를 원본 해상도로
+    올려 배경과 합성한다. 추론만 GPU이고 프레임 입출력은 CPU 왕복이라(데모용 단순 경로)
+    표시되는 프레임타임은 순추론 시간보다 크다.</p>
+
+  <div id="status">대기 — “시작”을 누르면 카메라 권한을 요청합니다.</div>
+
+  <div class="bar">
+    <button id="start">시작</button>
+    <button id="stop" disabled>정지</button>
+    <label>모델
+      <select id="model">
+        <option value="../models/rvm_256x144_fp16w.sw">가중치 fp16 (7.8MB)</option>
+        <option value="../models/rvm_256x144.sw">fp32 (15.1MB)</option>
+      </select>
+    </label>
+    <label>배경
+      <select id="bg">
+        <option value="blur">원본 블러</option>
+        <option value="gradient">그라디언트</option>
+        <option value="black">검정</option>
+        <option value="none">배경 없음(알파 확인)</option>
+      </select>
+    </label>
+    <label><input type="checkbox" id="showMask" /> 마스크만 보기</label>
+  </div>
+
+  <div id="stage"><canvas id="out"></canvas></div>
+
+  <div id="stats">
+    <div class="stat"><b id="s-fps">–</b><span>표시 FPS</span></div>
+    <div class="stat"><b id="s-infer">–</b><span>추론 (ms, 중앙값)</span></div>
+    <div class="stat"><b id="s-total">–</b><span>프레임 전체 (ms)</span></div>
+    <div class="stat"><b id="s-load">–</b><span>모델 로드 (ms)</span></div>
+    <div class="stat"><b id="s-ops">–</b><span>op / 파이프라인</span></div>
+  </div>
+
+  <script type="module" src="./demo.js"></script>
+</body>
+</html>

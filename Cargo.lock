@@ -75,10 +75,12 @@ dependencies = [
  "ai-convert",
  "ai-core",
  "ai-gpu",
+ "bytemuck",
  "env_logger",
  "log",
  "pollster",
  "thiserror",
+ "web-time",
 ]
 
 [[package]]
@@ -88,6 +90,7 @@ dependencies = [
  "ai-core",
  "ai-gpu",
  "ai-runtime",
+ "bytemuck",
  "console_error_panic_hook",
  "console_log",
  "js-sys",
@@ -96,6 +99,7 @@ dependencies = [
  "serde-wasm-bindgen",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "web-sys",
  "web-time",
 ]
 
