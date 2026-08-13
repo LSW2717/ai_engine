@@ -13,6 +13,8 @@ pub enum Activation {
     Hardsigmoid,
     /// clamp(x, 0, 1) — RVM 출력 등
     Clamp01,
+    /// clamp(x, 0, 6) — MobileNetV2 계열 (MediaPipe hand_landmarks)
+    Relu6,
 }
 
 impl Activation {
@@ -26,6 +28,7 @@ impl Activation {
             Activation::Hardswish => x * (x / 6.0 + 0.5).clamp(0.0, 1.0),
             Activation::Hardsigmoid => (x / 6.0 + 0.5).clamp(0.0, 1.0),
             Activation::Clamp01 => x.clamp(0.0, 1.0),
+            Activation::Relu6 => x.clamp(0.0, 6.0),
         }
     }
 
@@ -39,6 +42,7 @@ impl Activation {
             Activation::Hardswish => "hswish",
             Activation::Hardsigmoid => "hsigmoid",
             Activation::Clamp01 => "clamp01",
+            Activation::Relu6 => "relu6",
         }
     }
 }

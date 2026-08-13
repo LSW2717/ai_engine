@@ -4,11 +4,17 @@
 //! 픽셀당: acc[c] = bias[c]; 유효 tap마다 acc += w[tap][c] * x[in_px][c].
 //! 에필로그: act → +residual (conv-tail 규약 동일).
 //!
+//! 경계 처리(conv_std와 같은 3분할): 행별 유효 ky 목록 + 모든 kx가 유효한
+//! interior ox 구간을 미리 계산 → interior는 tap 경계검사 없는 고속 픽셀,
+//! 좌우 가장자리만 kx별 검사. 예산표에서 tap당 i64 경계검사가 5 GF/s
+//! 바닥의 주범이었다 (하한의 9.6배).
+//!
 //! 채널 꼬리(c%4)는 스칼라 — 뷰(c_off≠0)의 마지막 4레인 로드가 백킹 텐서의
 //! 다음 픽셀 채널을 읽으면 안 되기 때문에 벡터 로드는 c/4*4까지만 한다.
 
 use ai_core::ops::Conv2d;
 
+use crate::kernels::apply4;
 use crate::simd::F32x4;
 use crate::view::View;
 
@@ -55,73 +61,213 @@ pub fn conv_dw(
     let (sh, sw, dil) = (op.sh as i64, op.sw as i64, op.dil as i64);
     let (pt, pl) = (op.pad[0] as i64, op.pad[1] as i64);
     let cv = c / 4 * 4; // 벡터화 가능한 채널 수
+    let kw = op.kw as usize;
+
+    // 모든 kx에 대해 ix가 유효한 interior ox 구간 [lo, hi) (conv_std와 같은 식)
+    let mut lo: i64 = 0;
+    let mut hi: i64 = ow as i64 - 1;
+    for kx in 0..kw as i64 {
+        let off = kx * dil - pl;
+        lo = lo.max((-off + sw - 1).div_euclid(sw).max(0));
+        hi = hi.min((iw as i64 - 1 - off).div_euclid(sw));
+    }
+    let x_lo = lo.clamp(0, ow as i64) as usize;
+    let x_hi = (hi + 1).clamp(x_lo as i64, ow as i64) as usize; // exclusive
 
     let px_base = y0 as usize * ow;
     debug_assert!(out.len() >= (y1 - y0) as usize * ow * c);
 
     for oy in y0 as usize..y1 as usize {
-        for ox in 0..ow {
-            let px_out = oy * ow + ox;
-            let out_base = (px_out - px_base) * c;
-
-            // 벡터 채널: 4개씩
-            let mut cc = 0usize;
-            while cc < cv {
-                let mut acc = F32x4::load(bias, cc);
-                for ky in 0..op.kh as i64 {
-                    let iy = oy as i64 * sh + ky * dil - pt;
-                    if iy < 0 || iy >= ih as i64 {
-                        continue;
-                    }
-                    for kx in 0..op.kw as i64 {
-                        let ix = ox as i64 * sw + kx * dil - pl;
-                        if ix < 0 || ix >= iw as i64 {
-                            continue;
-                        }
-                        let t = (ky * op.kw as i64 + kx) as usize;
-                        let base = input.base((iy * iw as i64 + ix) as usize);
-                        acc = acc.fma(
-                            F32x4::load(input.data, base + cc),
-                            F32x4::load(wts, t * c_pad + cc),
-                        );
-                    }
-                }
-                let lanes = acc.to_array();
-                for l in 0..4 {
-                    let mut v = op.act.apply(lanes[l]);
-                    if let Some(r) = residual {
-                        v += r.data[r.base(px_out) + cc + l];
-                    }
-                    out[out_base + cc + l] = v;
-                }
-                cc += 4;
-            }
-
-            // 꼬리 채널: 스칼라
-            for ch in cv..c {
-                let mut acc = bias[ch];
-                for ky in 0..op.kh as i64 {
-                    let iy = oy as i64 * sh + ky * dil - pt;
-                    if iy < 0 || iy >= ih as i64 {
-                        continue;
-                    }
-                    for kx in 0..op.kw as i64 {
-                        let ix = ox as i64 * sw + kx * dil - pl;
-                        if ix < 0 || ix >= iw as i64 {
-                            continue;
-                        }
-                        let t = (ky * op.kw as i64 + kx) as usize;
-                        let base = input.base((iy * iw as i64 + ix) as usize);
-                        acc += input.data[base + ch] * wts[t * c_pad + ch];
-                    }
-                }
-                let mut v = op.act.apply(acc);
-                if let Some(r) = residual {
-                    v += r.data[r.base(px_out) + ch];
-                }
-                out[out_base + ch] = v;
+        // 유효 tap 행: (tap 행 시작 인덱스, iy)
+        let mut ky_list: [(usize, usize); 16] = [(0, 0); 16];
+        let mut n_ky = 0usize;
+        for ky in 0..op.kh as i64 {
+            let iy = oy as i64 * sh + ky * dil - pt;
+            if iy >= 0 && iy < ih as i64 {
+                ky_list[n_ky] = ((ky * kw as i64) as usize, iy as usize);
+                n_ky += 1;
             }
         }
+        let ky_list = &ky_list[..n_ky];
+
+        // 좌 가장자리 (kx별 검사)
+        for ox in 0..x_lo {
+            edge_px(op, iw, input, wts, bias, residual, out, ky_list, oy, ox, ow, px_base, c, c_pad, cv);
+        }
+        // interior — tap 경계검사 없음. 채널블록 바깥 루프: (행, 블록)마다
+        // tap 오프셋·가중치 테이블을 한 번 만들고, 픽셀 루프는 순수
+        // load-fma-덧셈만 남긴다 (주소 곱셈이 4.3배 배율의 잔여 주범이었다).
+        const MAX_TAPS: usize = 32;
+        if x_hi > x_lo && (op.kh * op.kw) as usize <= MAX_TAPS {
+            let step = sw as usize * input.stride;
+            for cc in (0..cv).step_by(4) {
+                let mut off0 = [0usize; MAX_TAPS];
+                let mut wv = [F32x4::splat(0.0); MAX_TAPS];
+                let mut nt = 0usize;
+                for &(t_row, iy) in ky_list {
+                    for kx in 0..kw {
+                        // interior 보장: x_lo*sw + kx*dil - pl ≥ 0
+                        let ix = (x_lo as i64 * sw + kx as i64 * dil - pl) as usize;
+                        off0[nt] = input.base(iy * iw as usize + ix) + cc;
+                        wv[nt] = F32x4::load(wts, (t_row + kx) * c_pad + cc);
+                        nt += 1;
+                    }
+                }
+                let b = F32x4::load(bias, cc);
+                let mut out_idx = (oy * ow + x_lo - px_base) * c + cc;
+                let mut r_idx = residual.map(|r| r.base(oy * ow + x_lo) + cc);
+                let mut px_off = 0usize;
+                // 4픽셀 동시: 누산 체인 4개(fma 지연 은닉) + tap당 가중치 로드 1회
+                let mut ox = x_lo;
+                while ox + 4 <= x_hi {
+                    let mut acc = [b; 4];
+                    for t in 0..nt {
+                        let w = wv[t];
+                        let o = off0[t] + px_off;
+                        acc[0] = acc[0].fma(F32x4::load(input.data, o), w);
+                        acc[1] = acc[1].fma(F32x4::load(input.data, o + step), w);
+                        acc[2] = acc[2].fma(F32x4::load(input.data, o + 2 * step), w);
+                        acc[3] = acc[3].fma(F32x4::load(input.data, o + 3 * step), w);
+                    }
+                    for a in acc {
+                        let mut v = apply4(op.act, a);
+                        if let Some(r) = residual {
+                            let ri = r_idx.as_mut().unwrap();
+                            v = v.add(F32x4::load(r.data, *ri));
+                            *ri += r.stride;
+                        }
+                        v.store(out, out_idx);
+                        out_idx += c;
+                    }
+                    px_off += 4 * step;
+                    ox += 4;
+                }
+                for _ox in ox..x_hi {
+                    let mut acc = b;
+                    for t in 0..nt {
+                        acc = acc.fma(F32x4::load(input.data, off0[t] + px_off), wv[t]);
+                    }
+                    let mut v = apply4(op.act, acc);
+                    if let Some(r) = residual {
+                        let ri = r_idx.as_mut().unwrap();
+                        v = v.add(F32x4::load(r.data, *ri));
+                        *ri += r.stride;
+                    }
+                    v.store(out, out_idx);
+                    out_idx += c;
+                    px_off += step;
+                }
+            }
+            // 꼬리 채널: 스칼라 (같은 테이블 방식)
+            for ch in cv..c {
+                let mut off0 = [0usize; MAX_TAPS];
+                let mut ws = [0f32; MAX_TAPS];
+                let mut nt = 0usize;
+                for &(t_row, iy) in ky_list {
+                    for kx in 0..kw {
+                        let ix = (x_lo as i64 * sw + kx as i64 * dil - pl) as usize;
+                        off0[nt] = input.base(iy * iw as usize + ix) + ch;
+                        ws[nt] = wts[(t_row + kx) * c_pad + ch];
+                        nt += 1;
+                    }
+                }
+                let mut out_idx = (oy * ow + x_lo - px_base) * c + ch;
+                let mut r_idx = residual.map(|r| r.base(oy * ow + x_lo) + ch);
+                let mut px_off = 0usize;
+                for _ox in x_lo..x_hi {
+                    let mut acc = bias[ch];
+                    for t in 0..nt {
+                        acc += input.data[off0[t] + px_off] * ws[t];
+                    }
+                    let mut v = op.act.apply(acc);
+                    if let Some(r) = residual {
+                        let ri = r_idx.as_mut().unwrap();
+                        v += r.data[*ri];
+                        *ri += r.stride;
+                    }
+                    out[out_idx] = v;
+                    out_idx += c;
+                    px_off += step;
+                }
+            }
+        } else {
+            // 초대형 커널(k>5 상당) — 검사 경로로 폴백
+            for ox in x_lo..x_hi {
+                edge_px(op, iw, input, wts, bias, residual, out, ky_list, oy, ox, ow, px_base, c, c_pad, cv);
+            }
+        }
+        // 우 가장자리
+        for ox in x_hi..ow {
+            edge_px(op, iw, input, wts, bias, residual, out, ky_list, oy, ox, ow, px_base, c, c_pad, cv);
+        }
+    }
+}
+
+/// 가장자리 1픽셀 — kx별 경계 검사 (interior 밖에서만 호출)
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn edge_px(
+    op: &Conv2d,
+    iw: u32,
+    input: View,
+    wts: &[f32],
+    bias: &[f32],
+    residual: Option<View>,
+    out: &mut [f32],
+    ky_list: &[(usize, usize)],
+    oy: usize,
+    ox: usize,
+    ow: usize,
+    px_base: usize,
+    c: usize,
+    c_pad: usize,
+    cv: usize,
+) {
+    let (sw, dil, pl) = (op.sw as i64, op.dil as i64, op.pad[1] as i64);
+    let kw = op.kw as usize;
+    let px_out = oy * ow + ox;
+    let out_base = (px_out - px_base) * c;
+
+    let mut cc = 0usize;
+    while cc < cv {
+        let mut acc = F32x4::load(bias, cc);
+        for &(t_row, iy) in ky_list {
+            for kx in 0..kw {
+                let ix = ox as i64 * sw + kx as i64 * dil - pl;
+                if ix < 0 || ix >= iw as i64 {
+                    continue;
+                }
+                let base = input.base(iy * iw as usize + ix as usize);
+                acc = acc.fma(
+                    F32x4::load(input.data, base + cc),
+                    F32x4::load(wts, (t_row + kx) * c_pad + cc),
+                );
+            }
+        }
+        let mut v = apply4(op.act, acc);
+        if let Some(r) = residual {
+            v = v.add(F32x4::load(r.data, r.base(px_out) + cc));
+        }
+        v.store(out, out_base + cc);
+        cc += 4;
+    }
+    for ch in cv..c {
+        let mut acc = bias[ch];
+        for &(t_row, iy) in ky_list {
+            for kx in 0..kw {
+                let ix = ox as i64 * sw + kx as i64 * dil - pl;
+                if ix < 0 || ix >= iw as i64 {
+                    continue;
+                }
+                let base = input.base(iy * iw as usize + ix as usize);
+                acc += input.data[base + ch] * wts[(t_row + kx) * c_pad + ch];
+            }
+        }
+        let mut v = op.act.apply(acc);
+        if let Some(r) = residual {
+            v += r.data[r.base(px_out) + ch];
+        }
+        out[out_base + ch] = v;
     }
 }
 

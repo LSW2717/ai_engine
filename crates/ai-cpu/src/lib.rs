@@ -17,6 +17,7 @@ mod exec;
 mod plan;
 
 pub use exec::CpuModel;
+pub use exec::StepProf;
 
 use thiserror::Error;
 

@@ -124,6 +124,20 @@ pub enum SwOp {
         sw: u32,
         pad: [u32; 4],
     },
+    Maxpool {
+        #[serde(rename = "in")]
+        input: u32,
+        out: u32,
+        kh: u32,
+        kw: u32,
+        sh: u32,
+        sw: u32,
+        pad: [u32; 4],
+        /// 출력 채널 끝 제로패딩 — BlazeFace "MaxPool→Pad(C)→Add"의 Pad를
+        /// 접은 것 (ops/pool.rs MaxPool2d 참조)
+        #[serde(default)]
+        pad_c: u32,
+    },
     Resize {
         #[serde(rename = "in")]
         input: u32,

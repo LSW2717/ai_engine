@@ -41,12 +41,37 @@ fn conv_like_out(i: i64, k: i64, s: i64, p0: i64, p1: i64, d: i64, ceil: bool) -
 pub fn infer(g: &Graph, node: &Node) -> Result<Option<Vec<Vec<i64>>>, ConvertError> {
     let one = |s: Vec<i64>| Ok(Some(vec![s]));
     match node.op.as_str() {
-        // 단항 (elementwise)
+        // 단항 (elementwise) — PRelu는 slope가 채널벡터라 shape은 입력 그대로
         "Relu" | "Sigmoid" | "Tanh" | "HardSigmoid" | "HardSwish" | "Clip" | "Identity" | "Erf"
-        | "hswish" => match shape_of(g, &node.inputs[0]) {
+        | "hswish" | "PRelu" => match shape_of(g, &node.inputs[0]) {
             Some(s) => one(s),
             None => Ok(None),
         },
+        "Pad" => {
+            let Some(x) = shape_of(g, &node.inputs[0]) else { return Ok(None) };
+            let pads: Vec<i64> = if let Some(p) = node.attr_is("pads") {
+                p.to_vec()
+            } else {
+                match node
+                    .inputs
+                    .get(1)
+                    .and_then(|n| g.info(n))
+                    .filter(|t| t.is_const())
+                    .and_then(|t| t.as_i64s().map(|v| v.to_vec()))
+                {
+                    Some(p) => p,
+                    None => return Ok(None),
+                }
+            };
+            if pads.len() != 2 * x.len() {
+                return Err(ConvertError::Malformed(format!(
+                    "Pad rank 불일치 ({})",
+                    node.name
+                )));
+            }
+            let r = x.len();
+            one((0..r).map(|i| x[i] + pads[i] + pads[i + r]).collect())
+        }
         "Mul" | "Add" | "Sub" | "Div" => {
             let (Some(a), Some(b)) =
                 (shape_of(g, &node.inputs[0]), shape_of(g, &node.inputs[1]))
@@ -101,6 +126,69 @@ pub fn infer(g: &Graph, node: &Node) -> Result<Option<Vec<Vec<i64>>>, ConvertErr
         "GlobalAveragePool" => {
             let Some(x) = shape_of(g, &node.inputs[0]) else { return Ok(None) };
             one(vec![x[0], x[1], 1, 1])
+        }
+        "Reshape" => {
+            let Some(x) = shape_of(g, &node.inputs[0]) else { return Ok(None) };
+            let Some(spec) = g
+                .info(&node.inputs[1])
+                .filter(|t| t.is_const())
+                .and_then(|t| t.as_i64s().map(|v| v.to_vec()))
+            else {
+                return Ok(None);
+            };
+            let numel: i64 = x.iter().product();
+            // 0 = 해당 입력 차원 복사(allowzero=0 기본), -1 = 잔여
+            let mut out: Vec<i64> = spec
+                .iter()
+                .enumerate()
+                .map(|(i, &d)| if d == 0 { x[i] } else { d })
+                .collect();
+            let known: i64 = out.iter().filter(|d| **d != -1).product();
+            for d in out.iter_mut() {
+                if *d == -1 {
+                    *d = numel / known;
+                }
+            }
+            one(out)
+        }
+        "Squeeze" => {
+            let Some(x) = shape_of(g, &node.inputs[0]) else { return Ok(None) };
+            // opset 13: axes는 두 번째 입력(상수), 구버전은 attr, 없으면 1인 차원 전부
+            let axes: Option<Vec<i64>> = if node.inputs.len() > 1 {
+                match g
+                    .info(&node.inputs[1])
+                    .filter(|t| t.is_const())
+                    .and_then(|t| t.as_i64s().map(|v| v.to_vec()))
+                {
+                    Some(a) => Some(a),
+                    None => return Ok(None),
+                }
+            } else {
+                node.attr_is("axes").map(|v| v.to_vec())
+            };
+            let rank = x.len() as i64;
+            let out: Vec<i64> = match axes {
+                Some(a) => x
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| {
+                        !a.contains(&(*i as i64)) && !a.contains(&(*i as i64 - rank))
+                    })
+                    .map(|(_, d)| *d)
+                    .collect(),
+                None => x.iter().copied().filter(|d| *d != 1).collect(),
+            };
+            one(out)
+        }
+        "Gemm" => {
+            let (Some(a), Some(b)) =
+                (shape_of(g, &node.inputs[0]), shape_of(g, &node.inputs[1]))
+            else {
+                return Ok(None);
+            };
+            let m = if node.attr_i("transA").unwrap_or(0) == 1 { a[1] } else { a[0] };
+            let n = if node.attr_i("transB").unwrap_or(0) == 1 { b[0] } else { b[1] };
+            one(vec![m, n])
         }
         "Resize" => {
             let Some(x) = shape_of(g, &node.inputs[0]) else { return Ok(None) };

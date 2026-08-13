@@ -6,8 +6,13 @@
 cargo test --workspace --release        # 52개 스위트, 전부 ok 여야 한다
 make build-wasm                         # web/pkg 갱신 (+simd128, 725KB)
 node tools/run_web.mjs compare/index.html   # webgl2 vs 우리 (GPU 다른 앱 닫고)
-# ai-cpu 정확도 (R11):
-AI_ONNX=/Users/foxcom/Desktop/segm-ft/export/mnv4/r11/segm_mnv4s050_s2_160x288.onnx \
+node tools/run_web.mjs demo/cpu-ab.html --camera   # R11 CPU 3자 A/B: ai-cpu ~6.8ms < tflite 6.9 / ort 11 (§2.5)
+node tools/profile_web.mjs 'demo/cpu-ab.html?only=ours' --ops   # wasm 스텝별 예산표
+# per-op 예산표 (커널 만졌으면 여기부터):
+AI_ONNX=$(pwd)/models/segm_mnv4s050_s2_160x288_nhwc.onnx \
+  cargo test --release -p ai-cpu --test prof_cpu -- --ignored --nocapture
+# ai-cpu 정확도 (R11) — AI_ONNX는 절대경로 (test CWD가 크레이트 루트):
+AI_ONNX=$(pwd)/models/segm_mnv4s050_s2_160x288_nhwc.onnx \
   cargo test --release -p ai-cpu --test oracle_real -- --ignored --nocapture   # max_err ~1.4e-5
 ```
 
@@ -16,19 +21,28 @@ compare에서 `webgl2 ~1.57ms / ai_engine 가중치fp16 ~2.01ms`.
 
 ---
 
-## 바로 다음 — 둘 중 하나 (사용자 선택 대기)
+## 바로 다음 — 로드맵 #4 (랜드마크 스파이크)
 
-**(A) 로드맵 #3: `Reshape` canon + `PRELU` + `MAX_POOL_2D`** ← 가치 상승.
-   랜드마크 핵심 4모델에 더해 **게이즈 MobileOne-S0(v-ai에서 ORT wasm 1T로 도는 것)가
-   `Reshape` 하나로 열린다** — 변환기에 직접 넣어 확정한 사실:
-   ```
-   mobileone_s0_gaze.onnx  → 미지원 op: Reshape (딱 하나)
-   fastenhancer_b_16k.onnx → 미지원 op: DFT (오디오는 어차피 CPU, 로드맵 #6)
-   ```
-**(B) 브라우저 R11 A/B 배선** — web 데모에 CPU 경로(`load_model_cpu`/`infer_frame_cpu`)
-   호출 추가 → tflite-simd·ORT wasm과 같은 페이지 비교. 눈검증·실행은 사용자 몫.
-   ⚠ v-ai 멀티스레드는 전부 `crossOriginIsolated` 게이트(webgl2.js:405) — 배포 헤더에
-   COOP/COEP 없으면 저쪽도 1T. A/B 조건 먼저 확인.
+모델 5종은 CPU·GPU 양쪽에서 다 돈다(§3.5) — 하지만 **calculator 그래프 없이는
+기능이 아니다** (디텍터 출력은 날 앵커/로짓, 랜드마크는 ROI 크롭 입력 전제).
+순서:
+1. **다중모델 핸들 API** (ai-wasm/ai-tasks — vision 워커에 det+lm+게이즈 상주)
+2. **face_detector 후처리**: 앵커 디코드(896×16, SSD 앵커) + NMS → 얼굴 박스
+3. **ROI 파이프라인**: 박스→회전 정규화 크롭→face_landmarks→역변환, 이전 프레임
+   ROI 트래킹(검출은 놓쳤을 때만) + OneEuroFilter
+4. **게이트: MediaPipe wasm과 같은 프레임 좌표 diff** — 파리티 증명 전 교체 금지
+(1~2는 스파이크로 face만 먼저 — hand는 같은 골격 복제.)
+
+**fastenhancer(#6, 오디오)는 그다음**: 선행조건(ai-cpu)은 풀렸지만 DFT·1D
+conv·복소 = 새 커널 계열이라 스파이크 단위가 크고, #4는 이미 변환해둔 5모델을
+기능으로 바꾸는 마지막 조각이라 레버리지가 더 크다. (#3 잔여인 tflite 직접
+임포터도 #4 뒤로.)
+**(B) 브라우저 R11 A/B 배선 — 완료 (2026-08-13 저녁, §2 실측 참조).**
+   `web/demo/cpu-ab.html` — 같은 프레임을 ai-cpu/tflite-simd/ORT wasm 셋에 먹여
+   마스크 3장 + p50/p90 + ai-cpu 대비 diff. ORT와 diff 0.0000(fp32 수치 일치) 확인.
+   COOP/COEP 없는 서버라 셋 다 1T = v-ai 배포 기본 조건과 동일(공정).
+   처음 발견된 2.6배 열세(17.9 vs 6.9ms)는 **같은 날 밤 커널 스프린트로 해소 —
+   wasm 7.1ms = tflite-simd(6.9)와 동률, §2.5 참조.**
 
 v-ai 정찰 전체 지도(런타임·티어·플래그·file:line)는 메모리 `vai-runtime-map` 참조.
 
@@ -40,9 +54,9 @@ v-ai 정찰 전체 지도(런타임·티어·플래그·file:line)는 메모리 
 |---|---|---|
 | 0 | `ai-tasks` 크레이트 (공개 API 본체) | **진행 중 — 아래 참조** |
 | 1 | 폴백 트리거 3종 | **엔진 쪽 완료** (2026-08-13) — v-ai 연결만 보류, §1 참조 |
-| 2 | `ai-cpu` (SIMD128/NEON + 스레드) + R11 vs tflite-simd A/B | **구현 완료, 네이티브 실측 끝** — 브라우저 A/B 남음, §2 참조 |
-| 3 | `Reshape` canon + `PRELU` + `MAX_POOL_2D` | 후보 A — 게이즈도 Reshape 하나로 열림 |
-| 4 | 랜드마크 스파이크 (face_detector → 좌표 diff) | |
+| 2 | `ai-cpu` (SIMD128/NEON + 스레드) + R11 vs tflite-simd A/B | **완료** (2026-08-13) — 브라우저 A/B + 커널 스프린트로 **tflite-simd 동률**, §2·§2.5 |
+| 3 | `Reshape` canon + `PRELU` + `MAX_POOL_2D` | **완료** (2026-08-13) — 5모델 전부 개통+ORT 게이트+벤치, §3.5 |
+| 4 | 랜드마크 스파이크 (face_detector → 좌표 diff) | ← 다음 (모델은 다 돈다 — calculator 그래프 차례) |
 | 5 | 파이프라인 로직 (ROI 트래킹 / 회전 정규화 / OneEuroFilter / Horn 피팅) | |
 | 6 | 오디오 (DFT / 1D conv / 복소) | |
 
@@ -50,6 +64,24 @@ v-ai 정찰 전체 지도(런타임·티어·플래그·file:line)는 메모리 
 프레임 실제로 나오는지(DeviceLost는 됨, "조용히 안 나옴" 헬스체크는 미구현) →
 ③안 되면 R11을 CPU로(`ai-cpu`) → ④CPU도 안 되면 구조화 에러 → 호스트가 "호환 안 됨"
 팝업. 모든 비전 태스크 공통. 전환 스위치는 호스트(모델 조달이 호스트 몫).
+
+**워커 토폴로지·백엔드 배치 (사용자 확정, 2026-08-13)**:
+
+| 워커(웹)/스레드(모바일) | 모델 | 백엔드 |
+|---|---|---|
+| video 워커 | 세그(가상배경) | **GPU 고정** (매 프레임, 최우선) |
+| vision 워커 | face det+lm, 게이즈 | GPU 기본 → **세그 p90 악화 시 CPU 강등** |
+| audio 워커 | fastenhancer(#6) | CPU 고정 (AudioWorklet엔 WebGPU 없음) |
+
+- 근거: 워커 = 스레드 1개 + wasm 인스턴스/메모리 분리 → **CPU 강등이 다른 워커에
+  무영향 + COOP/COEP 없이 멀티코어** (SAB 불필요). 단 GPU 큐는 워커가 나뉘어도
+  하나 — "후달림" 신호는 **세그 모델의 p90**(v-ai p90>66ms 규칙), `model_stats`/
+  `model_stats_cpu`가 그 입력.
+- vision 워커는 det→lm→게이즈가 한 프레임 순차 파이프라인이라 **핸들 기반 다중모델
+  API**가 필요 (지금은 워커당 GPU 1 + CPU 1 슬롯). 이 확장이 로드맵 #4의 첫 삽.
+- 웹 CPU는 워커당 1T (게이즈 48ms급은 강등 시 N프레임에 1회 페이싱 — 파이프라인
+  로직 #5에서). 모바일은 스레드 자유 + CPU 4T라 강등 페널티가 작다.
+- op 단위 GPU/CPU 분할은 안 한다 — 경계 리드백이 이득을 압도 (모델 단위 배치만).
 
 성능 추격(webgl2 대비 1.28배)은 **mnv4 기반 RVM으로 교체한 뒤에** 재개하기로 함.
 
@@ -123,14 +155,135 @@ v-ai 정찰 전체 지도(런타임·티어·플래그·file:line)는 메모리 
 ```sh
 AI_ONNX=<onnx> cargo test --release -p ai-cpu --test oracle_real -- --ignored --nocapture  # 정확도
 AI_ONNX=<onnx> AI_THREADS=4 AI_REPS=100 cargo test --release -p ai-cpu --test bench_cpu -- --ignored --nocapture
-# R11: /Users/foxcom/Desktop/segm-ft/export/mnv4/r11/segm_mnv4s050_s2_<res>.onnx
+# R11 160×288 로컬 사본: models/segm_mnv4s050_s2_160x288_nhwc.onnx (gitignore — 원본은 v-ai assets/models)
+# 다른 해상도(144×256/192×320)는 M2 Pro 머신: /Users/foxcom/Desktop/segm-ft/export/mnv4/r11/
 ```
 
-**남은 것**: ①브라우저에서 tflite-simd와 A/B (데모 페이지에 CPU 경로 배선 필요 —
-ab.html은 아직 GPU 경로만 부른다), ②wasm 스레드(코옵 헤더 요구라 v-ai 배포 환경 확인 먼저),
-③"조용히 프레임 안 나옴" 첫 프레임 헬스체크(NaN/전부0/시간 상한).
+**브라우저 A/B 완료 (2026-08-13 저녁, M1 Pro)**: `web/demo/cpu-ab.html` + `cpu-ab.js` —
+같은 카메라 프레임(288×160, RGB [0,1] 한 벌)을 셋에 먹이고 2채널 로짓을 각자
+softmax(사람확률 = sigmoid(사람−배경), v-ai softmax 스테이지와 같은 식).
+자산: `make convert-r11-web`(V_AI ?= ../../vcxreact/packages/v-ai에서 tflite 복사),
+런타임 glue는 web/demo/tflite/, 모델 3종은 web/models/(gitignore).
+
+| 헤드리스 크로미움 1T (COOP/COEP 없음 = v-ai 배포 기본) | p50 |
+|---|---|
+| ai-cpu (wasm SIMD128) | **17.9ms** (벽시계 18.2) |
+| tflite-simd (XNNPACK, f16 가중치) | **6.9ms** |
+| ORT wasm (동일 fp32 onnx) | **11.0ms** |
+
+정확도: ORT vs ai-cpu **diff 0.0000**(같은 fp32 그래프 수치 일치 — 배선 정합 증명),
+tflite는 f16 가중치라 0.02~0.06. 이 머신 네이티브 1T 10.89ms → wasm 갭 1.64배(정상 범위).
+재현: `node tools/run_web.mjs demo/cpu-ab.html --camera` (수치), `--headed`(눈검증).
+
+**남은 것**: ①wasm 스레드(코옵 헤더 요구라 v-ai 배포 환경 확인 먼저), ②"조용히
+프레임 안 나옴" 첫 프레임 헬스체크(NaN/전부0/시간 상한), ③프로덕션 로더(ai-tasks/
+v-ai 연결)에 relaxed-simd 이중 빌드 선택 로직 이식 — 지금은 cpu-ab.js에만 있다.
 
 ---
+
+## 2.5. XNNPACK 추격 스프린트 — 완료 (2026-08-13 밤): 2.6배 열세 → **역전**
+
+**결과 (R11 160×288, 1T)**: 네이티브 10.89 → **~5.1ms** (4T 3.57 → **~2.2ms**),
+Chrome wasm 17.9 → **6.8ms 벽시계 / 6.6 순추론 = tflite-simd(XNNPACK) 6.9를 제침**,
+ORT wasm 11.0 대비 1.6배. 정확도 게이트 전 과정 유지: oracle max_err 1.4e-5,
+브라우저 ORT diff 0.0000, 전 스위트(89) 그린.
+
+**방법론**: ① 네이티브 — `ai-cpu/tests/prof_cpu.rs` per-op 예산표(rep별 min vs
+이론하한, `CpuModel::infer_profiled`). ② **wasm — `node tools/profile_web.mjs
+'demo/cpu-ab.html?only=ours' --ops`** (`CpuModel::bench_steps` = 스텝당 N회 합산으로
+100µs 타이머 양자화 우회; V8 CDP 샘플 프로파일은 전 커널이 한 함수로 인라인돼 무용).
+**네이티브 예산표로 wasm을 추정하면 틀린다** — 스템은 wasm에서 1.74배, concat 1.5배로
+뒤틀렸었다. wasm 최적화는 반드시 wasm 스텝벤치를 근거로.
+
+**적용한 것 (효과 순)**:
+1. **conv 마이크로커널 = XNNPACK gemm-splat 구조** (소스 대조: scratchpad에 받아 확인):
+   A를 픽셀당 벡터 1로드 + lane 브로드캐스트 fma 4회 (NEON `fmla by lane` /
+   wasm `i32x4_shuffle` — splat 로드 4개 → 로드 1개). 경계검사 제거(`load_splat`/`load`
+   무검사), 에필로그 벡터화(act `apply4` + residual + 벡터 store, 부분블록 nc≥4 포함).
+2. **MR 확장**: 4px→MR_BIG px 마이크로커널(`mr_n::<MR>` const generic). **네이티브 8 /
+   wasm 6** — 누산 체인 2×MR개가 FMA 지연 은닉. 디코더 conv 46→74 GF/s.
+3. **relaxed-simd 이중 빌드**: `web/pkg-relaxed`(+relaxed-simd, `f32x4_relaxed_madd`=FMLA)
+   + 기본 `web/pkg`. 로더는 relaxed 먼저 import하고 CompileError면 폴백(Safari) —
+   cpu-ab.js. wasm -9%.
+4. **dw 재작성**: conv_std식 3분할(행별 ky목록 + interior ox구간) + (행,채널블록)당
+   tap 오프셋·가중치 테이블 + 4px 동시(체인 4개). 5.2 → 20+ GF/s (c44 1.75→0.37ms).
+5. **resize**: ox 좌표 테이블(행 불변) + 채널 벡터화 + **c2 픽셀페어 패킹**(`low2_concat`,
+   세그 마스크 최종 업샘플 0.35→0.067ms).
+6. **elementwise/mix/concat(copy_view_into) 벡터화**, **슬롯 +4 패딩**(4레인
+   오버리드를 crate 전체에서 안전화 — exec.rs 참조).
+7. **역전 마무리 3종 (wasm 스텝벤치 근거)**: ⓐ **ConvStem** — cin≤4 k>1 conv를
+   im2row 패치(`[px][k_pad]`, K=(ky,kx,ic) 연속)로 펴서 1x1 GEMM화 (스템 wasm
+   1.03→0.58ms; im2row.rs, 오버런 규약은 파일 머리 주석). ⓑ **PwDot** — cout≤4
+   1x1 헤드를 채널 내적으로 (NR8 레인 6개 버리던 것; 0.17→0.107). ⓒ **NR16
+   (wasm 전용)** — cout 16배수 블록은 mr4_nr16: 셔플 1개가 madd 4개 서빙 (NR8은
+   2개). ⓓ **출력 zero-copy**: `infer_frame_cpu_view` — wasm 힙 뷰 반환(tflite
+   HEAPF32 규약, 368KB/프레임 2차 복사 제거). 뷰는 다음 호출 전 소비.
+
+**실패/무효 실험 (재시도 금지)**: ①**MR8 wasm = 스필 경계** (V8 arm64 가용 vreg ~28,
+acc16+A8+W2=26; MR6이 7.6→7.1ms, MR8은 7.6) — 네이티브(NEON 32reg)만 8. ②스템
+K패딩(제로패딩만으로는)은 네이티브·wasm 모두 무반응 — im2row(⑦ⓐ)가 정답이었다.
+③wasm에서 MR8 단독(relaxed 없이)은 무반응 — wasm은 FMA 없인 처리량 병목이라 체인
+수가 안 도움. ④V8 CDP 샘플 프로파일로 wasm 커널 분해 — 전부 한 함수로 인라인돼
+못 씀 (bench_steps가 대안).
+
+**남은 여지 (지금 안 함)**: 디코더 conv(wasm 2.18ms, 네이티브 대비 1.35배 — 셔플
+잔여세. dot-product 재구성(MR2NR8, hsum)이 이론상 남은 카드나 리스크 있음), 소형맵
+dw(@18x10 에지 지배), gpool/segate 스칼라(µs급). tflite 역전 달성으로 우선순위 하락.
+
+---
+
+## 3.5. MediaPipe 5모델 개통 — 완료 (2026-08-13 밤)
+
+**결과**: `.task`의 tflite 4종(tf2onnx 경유) + 게이즈 onnx 전부 **변환·ORT 게이트·벤치
+통과 — CPU·GPU 양 백엔드** (2일째 밤에 GPU 개통 + CPU 추가 개선 반영).
+
+| 모델 | 네이티브 CPU 1T | wasm ai-cpu | **WebGPU** | ORT wasm 1T | GPU 네이티브 |
+|---|---|---|---|---|---|
+| gaze 448² (1.10 GMAC) | 36.0ms | 48.3 | **3.9** | 67.5 | 10.3 |
+| face_detector 128² | 1.7ms | 2.4 | **0.63** | 3.3 | 1.5 |
+| face_landmarks 256² | 6.8ms | 8.4 | **1.72** | 10.4 | 2.5 |
+| hand_detector 192² | 16.6ms | 20.0 | **2.32** | 34.2 | 3.0 |
+| hand_landmarks 224² | 21.1→**14.2ms** | 17.4 | **3.18** | 32.6 | 4.0 |
+
+CPU는 ORT 대비 전 모델 1.24~1.87배, **WebGPU는 ORT wasm 대비 10~17배**.
+MediaPipe tasks-vision e2e 12.1ms vs 우리 GPU face 파이프라인(det+lm) 2.4ms.
+(⚠ WebGPU가 네이티브 GPU보다 빠른 건 Tint MSL — RVM 때와 같은 현상.
+GPU 프레임타임 측정은 **동기화 필수**: infer는 제출만 한다 — gate_models_gpu가
+마지막 리드백으로 강제. 동기화 없으면 0.3ms 허수가 나온다.)
+
+**추가된 op/canon**: SwOp::Maxpool(+pad_c=BlazeFace 채널패드 접기, GPU/CPU 커널),
+BinaryOp::Prelu(cvec slope, wgsl_expr 함수형 코드젠), Activation::Relu6,
+canon 4종(reshape→chcopy 실체화·gemm→1x1 Conv·pad 접기/k1s1 maxpool 폴백·
+transpose flat_ok 마킹), shape 추론 5종(Reshape/Squeeze/Gemm/Pad/PRelu),
+desc_of rank-3 flatten, 임포터 견고화.
+
+**잡은 잠복버그 2개 (기존 코드)**: ① dce가 res attr(fuse_residual)을 읽기로
+추적 안 함 — res 유일 소비 생산자가 통째로 죽음 (facelm maxpool 전멸로 발견).
+② fuse_act가 모르는 act 태그를 "none"으로 뭉갬 — relu6 증발, 출력 1e9 폭주.
+디버깅은 층별 이등분: `dump_all.rs` + `tools/diff_dump.py` (ORT --intermediates
+대조, NCHW/NHWC라 정렬비교, act 융합은 Clip후 매핑).
+
+**GPU 개통에서 잡은 것 (2일째)**: ①desc_of가 [1,1,1,N]을 (h1,wN,c1)로 잡아
+GPU C4 레인패딩과 평탄 버퍼가 어긋남 → (1,1,N) 채널벡터로 접음. ②지오메트리를
+바꾸는 chcopy(flatten)는 c%4≠0에서 레인 재배치 필요 → **flatten 커널 신설**
+(ai-gpu/kernels/flatten.rs, 런타임이 out_c≠n일 때 라우팅). CPU는 밀집이라 무관.
+디버깅 교훈: **GPU 중간텐서 이등분은 AI_RT_NO_REUSE=1 필수** — 버퍼 재사용
+때문에 안 걸면 tid1부터 전부 허수 발산으로 보인다 (gate_models_gpu AI_BISECT=1).
+
+**CPU 추가 개선 (2일째)**: ①k1s1 conv 지오메트리 접기(전 픽셀 한 행 — 7×7 소형맵
+mr1 낭비 제거, hand_lm 21→14ms) ②elementwise dense 플랫 루프. PRelu 단독 op는
+메모리 대역 한계 — **conv+PRelu(cvec) 에필로그 융합이 다음 CPU 카드** (face_lm
+~1.5ms어치). dw k5 슬라이딩 윈도우(x-로드 재사용)도 미착수 카드 (hand_det 6.4ms어치).
+
+**도구**: `tools/prep_mediapipe.py`(.task→onnx, tf2onnx+후처리),
+`tools/ort_dump.py`(게이트 기준값, --intermediates), `gate_ort_models.rs`(CPU)·
+`gate_models_gpu.rs`(GPU, AI_BISECT 층별 이등분), `dump_all.rs`+`tools/diff_dump.py`,
+`web/demo/models-bench.html`(5모델 CPU/GPU/ORT 벤치). tf2onnx는 /usr/bin/python3 --user.
+
+**남은 것**: ①tflite flatbuffer 직접 임포터(로드맵의 (B) — 지금은 tf2onnx 경유),
+②커널 여지 — hand 계열이 15~20 GMAC/s로 낮음(PRelu 비융합 69개, dw 비중,
+Gemm@1x1 — conv+prelu 융합이 1순위), ③MediaPipe e2e 정밀 A/B(같은 프레임 좌표
+diff — 로드맵 #4의 검증 게이트와 한 몸), ④face_blendshapes(잡op 많음, 별도 판단).
 
 ## 3~5. 랜드마크 — 조사 끝, 결론
 

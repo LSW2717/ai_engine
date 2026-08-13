@@ -60,6 +60,7 @@ dependencies = [
  "log",
  "rayon",
  "thiserror",
+ "web-time",
 ]
 
 [[package]]

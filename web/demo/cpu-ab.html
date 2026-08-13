@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>R11 세그 CPU A/B — ai-cpu vs tflite-simd vs ORT wasm</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: ui-sans-serif, system-ui, -apple-system, "Apple SD Gothic Neo", sans-serif;
+    max-width: 1400px; margin: 1.2rem auto; padding: 0 1rem; line-height: 1.5; }
+  h1 { font-size: 1.2rem; margin: 0 0 .25rem; }
+  .note { font-size: .85rem; opacity: .75; margin: 0 0 .9rem; }
+  .bar { display: flex; gap: .75rem; align-items: center; flex-wrap: wrap; margin-bottom: .8rem; }
+  button { font: inherit; padding: .4rem .7rem; border-radius: 8px;
+    border: 1px solid #8886; background: #8881; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  #grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: .6rem; }
+  @media (max-width: 900px) { #grid { grid-template-columns: 1fr 1fr; } }
+  .pane { position: relative; }
+  .pane canvas, .pane video { width: 100%; display: block; background: #0002; border-radius: 10px; }
+  .tag { position: absolute; left: .5rem; top: .5rem; padding: .25rem .55rem; border-radius: 6px;
+    background: #000a; color: #fff; font-size: .8rem; font-weight: 600; }
+  .metrics { font-size: .82rem; opacity: .85; margin-top: .35rem;
+    font-variant-numeric: tabular-nums; min-height: 2.4em; }
+  #status { padding: .5rem .8rem; border-radius: 8px; background: rgba(88,166,255,.12);
+    margin-bottom: .8rem; font-size: .9rem; }
+  .err { color: #d1242f; }
+</style>
+</head>
+<body>
+  <h1>R11 세그멘테이션 CPU 폴백 3자 A/B — 같은 프레임, 세 런타임</h1>
+  <p class="note">한 카메라 프레임을 288×160으로 줄여 <b>세 런타임에 동일한 float 배열</b>로
+    먹인다. 출력(2채널 로짓)을 각자 softmax해 사람 확률 마스크를 그레이스케일로 보여준다.
+    모델: ai-cpu·ORT는 같은 onnx 계보의 fp32, tflite는 v-ai 프로덕션과 동일한 float16
+    가중치 export — tflite 마스크의 미세한 차이는 가중치 정밀도 차이다.</p>
+  <p class="note">스레드: 이 페이지는 COOP/COEP 헤더 없이 서빙되므로
+    <code>crossOriginIsolated=false</code> — <b>세 런타임 모두 1스레드</b>다
+    (v-ai 배포 기본 조건과 동일). <b>ms</b> = 추론 호출을 감싼 벽시계.
+    ai-cpu는 wasm 내부에서 잰 순추론 p50/p90도 따로 보여준다.</p>
+
+  <div id="status">대기 — “시작”을 누르면 카메라 권한을 요청합니다.</div>
+
+  <div class="bar">
+    <button id="start">시작</button>
+    <button id="stop" disabled>정지</button>
+    <label><input type="checkbox" id="en-ours" checked /> ai-cpu</label>
+    <label><input type="checkbox" id="en-tfl" checked /> tflite-simd</label>
+    <label><input type="checkbox" id="en-ort" checked /> ORT wasm</label>
+  </div>
+
+  <div id="grid">
+    <div>
+      <div class="pane"><span class="tag">원본 288×160</span><canvas id="src"></canvas></div>
+      <div class="metrics"><span id="m-fps">– fps (루프 전체)</span></div>
+    </div>
+    <div>
+      <div class="pane"><span class="tag">ai-cpu (wasm SIMD128)</span><canvas id="outOurs"></canvas></div>
+      <div class="metrics" id="m-ours">–</div>
+    </div>
+    <div>
+      <div class="pane"><span class="tag">tflite-simd (f16 가중치)</span><canvas id="outTfl"></canvas></div>
+      <div class="metrics" id="m-tfl">–</div>
+    </div>
+    <div>
+      <div class="pane"><span class="tag">onnxruntime-web wasm</span><canvas id="outOrt"></canvas></div>
+      <div class="metrics" id="m-ort">–</div>
+    </div>
+  </div>
+
+  <script type="module" src="./cpu-ab.js"></script>
+</body>
+</html>

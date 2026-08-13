@@ -1,20 +1,54 @@
 //! 원소별 연산 — Binary(tensor/scalar/cvec)/Act/Mix.
 //!
-//! 입력은 뷰(alias 무복사), 출력은 항상 밀집 슬롯. 전체 프레임 비용에서
-//! 비중이 작아 스칼라 루프로 둔다 — 프로파일에 뜨면 그때 벡터화.
+//! 입력은 뷰(alias 무복사), 출력은 항상 밀집 슬롯. 채널 4배수 구간은 벡터,
+//! 꼬리는 스칼라 (뷰의 마지막 4레인 로드가 백킹 이웃 채널을 읽으면 안 되므로
+//! 벡터 로드는 c/4*4까지 — dw와 같은 규약).
 
 use ai_core::ops::BinaryOp;
 use ai_core::Activation;
 
+use crate::kernels::apply4;
+use crate::simd::F32x4;
 use crate::view::View;
+
+/// BinaryOp 4레인 적용
+#[inline(always)]
+fn bin4(op: BinaryOp, a: F32x4, b: F32x4) -> F32x4 {
+    match op {
+        BinaryOp::Add => a.add(b),
+        BinaryOp::Mul => a.mul(b),
+        BinaryOp::Sub => a.fma(b, F32x4::splat(-1.0)), // a + b*(-1)
+        // max(a,0) + b*min(a,0) — 분기 없는 prelu (b = 채널 slope)
+        BinaryOp::Prelu => {
+            let z = F32x4::splat(0.0);
+            a.max(z).fma(a.min(z), b)
+        }
+    }
+}
 
 /// out[p,ch] = act(a[p,ch] ∘ b[p,ch])
 pub fn binary_tensor(op: BinaryOp, a: View, b: View, px: usize, act: Activation, out: &mut [f32]) {
     debug_assert_eq!(a.c, b.c);
     let c = a.c;
+    let cv = c / 4 * 4;
+    if a.c_off == 0 && a.stride == c && b.c_off == 0 && b.stride == c && cv == c {
+        let n = px * c;
+        let mut i = 0usize;
+        while i < n {
+            apply4(act, bin4(op, F32x4::load(a.data, i), F32x4::load(b.data, i))).store(out, i);
+            i += 4;
+        }
+        return;
+    }
     for p in 0..px {
         let (ab, bb) = (a.base(p), b.base(p));
-        for ch in 0..c {
+        let mut cc = 0usize;
+        while cc < cv {
+            apply4(act, bin4(op, F32x4::load(a.data, ab + cc), F32x4::load(b.data, bb + cc)))
+                .store(out, p * c + cc);
+            cc += 4;
+        }
+        for ch in cv..c {
             out[p * c + ch] = act.apply(op.apply(a.data[ab + ch], b.data[bb + ch]));
         }
     }
@@ -31,9 +65,18 @@ pub fn binary_scalar(
     out: &mut [f32],
 ) {
     let c = a.c;
+    let cv = c / 4 * 4;
+    let vv = F32x4::splat(v);
     for p in 0..px {
         let ab = a.base(p);
-        for ch in 0..c {
+        let mut cc = 0usize;
+        while cc < cv {
+            let x = F32x4::load(a.data, ab + cc);
+            let r = if first { bin4(op, vv, x) } else { bin4(op, x, vv) };
+            apply4(act, r).store(out, p * c + cc);
+            cc += 4;
+        }
+        for ch in cv..c {
             let x = a.data[ab + ch];
             let r = if first { op.apply(v, x) } else { op.apply(x, v) };
             out[p * c + ch] = act.apply(r);
@@ -52,9 +95,33 @@ pub fn binary_cvec(
 ) {
     debug_assert_eq!(a.c, vec.len());
     let c = a.c;
+    let cv = c / 4 * 4;
+    // dense 뷰 + 4배수 채널: 플랫 루프 (픽셀당 인덱스 산술 제거 — PRelu가
+    // 2 GF/s로 기던 원인)
+    if a.c_off == 0 && a.stride == c && cv == c {
+        let n = px * c;
+        let mut i = 0usize;
+        let mut cc = 0usize;
+        while i < n {
+            apply4(act, bin4(op, F32x4::load(a.data, i), F32x4::load(vec, cc)))
+                .store(out, i);
+            i += 4;
+            cc += 4;
+            if cc == c {
+                cc = 0;
+            }
+        }
+        return;
+    }
     for p in 0..px {
         let ab = a.base(p);
-        for ch in 0..c {
+        let mut cc = 0usize;
+        while cc < cv {
+            apply4(act, bin4(op, F32x4::load(a.data, ab + cc), F32x4::load(vec, cc)))
+                .store(out, p * c + cc);
+            cc += 4;
+        }
+        for ch in cv..c {
             out[p * c + ch] = act.apply(op.apply(a.data[ab + ch], vec[ch]));
         }
     }
@@ -63,9 +130,24 @@ pub fn binary_cvec(
 /// 단독 활성화
 pub fn act(a: View, px: usize, f: Activation, out: &mut [f32]) {
     let c = a.c;
+    let cv = c / 4 * 4;
+    if a.c_off == 0 && a.stride == c && cv == c {
+        let n = px * c;
+        let mut i = 0usize;
+        while i < n {
+            apply4(f, F32x4::load(a.data, i)).store(out, i);
+            i += 4;
+        }
+        return;
+    }
     for p in 0..px {
         let ab = a.base(p);
-        for ch in 0..c {
+        let mut cc = 0usize;
+        while cc < cv {
+            apply4(f, F32x4::load(a.data, ab + cc)).store(out, p * c + cc);
+            cc += 4;
+        }
+        for ch in cv..c {
             out[p * c + ch] = f.apply(a.data[ab + ch]);
         }
     }
@@ -75,9 +157,20 @@ pub fn act(a: View, px: usize, f: Activation, out: &mut [f32]) {
 pub fn mix(z: View, a: View, b: View, px: usize, out: &mut [f32]) {
     debug_assert!(a.c == b.c && a.c == z.c);
     let c = a.c;
+    let cv = c / 4 * 4;
+    let m1 = F32x4::splat(-1.0);
     for p in 0..px {
         let (zb, ab, bb) = (z.base(p), a.base(p), b.base(p));
-        for ch in 0..c {
+        let mut cc = 0usize;
+        while cc < cv {
+            let av = F32x4::load(a.data, ab + cc);
+            let bv = F32x4::load(b.data, bb + cc);
+            let zv = F32x4::load(z.data, zb + cc);
+            // a + z*(b-a) = a + z*b - z*a
+            av.fma(zv, bv).fma(zv.mul(m1), av).store(out, p * c + cc);
+            cc += 4;
+        }
+        for ch in cv..c {
             let (zv, av, bv) = (z.data[zb + ch], a.data[ab + ch], b.data[bb + ch]);
             out[p * c + ch] = av + zv * (bv - av);
         }

@@ -200,6 +200,13 @@ impl<'a> CpuExec<'a> {
                 let op = AvgPool2d { kh: *kh, kw: *kw, sh: *sh, sw: *sw, pad: *pad };
                 (*out, reference::pool::avg_pool(&op, ih, iw, c, &self.read(*input)?))
             }
+            SwOp::Maxpool { input, out, kh, kw, sh, sw, pad, pad_c } => {
+                let (ih, iw, c) = self.hw(*input);
+                let op = ai_core::ops::MaxPool2d {
+                    kh: *kh, kw: *kw, sh: *sh, sw: *sw, pad: *pad, pad_c: *pad_c,
+                };
+                (*out, reference::pool::max_pool(&op, ih, iw, c, &self.read(*input)?))
+            }
             SwOp::Resize { input, out, srcs, oh, ow, mode } => {
                 let (ih, iw, _) = self.hw(*input);
                 // concat 융합 resize: 파트를 채널 concat해 단일 입력으로 평가

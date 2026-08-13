@@ -11,11 +11,11 @@
 use std::collections::HashSet;
 
 use ai_core::format::{SwModel, SwOp, SwOperand};
-use ai_core::ops::{AvgPool2d, BinaryOp, Conv2d, ResizeBilinear};
+use ai_core::ops::{AvgPool2d, BinaryOp, Conv2d, MaxPool2d, ResizeBilinear};
 use ai_core::tensor::TensorDesc;
 use ai_core::{pack, Activation, DType};
 
-use crate::kernels::{conv, dw, segate::SeFc};
+use crate::kernels::{conv, dw, im2row, pw_dot, segate::SeFc};
 use crate::CpuError;
 
 /// 텐서 → 슬롯 뷰 (alias 체인 해석 완료)
@@ -31,6 +31,8 @@ pub(crate) struct ViewRef {
 pub(crate) struct ConvPartRef {
     pub view: ViewRef,
     pub ic0: usize,
+    /// 벡터 루프 경계 (kernels::conv::ConvPart::c4 참조)
+    pub c4: usize,
 }
 
 pub(crate) enum PlanKind {
@@ -61,12 +63,43 @@ pub(crate) enum PlanKind {
         px: usize,
         act: Activation,
     },
+    /// 소채널(cin≤4) k>1 conv — im2row 패치 실체화 후 1x1 GEMM (스템)
+    ConvStem {
+        /// 원본 conv (im2row 기하)
+        op: Conv2d,
+        /// 패치 위 1x1 (cin = kh*kw*cin 논리값)
+        pw: Conv2d,
+        ih: u32,
+        iw: u32,
+        oh: u32,
+        px: usize,
+        k_pad: usize,
+        input: ViewRef,
+        w: usize,
+        b: usize,
+        res: Option<ViewRef>,
+    },
+    /// cout ≤ pw_dot::MAX_COUT 1x1 헤드 — 채널 내적 커널
+    PwDot {
+        op: Conv2d,
+        input: ViewRef,
+        px: usize,
+        w: usize,
+        k_pad: usize,
+        b: usize,
+    },
     Gpool {
         input: ViewRef,
         px: usize,
     },
     Avgpool {
         op: AvgPool2d,
+        ih: u32,
+        iw: u32,
+        input: ViewRef,
+    },
+    Maxpool {
+        op: MaxPool2d,
         ih: u32,
         iw: u32,
         input: ViewRef,
@@ -160,6 +193,7 @@ fn op_reads(op: &SwOp) -> Vec<u32> {
         }
         SwOp::Gpool { input, .. }
         | SwOp::Avgpool { input, .. }
+        | SwOp::Maxpool { input, .. }
         | SwOp::Chcopy { input, .. }
         | SwOp::Act { input, .. }
         | SwOp::SeGate { input, .. } => vec![*input],
@@ -181,6 +215,7 @@ fn op_out(op: &SwOp) -> u32 {
         | SwOp::Binary { out, .. }
         | SwOp::Gpool { out, .. }
         | SwOp::Avgpool { out, .. }
+        | SwOp::Maxpool { out, .. }
         | SwOp::Resize { out, .. }
         | SwOp::Concat { out, .. }
         | SwOp::Chcopy { out, .. }
@@ -440,24 +475,92 @@ fn lower(b: &mut Builder, op: &SwOp, dt: DType, wdt: DType) -> Result<PlanKind, 
                     b: b_idx,
                     res: res_view,
                 }
+            } else if srcs.is_empty()
+                && (*cin as usize) <= 4
+                && (*kh * *kw) > 1
+                && *d == 1
+                && {
+                    let v = b.view_of(*input)?;
+                    v.c_off == 0 && v.stride == v.c
+                }
+            {
+                // 스템(cin≤4, k>1): im2row로 패치를 펴서 1x1 GEMM으로 —
+                // tap당 오버헤드가 4레인 하나뿐인 일을 지배하던 경로 (im2row.rs)
+                let v = b.view_of(*input)?;
+                let w_oihw = pack::unpack_weights_conv(
+                    b.wref(*w), *cout, *cin, *kh, *kw, *kg_pad, wdt,
+                );
+                let w_perm = im2row::permute_weights(&w_oihw, *cout, *cin, *kh, *kw);
+                let k = (*kh * *kw * *cin) as usize;
+                let k_pad = k.next_multiple_of(4);
+                let (wts, cout_pad) =
+                    conv::repack_weights(&w_perm, *cout, k as u32, k_pad, 1, 1);
+                let w_idx = b.push_weights(wts);
+                let b_idx = b.push_weights(conv::pad_bias(&bias_v, cout_pad));
+                PlanKind::ConvStem {
+                    op: conv2d,
+                    pw: Conv2d::pointwise(k as u32, *cout, *act),
+                    ih,
+                    iw,
+                    oh,
+                    px: (oh * ow) as usize,
+                    k_pad,
+                    input: v,
+                    w: w_idx,
+                    b: b_idx,
+                    res: res_view,
+                }
+            } else if *kh == 1
+                && *kw == 1
+                && *sh == 1
+                && *swi == 1
+                && srcs.is_empty()
+                && res.is_none()
+                && (*cout as usize) <= pw_dot::MAX_COUT
+            {
+                // 세그 헤드류(cout 1~4) — NR8 GEMM은 레인을 버리므로 내적 커널
+                let w_oihw = pack::unpack_weights_conv(
+                    b.wref(*w), *cout, *cin, 1, 1, *kg_pad, wdt,
+                );
+                let (wts, k_pad) = pw_dot::repack_weights(&w_oihw, *cout, *cin);
+                let w_idx = b.push_weights(wts);
+                let b_idx = b.push_weights(bias_v.clone());
+                PlanKind::PwDot {
+                    op: conv2d,
+                    input: b.view_of(*input)?,
+                    px: (oh * ow) as usize,
+                    w: w_idx,
+                    k_pad,
+                    b: b_idx,
+                }
             } else {
                 let w_oihw = pack::unpack_weights_conv(
                     b.wref(*w), *cout, *cin, *kh, *kw, *kg_pad, wdt,
                 );
-                let (wts, cout_pad) = conv::repack_weights(&w_oihw, *cout, *cin, *kh, *kw);
+                // 단일 파트 & c%4≠0 (스템 cin=3 등): K축을 4배수로 제로패딩해
+                // 벡터 경로에 태운다 — 4레인 로드의 초과분은 가중치 0이 지운다
+                // (마지막 픽셀의 초과 읽기는 슬롯 +4 패딩이 보장, exec.rs 참조).
+                let cin_pad = if srcs.is_empty() && (*cin as usize) % 4 != 0 {
+                    (*cin as usize).next_multiple_of(4)
+                } else {
+                    *cin as usize
+                };
+                let (wts, cout_pad) =
+                    conv::repack_weights(&w_oihw, *cout, *cin, cin_pad, *kh, *kw);
                 let w_idx = b.push_weights(wts);
                 let b_idx = b.push_weights(conv::pad_bias(&bias_v, cout_pad));
                 let mut parts = Vec::new();
                 let mut ic0 = 0usize;
                 if srcs.is_empty() {
-                    parts.push(ConvPartRef { view: b.view_of(*input)?, ic0: 0 });
+                    let v = b.view_of(*input)?;
+                    parts.push(ConvPartRef { view: v, ic0: 0, c4: cin_pad });
                 } else {
                     for p in srcs {
                         let v = b.view_of(p.input)?;
                         if v.c != p.c as usize {
                             return Err(CpuError::Other("concat 파트 채널 불일치".into()));
                         }
-                        parts.push(ConvPartRef { view: v, ic0 });
+                        parts.push(ConvPartRef { view: v, ic0, c4: v.c });
                         ic0 += v.c;
                     }
                 }
@@ -502,6 +605,17 @@ fn lower(b: &mut Builder, op: &SwOp, dt: DType, wdt: DType) -> Result<PlanKind, 
             let it = &b.sw.tensors[*input as usize];
             PlanKind::Avgpool {
                 op: AvgPool2d { kh: *kh, kw: *kw, sh: *sh, sw: *swi, pad: *pad },
+                ih: it.h,
+                iw: it.w,
+                input: b.view_of(*input)?,
+            }
+        }
+        SwOp::Maxpool { input, kh, kw, sh, sw: swi, pad, pad_c, .. } => {
+            let it = &b.sw.tensors[*input as usize];
+            PlanKind::Maxpool {
+                op: MaxPool2d {
+                    kh: *kh, kw: *kw, sh: *sh, sw: *swi, pad: *pad, pad_c: *pad_c,
+                },
                 ih: it.h,
                 iw: it.w,
                 input: b.view_of(*input)?,

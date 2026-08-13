@@ -23,7 +23,9 @@ fn is_scalar_shape(s: &[i64]) -> bool {
 pub fn run(g: &mut Graph, _ctx: &Ctx) -> Result<PassReport, ConvertError> {
     let mut report = PassReport::default();
     for idx in 0..g.nodes.len() {
-        if g.nodes[idx].dead || !matches!(g.nodes[idx].op.as_str(), "Mul" | "Add" | "Sub") {
+        if g.nodes[idx].dead
+            || !matches!(g.nodes[idx].op.as_str(), "Mul" | "Add" | "Sub" | "PRelu")
+        {
             continue;
         }
         let node = g.nodes[idx].clone();

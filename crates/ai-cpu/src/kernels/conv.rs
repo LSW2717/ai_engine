@@ -13,31 +13,52 @@
 
 use ai_core::ops::Conv2d;
 
+use crate::kernels::apply4;
 use crate::simd::F32x4;
 use crate::view::View;
 
 /// 출력채널 블록 폭 (F32x4 두 개)
 pub const NR: usize = 8;
 
+/// 큰 마이크로커널의 픽셀 폭. 네이티브 8 (acc 16개 + A 8 + W 2 = 26 < 32 NEON 레지스터).
+/// wasm 6 — V8 arm64 가용 vreg ~28에서 MR8은 스필 경계라 실험으로 정한다.
+#[cfg(target_arch = "wasm32")]
+const MR_BIG: usize = 6;
+#[cfg(not(target_arch = "wasm32"))]
+const MR_BIG: usize = 8;
+
 /// concat 융합 파트: 뷰 + 가중치 K축에서의 시작 채널
 #[derive(Clone, Copy)]
 pub struct ConvPart<'a> {
     pub view: View<'a>,
-    /// 이 파트의 첫 채널이 대응하는 가중치 입력채널 인덱스 (누적)
+    /// 이 파트의 첫 채널이 대응하는 가중치 입력채널 인덱스 (누적, 패딩 포함)
     pub ic0: usize,
+    /// 벡터 루프 경계. 보통 view.c (c%4는 스칼라 꼬리). K축이 제로패딩된
+    /// 파트(스템 cin=3 등)는 next4(c) — 4레인 로드가 이웃 채널을 읽어도
+    /// 가중치가 0이라 무해하다 (슬롯 +4 패딩이 마지막 픽셀을 보호).
+    pub c4: usize,
 }
 
-/// OIHW → `[tap][cin][cout_pad]` 재패킹. 반환 (data, cout_pad).
-pub fn repack_weights(w_oihw: &[f32], cout: u32, cin: u32, kh: u32, kw: u32) -> (Vec<f32>, usize) {
+/// OIHW → `[tap][cin_pad][cout_pad]` 재패킹. 반환 (data, cout_pad).
+/// cin_pad > cin이면 K축 제로패딩 (cin=3 스템을 벡터 경로에 태우는 용도).
+pub fn repack_weights(
+    w_oihw: &[f32],
+    cout: u32,
+    cin: u32,
+    cin_pad: usize,
+    kh: u32,
+    kw: u32,
+) -> (Vec<f32>, usize) {
     let (cout, cin, kh, kw) = (cout as usize, cin as usize, kh as usize, kw as usize);
     assert_eq!(w_oihw.len(), cout * cin * kh * kw);
+    debug_assert!(cin_pad >= cin);
     let cout_pad = cout.next_multiple_of(NR);
     let taps = kh * kw;
-    let mut out = vec![0f32; taps * cin * cout_pad];
+    let mut out = vec![0f32; taps * cin_pad * cout_pad];
     for oc in 0..cout {
         for ic in 0..cin {
             for t in 0..taps {
-                out[(t * cin + ic) * cout_pad + oc] = w_oihw[((oc * cin) + ic) * taps + t];
+                out[(t * cin_pad + ic) * cout_pad + oc] = w_oihw[((oc * cin) + ic) * taps + t];
             }
         }
     }
@@ -75,8 +96,9 @@ pub fn conv_std(
     let _ = oh;
     let cout = op.cout as usize;
     let cout_pad = bias.len();
-    let cin_total: usize = parts.iter().map(|p| p.view.c).sum();
-    debug_assert_eq!(cin_total, op.cin as usize);
+    // 가중치 K축 스트라이드 = c4 합 (패딩 파트는 c4 > c)
+    let cin_total: usize = parts.iter().map(|p| p.c4).sum();
+    debug_assert!(cin_total >= op.cin as usize);
     debug_assert_eq!(wts.len(), (op.kh * op.kw) as usize * cin_total * cout_pad);
 
     let (sh, sw, dil) = (op.sh as i64, op.sw as i64, op.dil as i64);
@@ -113,45 +135,107 @@ pub fn conv_std(
         }
         let ky_list = &ky_list[..n_ky];
 
-        for oc0 in (0..cout).step_by(NR) {
+        let mut oc0 = 0usize;
+        while oc0 < cout {
+            // wasm: cout 16배수 구간은 NR16 — 셔플 1개가 madd 4개를 서빙
+            // (NR8은 2개) → 브로드캐스트의 wasm 셔플세를 반으로.
+            let nr16 = cfg!(target_arch = "wasm32") && cout - oc0 >= 16;
             let mut ox = 0usize;
             while ox < ow as usize {
-                let interior =
-                    ox as i64 >= lo && (ox + 3) as i64 <= hi && ox + 4 <= ow as usize;
-                // 에필로그: bias는 acc 초기값 → act → +residual (conv-tail 규약)
-                let sink = |px: usize, l: usize, acc: f32, out: &mut [f32]| {
-                    let mut v = op.act.apply(acc);
-                    if let Some(r) = residual {
-                        v += r.data[r.base(px) + oc0 + l];
-                    }
-                    out[(px - px_base) * cout + oc0 + l] = v;
+                let inb = |n: usize| {
+                    ox as i64 >= lo && (ox + n - 1) as i64 <= hi && ox + n <= ow as usize
                 };
-                if interior {
-                    mr4(
+                if nr16 && inb(4) {
+                    mr4_nr16(
                         op, iw, ow as usize, parts, wts, bias, cin_total, cout_pad, oc0,
-                        ky_list, oy, ox,
-                        |px, l, acc| sink(px, l, acc, out),
-                        cout - oc0,
+                        ky_list, oy, ox, residual, out, px_base, cout,
+                    );
+                    ox += 4;
+                } else if !nr16 && inb(MR_BIG) {
+                    // MR_BIG 우선: 누산 체인 2×MR개가 fma 지연을 채운다 (4픽셀
+                    // 8체인으로는 절반 — 디코더 conv가 46 GF/s에서 멈추던 원인).
+                    mr_n::<MR_BIG>(
+                        op, iw, ow as usize, parts, wts, bias, cin_total, cout_pad, oc0,
+                        ky_list, oy, ox, residual, out, px_base, cout,
+                    );
+                    ox += MR_BIG;
+                } else if !nr16 && inb(4) {
+                    mr_n::<4>(
+                        op, iw, ow as usize, parts, wts, bias, cin_total, cout_pad, oc0,
+                        ky_list, oy, ox, residual, out, px_base, cout,
                     );
                     ox += 4;
                 } else {
                     mr1(
                         op, iw, ow as usize, parts, wts, bias, cin_total, cout_pad, oc0,
-                        ky_list, oy, ox,
-                        |px, l, acc| sink(px, l, acc, out),
-                        cout - oc0,
+                        ky_list, oy, ox, residual, out, px_base, cout,
                     );
+                    if nr16 {
+                        mr1(
+                            op, iw, ow as usize, parts, wts, bias, cin_total, cout_pad,
+                            oc0 + NR, ky_list, oy, ox, residual, out, px_base, cout,
+                        );
+                    }
                     ox += 1;
                 }
             }
+            oc0 += if nr16 { 16 } else { NR };
         }
     }
 }
 
-/// interior 4픽셀 × NR 마이크로커널 — 경계 검사 없음
+/// 에필로그: act → +residual → 저장. 풀 블록(nc≥NR)은 벡터, 부분 블록은 스칼라.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
-fn mr4(
+fn epilogue(
+    op: &Conv2d,
+    acc: [F32x4; 2],
+    px: usize,
+    px_base: usize,
+    cout: usize,
+    oc0: usize,
+    residual: Option<View>,
+    out: &mut [f32],
+) {
+    let o = (px - px_base) * cout + oc0;
+    let nc = cout - oc0;
+    if nc >= NR {
+        let mut v0 = apply4(op.act, acc[0]);
+        let mut v1 = apply4(op.act, acc[1]);
+        if let Some(r) = residual {
+            let rb = r.base(px) + oc0;
+            v0 = v0.add(F32x4::load(r.data, rb));
+            v1 = v1.add(F32x4::load(r.data, rb + 4));
+        }
+        v0.store(out, o);
+        v1.store(out, o + 4);
+    } else {
+        // 부분 블록: 앞 4레인은 벡터, 나머지 스칼라
+        let mut l0 = 0usize;
+        if nc >= 4 {
+            let mut v0 = apply4(op.act, acc[0]);
+            if let Some(r) = residual {
+                v0 = v0.add(F32x4::load(r.data, r.base(px) + oc0));
+            }
+            v0.store(out, o);
+            l0 = 4;
+        }
+        let lanes = [acc[0].to_array(), acc[1].to_array()];
+        for l in l0..nc {
+            let mut v = op.act.apply(lanes[l / 4][l % 4]);
+            if let Some(r) = residual {
+                v += r.data[r.base(px) + oc0 + l];
+            }
+            out[o + l] = v;
+        }
+    }
+}
+
+/// interior MR픽셀 × NR 마이크로커널 — 경계 검사 없음. MR은 4/8만 쓴다
+/// (8 = 누산 체인 16개로 fma 지연 은닉, 4 = 잔여 구간).
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn mr_n<const MR: usize>(
     op: &Conv2d,
     iw: u32,
     ow: usize,
@@ -164,12 +248,14 @@ fn mr4(
     ky_list: &[(usize, usize)],
     oy: usize,
     ox: usize,
-    mut sink: impl FnMut(usize, usize, f32),
-    nc: usize,
+    residual: Option<View>,
+    out: &mut [f32],
+    px_base: usize,
+    cout: usize,
 ) {
     let b0 = F32x4::load(bias, oc0);
     let b1 = F32x4::load(bias, oc0 + 4);
-    let mut acc = [[b0, b1]; 4];
+    let mut acc = [[b0, b1]; MR];
 
     let (sw, dil, pl) = (op.sw as usize, op.dil as usize, op.pad[1] as usize);
     let kw = op.kw as usize;
@@ -180,23 +266,127 @@ fn mr4(
             let ix0 = ox * sw + kx * dil - pl;
             let row = iy * iw as usize;
             for part in parts {
-                let base = [
-                    part.view.base(row + ix0),
-                    part.view.base(row + ix0 + sw),
-                    part.view.base(row + ix0 + 2 * sw),
-                    part.view.base(row + ix0 + 3 * sw),
-                ];
+                let base: [usize; MR] =
+                    std::array::from_fn(|p| part.view.base(row + ix0 + p * sw));
                 let x = part.view.data;
+                let pc = part.view.c;
                 let mut w_idx = (t * cin_total + part.ic0) * cout_pad + oc0;
-                for ic in 0..part.view.c {
+                let mut ic = 0usize;
+                // ic 4블록: 픽셀당 A 벡터 로드 1 + lane-fma 4 — splat 로드 4개를
+                // 로드 1개로 (XNNPACK gemm-splat 구조. NHWC라 채널 4개가 연속).
+                // 경계는 c4가 보장: 보통 4배수 하한, 패딩 파트는 가중치 0.
+                while ic + 4 <= part.c4 {
+                    let a: [F32x4; MR] = std::array::from_fn(|p| F32x4::load(x, base[p] + ic));
+                    macro_rules! lane {
+                        ($l:literal) => {{
+                            let w0 = F32x4::load(wts, w_idx);
+                            let w1 = F32x4::load(wts, w_idx + 4);
+                            for p in 0..MR {
+                                acc[p][0] = acc[p][0].fma_lane::<$l>(a[p], w0);
+                                acc[p][1] = acc[p][1].fma_lane::<$l>(a[p], w1);
+                            }
+                            w_idx += cout_pad;
+                        }};
+                    }
+                    lane!(0);
+                    lane!(1);
+                    lane!(2);
+                    lane!(3);
+                    ic += 4;
+                }
+                // 꼬리 채널: splat 로드
+                while ic < pc {
                     let w0 = F32x4::load(wts, w_idx);
                     let w1 = F32x4::load(wts, w_idx + 4);
-                    for p in 0..4 {
-                        let a = F32x4::splat(x[base[p] + ic]);
+                    for p in 0..MR {
+                        let a = F32x4::load_splat(x, base[p] + ic);
                         acc[p][0] = acc[p][0].fma(a, w0);
                         acc[p][1] = acc[p][1].fma(a, w1);
                     }
                     w_idx += cout_pad;
+                    ic += 1;
+                }
+            }
+        }
+    }
+
+    for p in 0..MR {
+        let px = oy * ow + ox + p;
+        epilogue(op, acc[p], px, px_base, cout, oc0, residual, out);
+    }
+}
+
+/// interior 4픽셀 × 16출력채널 (wasm 전용 경로) — 셔플 브로드캐스트 1개가
+/// madd 4개를 서빙해 fma당 셔플이 NR8의 절반이다. 같은 (a, lane) 셔플은
+/// LLVM CSE가 합친다 (fma_lane 반복 호출로 표현).
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn mr4_nr16(
+    op: &Conv2d,
+    iw: u32,
+    ow: usize,
+    parts: &[ConvPart],
+    wts: &[f32],
+    bias: &[f32],
+    cin_total: usize,
+    cout_pad: usize,
+    oc0: usize,
+    ky_list: &[(usize, usize)],
+    oy: usize,
+    ox: usize,
+    residual: Option<View>,
+    out: &mut [f32],
+    px_base: usize,
+    cout: usize,
+) {
+    let b: [F32x4; 4] = std::array::from_fn(|i| F32x4::load(bias, oc0 + 4 * i));
+    let mut acc = [b; 4];
+
+    let (sw, dil, pl) = (op.sw as usize, op.dil as usize, op.pad[1] as usize);
+    let kw = op.kw as usize;
+    for &(t_row, iy) in ky_list {
+        for kx in 0..kw {
+            let t = t_row + kx;
+            let ix0 = ox * sw + kx * dil - pl;
+            let row = iy * iw as usize;
+            for part in parts {
+                let base: [usize; 4] =
+                    std::array::from_fn(|p| part.view.base(row + ix0 + p * sw));
+                let x = part.view.data;
+                let pc = part.view.c;
+                let mut w_idx = (t * cin_total + part.ic0) * cout_pad + oc0;
+                let mut ic = 0usize;
+                while ic + 4 <= part.c4 {
+                    let a: [F32x4; 4] = std::array::from_fn(|p| F32x4::load(x, base[p] + ic));
+                    macro_rules! lane {
+                        ($l:literal) => {{
+                            let w: [F32x4; 4] =
+                                std::array::from_fn(|i| F32x4::load(wts, w_idx + 4 * i));
+                            for p in 0..4 {
+                                for i in 0..4 {
+                                    acc[p][i] = acc[p][i].fma_lane::<$l>(a[p], w[i]);
+                                }
+                            }
+                            w_idx += cout_pad;
+                        }};
+                    }
+                    lane!(0);
+                    lane!(1);
+                    lane!(2);
+                    lane!(3);
+                    ic += 4;
+                }
+                while ic < pc {
+                    let w: [F32x4; 4] =
+                        std::array::from_fn(|i| F32x4::load(wts, w_idx + 4 * i));
+                    for p in 0..4 {
+                        let a = F32x4::load_splat(x, base[p] + ic);
+                        for i in 0..4 {
+                            acc[p][i] = acc[p][i].fma(a, w[i]);
+                        }
+                    }
+                    w_idx += cout_pad;
+                    ic += 1;
                 }
             }
         }
@@ -204,10 +394,8 @@ fn mr4(
 
     for p in 0..4 {
         let px = oy * ow + ox + p;
-        let lanes = [acc[p][0].to_array(), acc[p][1].to_array()];
-        for l in 0..nc.min(NR) {
-            sink(px, l, lanes[l / 4][l % 4]);
-        }
+        epilogue(op, [acc[p][0], acc[p][1]], px, px_base, cout, oc0, residual, out);
+        epilogue(op, [acc[p][2], acc[p][3]], px, px_base, cout, oc0 + NR, residual, out);
     }
 }
 
@@ -227,8 +415,10 @@ fn mr1(
     ky_list: &[(usize, usize)],
     oy: usize,
     ox: usize,
-    mut sink: impl FnMut(usize, usize, f32),
-    nc: usize,
+    residual: Option<View>,
+    out: &mut [f32],
+    px_base: usize,
+    cout: usize,
 ) {
     let mut acc = [F32x4::load(bias, oc0), F32x4::load(bias, oc0 + 4)];
 
@@ -245,22 +435,36 @@ fn mr1(
             for part in parts {
                 let base = part.view.base(lin);
                 let x = part.view.data;
+                let pc = part.view.c;
                 let mut w_idx = (t * cin_total + part.ic0) * cout_pad + oc0;
-                for ic in 0..part.view.c {
-                    let a = F32x4::splat(x[base + ic]);
+                let mut ic = 0usize;
+                while ic + 4 <= part.c4 {
+                    let a = F32x4::load(x, base + ic);
+                    macro_rules! lane {
+                        ($l:literal) => {{
+                            acc[0] = acc[0].fma_lane::<$l>(a, F32x4::load(wts, w_idx));
+                            acc[1] = acc[1].fma_lane::<$l>(a, F32x4::load(wts, w_idx + 4));
+                            w_idx += cout_pad;
+                        }};
+                    }
+                    lane!(0);
+                    lane!(1);
+                    lane!(2);
+                    lane!(3);
+                    ic += 4;
+                }
+                while ic < pc {
+                    let a = F32x4::load_splat(x, base + ic);
                     acc[0] = acc[0].fma(a, F32x4::load(wts, w_idx));
                     acc[1] = acc[1].fma(a, F32x4::load(wts, w_idx + 4));
                     w_idx += cout_pad;
+                    ic += 1;
                 }
             }
         }
     }
 
-    let px = oy * ow + ox;
-    let lanes = [acc[0].to_array(), acc[1].to_array()];
-    for l in 0..nc.min(NR) {
-        sink(px, l, lanes[l / 4][l % 4]);
-    }
+    epilogue(op, acc, oy * ow + ox, px_base, cout, oc0, residual, out);
 }
 
 #[cfg(test)]
@@ -271,7 +475,7 @@ mod tests {
 
     fn run_case(op: &Conv2d, ih: u32, iw: u32, with_res: bool, seed: u32) {
         let mut rng = XorShift32::new(seed);
-        let x = rng.vec_f32((ih * iw * op.cin) as usize);
+        let mut x = rng.vec_f32((ih * iw * op.cin) as usize);
         let w = rng.vec_f32((op.cout * op.cin * op.kh * op.kw) as usize);
         let b = rng.vec_f32(op.cout as usize);
         let (oh, ow) = op.out_hw(ih, iw);
@@ -283,9 +487,14 @@ mod tests {
 
         let want = reference::conv::conv2d(op, ih, iw, &x, &w, Some(&b), res.as_deref());
 
-        let (wts, cout_pad) = repack_weights(&w, op.cout, op.cin, op.kh, op.kw);
+        // 단일 파트는 plan과 동일하게 K 제로패딩 (cin 3/5 케이스가 패딩 경로 검증).
+        // 입력 +4 패딩은 exec 슬롯 패딩과 같은 역할.
+        x.extend_from_slice(&[0.0; 4]);
+        let cin_pad = (op.cin as usize).next_multiple_of(4);
+        let (wts, cout_pad) = repack_weights(&w, op.cout, op.cin, cin_pad, op.kh, op.kw);
         let bias = pad_bias(&b, cout_pad);
-        let parts = [ConvPart { view: View::dense(&x, op.cin as usize), ic0: 0 }];
+        let parts =
+            [ConvPart { view: View::dense(&x, op.cin as usize), ic0: 0, c4: cin_pad }];
         let mut got = vec![0f32; want.len()];
         let res_view = res.as_deref().map(|r| View::dense(r, op.cout as usize));
         conv_std(op, ih, iw, &parts, &wts, &bias, res_view, &mut got, 0, oh);
@@ -398,13 +607,14 @@ mod tests {
         let b = rng.vec_f32(cout as usize);
         let want = reference::conv::conv2d(&op, ih, iw, &xcat, &w, Some(&b), None);
 
-        let (wts, cout_pad) = repack_weights(&w, cout, cin, 3, 3);
+        let (wts, cout_pad) = repack_weights(&w, cout, cin, cin as usize, 3, 3);
         let bias = pad_bias(&b, cout_pad);
         let parts = [
-            ConvPart { view: View::dense(&x1, c1), ic0: 0 },
+            ConvPart { view: View::dense(&x1, c1), ic0: 0, c4: c1 },
             ConvPart {
                 view: View { data: &big, c_off, stride: big_c, c: c2 },
                 ic0: c1,
+                c4: c2,
             },
         ];
         let mut got = vec![0f32; want.len()];
@@ -433,12 +643,15 @@ mod tests {
         };
         let (ih, iw) = (11u32, 13u32);
         let mut rng = XorShift32::new(8);
-        let x = rng.vec_f32((ih * iw * op.cin) as usize);
+        let mut x = rng.vec_f32((ih * iw * op.cin) as usize);
+        x.extend_from_slice(&[0.0; 4]); // 4레인 오버리드 패딩
         let w = rng.vec_f32((op.cout * op.cin * 9) as usize);
         let b = rng.vec_f32(op.cout as usize);
-        let (wts, cout_pad) = repack_weights(&w, op.cout, op.cin, 3, 3);
+        let cin_pad = (op.cin as usize).next_multiple_of(4);
+        let (wts, cout_pad) = repack_weights(&w, op.cout, op.cin, cin_pad, 3, 3);
         let bias = pad_bias(&b, cout_pad);
-        let parts = [ConvPart { view: View::dense(&x, op.cin as usize), ic0: 0 }];
+        let parts =
+            [ConvPart { view: View::dense(&x, op.cin as usize), ic0: 0, c4: cin_pad }];
         let (oh, ow) = op.out_hw(ih, iw);
 
         let mut full = vec![0f32; (oh * ow * op.cout) as usize];

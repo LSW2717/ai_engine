@@ -57,7 +57,17 @@ impl CpuSegmenter {
         self.model.read_output(name).map_err(|e| TaskError::Cpu(e.to_string()))
     }
 
+    /// 재사용 버퍼로 출력 복사 — 프레임 루프에서 JS 이중 복사 제거용
+    pub fn read_output_into(&self, name: &str, out: &mut Vec<f32>) -> Result<(), TaskError> {
+        self.model.read_output_into(name, out).map_err(|e| TaskError::Cpu(e.to_string()))
+    }
+
     pub fn stats(&self) -> Stats {
         self.clock.stats()
+    }
+
+    /// 스텝별 반복 벤치 passthrough — (라벨, 1회 평균 ms). 진단용 (cpu-ab 프로파일).
+    pub fn bench_steps(&mut self, reps: usize) -> Vec<(String, f64)> {
+        self.model.bench_steps(reps).into_iter().map(|r| (r.label, r.ms)).collect()
     }
 }

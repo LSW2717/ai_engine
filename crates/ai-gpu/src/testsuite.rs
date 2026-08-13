@@ -151,7 +151,7 @@ pub async fn run_elementwise(ctx: &GpuContext) -> Result<Vec<CaseResult>, String
 
     let mut results = Vec::new();
     let acts = [Activation::None, Activation::Relu, Activation::Sigmoid, Activation::Hardswish];
-    let ops = [BinaryOp::Add, BinaryOp::Sub, BinaryOp::Mul];
+    let ops = [BinaryOp::Add, BinaryOp::Sub, BinaryOp::Mul, BinaryOp::Prelu];
     let operands = [
         EwOperand::Tensor,
         EwOperand::Scalar { scalar_first: false },
@@ -703,6 +703,21 @@ pub async fn run_conv_igemm(ctx: &GpuContext) -> Result<Vec<CaseResult>, String>
     results.push(
         igemm_case(ctx, 16, 16, 4, 8, 3, 1, [1, 0, 0, 1], Activation::Relu, false, 7001).await?,
     );
+    // 실제 스템 크기 (128² — Direct4 변형이 걸리는 크기)
+    results.push(
+        igemm_case(ctx, 128, 128, 3, 16, 3, 2, [0, 0, 1, 1], Activation::None, false, 7008)
+            .await?,
+    );
+    // tf2onnx SAME 패딩 (s2 → 비대칭 [0,0,1,1]) — MediaPipe 스템이 실제로 이 모양
+    results.push(
+        igemm_case(ctx, 32, 32, 3, 16, 3, 2, [0, 0, 1, 1], Activation::None, false, 7005).await?,
+    );
+    results.push(
+        igemm_case(ctx, 32, 32, 3, 24, 5, 2, [1, 1, 2, 2], Activation::None, false, 7006).await?,
+    );
+    results.push(
+        igemm_case(ctx, 24, 24, 16, 16, 3, 2, [0, 0, 1, 1], Activation::Relu, false, 7007).await?,
+    );
     results.push(
         igemm_case(ctx, 24, 32, 16, 16, 3, 1, [1; 4], Activation::Hardswish, true, 7002).await?,
     );
@@ -751,6 +766,34 @@ pub async fn run_pool_resize(ctx: &GpuContext) -> Result<Vec<CaseResult>, String
             run_single(ctx, &spec, &[0u8; 16], &[&in_buf, &out_buf], dout.size_bytes()).await?;
         let got = pack::unpack_nhwc(&bytes, &dout);
         results.push(compare(&spec.cache_key(&ctx.caps), &got, &want, ATOL_F32, RTOL_F32));
+    }
+
+    // maxpool: MediaPipe k2 s2 + pad_c(채널패드 접기) + 비4배수 채널
+    {
+        use crate::kernels::maxpool::MaxPoolSpec;
+        use ai_core::ops::MaxPool2d;
+        for (ih, iw, c, k, s, pad_c, seed) in [
+            (16u32, 16u32, 8u32, 2u32, 2u32, 0u32, 8201u32),
+            (16, 16, 44, 2, 2, 4, 8202),
+            (7, 7, 6, 2, 2, 2, 8203),
+            (9, 9, 12, 3, 1, 0, 8204),
+        ] {
+            let op = MaxPool2d { kh: k, kw: k, sh: s, sw: s, pad: [0; 4], pad_c };
+            let (oh, ow) = op.out_hw(ih, iw);
+            let din = TensorDesc::new(ih, iw, c, DType::F32);
+            let dout = TensorDesc::new(oh, ow, c + pad_c, DType::F32);
+            let mut rng = XorShift32::new(seed);
+            let input = rng.vec_f32(din.elems());
+            let want = reference::pool::max_pool(&op, ih, iw, c, &input);
+            let spec = MaxPoolSpec::from_op(&op, ih, iw, c, DType::F32);
+            let in_buf = storage_in(ctx, &pack::pack_nhwc(&input, &din));
+            let out_buf = storage_out(ctx, dout.size_bytes());
+            let bytes =
+                run_single(ctx, &spec, &[0u8; 16], &[&in_buf, &out_buf], dout.size_bytes())
+                    .await?;
+            let got = pack::unpack_nhwc(&bytes, &dout);
+            results.push(compare(&spec.cache_key(&ctx.caps), &got, &want, ATOL_F32, RTOL_F32));
+        }
     }
 
     // avgpool: RVM k==s 경로 + 일반형

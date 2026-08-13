@@ -2,6 +2,8 @@
 //! 파일 규약(Spec + 변형 정책 + KernelSpec impl + naga 테스트)은 ARCHITECTURE.md 참조.
 
 pub mod avgpool;
+pub mod flatten;
+pub mod maxpool;
 pub mod channel_gather;
 pub mod common;
 pub mod conv_dw;

@@ -11,5 +11,5 @@ pub mod shape;
 
 pub use conv::Conv2d;
 pub use elementwise::BinaryOp;
-pub use pool::AvgPool2d;
+pub use pool::{AvgPool2d, MaxPool2d};
 pub use resize::{CoordMode, ResizeBilinear};

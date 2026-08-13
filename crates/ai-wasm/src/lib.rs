@@ -367,6 +367,41 @@ pub fn infer_frame_cpu(rgb: Vec<f32>, output: String) -> Result<Vec<f32>, JsValu
     })
 }
 
+thread_local! {
+    /// infer_frame_cpu_view의 출력 스테이징 — 프레임마다 재사용
+    static CPU_OUT: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// CPU 프레임 1장 — 출력을 **wasm 힙 뷰**로 반환 (JS로의 2차 복사 없음,
+/// tflite HEAPF32 규약과 동일). 뷰는 다음 호출·wasm 메모리 성장 전까지만 유효 —
+/// 받은 즉시 소비할 것.
+#[wasm_bindgen]
+pub fn infer_frame_cpu_view(rgb: &[f32], output: &str) -> Result<js_sys::Float32Array, JsValue> {
+    CPU_MODEL.with(|m| {
+        let mut b = m.borrow_mut();
+        let seg = b.as_mut().ok_or_else(|| JsValue::from_str("CPU 모델 미로드"))?;
+        seg.infer_frame(rgb).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        CPU_OUT.with(|o| {
+            let mut o = o.borrow_mut();
+            seg.read_output_into(output, &mut o)
+                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+            // SAFETY: 뷰 수명은 문서 규약(다음 호출 전 소비)이 지킨다
+            Ok(unsafe { js_sys::Float32Array::view(&o) })
+        })
+    })
+}
+
+/// CPU 스텝별 반복 벤치 — [[라벨, ms], ...] (진단용, tools/profile_web.mjs --ops)
+#[wasm_bindgen]
+pub fn profile_cpu(reps: usize) -> Result<JsValue, JsValue> {
+    CPU_MODEL.with(|m| {
+        let mut b = m.borrow_mut();
+        let seg = b.as_mut().ok_or_else(|| JsValue::from_str("CPU 모델 미로드"))?;
+        serde_wasm_bindgen::to_value(&seg.bench_steps(reps))
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    })
+}
+
 /// CPU 티어 프레임타임 분포 — GPU와 같은 강등 판정 입력 형식
 #[wasm_bindgen]
 pub fn model_stats_cpu() -> Result<JsValue, JsValue> {

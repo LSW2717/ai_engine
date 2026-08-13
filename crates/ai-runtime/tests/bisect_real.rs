@@ -53,8 +53,8 @@ fn bisect_real_frame() {
         use ai_core::format::SwOp::*;
         let out_tid = match op {
             Conv { out, .. } | Binary { out, .. } | Gpool { out, .. } | Avgpool { out, .. }
-            | Resize { out, .. } | Concat { out, .. } | Chcopy { out, .. }
-            | SeGate { out, .. } | Act { out, .. } | Mix { out, .. } => *out,
+            | Maxpool { out, .. } | Resize { out, .. } | Concat { out, .. }
+            | Chcopy { out, .. } | SeGate { out, .. } | Act { out, .. } | Mix { out, .. } => *out,
         };
         if sw.states.iter().any(|s| s.output == out_tid || s.input == out_tid) {
             continue;

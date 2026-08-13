@@ -103,22 +103,26 @@ impl KernelSpec for ElementwiseSpec {
                  @group(0) @binding(3) var<storage, read_write> O: array<sv4>;"
                 .to_string(),
         };
-        let o = self.op.wgsl_op();
         let (a, b, z) = (self.read("A", 0), self.read("B", 1), self.read("Z", 2));
+        let av = format!("vec4f({a})");
         let mut body = match self.operand {
-            EwOperand::Tensor => format!("var v = vec4f({a}) {o} vec4f({b});\n"),
+            EwOperand::Tensor => {
+                format!("var v = {};\n", self.op.wgsl_expr(&av, &format!("vec4f({b})")))
+            }
             EwOperand::Scalar { scalar_first } => {
                 let s = "vec4f(P.scalar)";
                 if scalar_first {
-                    format!("var v = {s} {o} vec4f({a});\n")
+                    format!("var v = {};\n", self.op.wgsl_expr(s, &av))
                 } else {
-                    format!("var v = vec4f({a}) {o} {s};\n")
+                    format!("var v = {};\n", self.op.wgsl_expr(&av, s))
                 }
             }
             // 채널 벡터 B는 [1,1,C]라 뷰 대상이 아니다 (재매핑 없음)
-            EwOperand::ChannelVector => format!("var v = vec4f({a}) {o} vec4f(B[i % P.cg]);\n"),
-            EwOperand::Unary => format!("var v = vec4f({a});\n"),
-            EwOperand::Mix => format!("var v = mix(vec4f({a}), vec4f({b}), vec4f({z}));\n"),
+            EwOperand::ChannelVector => {
+                format!("var v = {};\n", self.op.wgsl_expr(&av, "vec4f(B[i % P.cg])"))
+            }
+            EwOperand::Unary => format!("var v = {av};\n"),
+            EwOperand::Mix => format!("var v = mix({av}, vec4f({b}), vec4f({z}));\n"),
         };
         if self.act != Activation::None {
             body.push_str(&format!("v = {};\n", act_expr(self.act, "v")));

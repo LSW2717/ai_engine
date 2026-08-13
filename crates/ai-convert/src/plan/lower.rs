@@ -25,6 +25,7 @@ fn parse_act(s: Option<&str>) -> Result<Activation, ConvertError> {
         Some("hswish") => Activation::Hardswish,
         Some("hsigmoid") => Activation::Hardsigmoid,
         Some("clamp01") => Activation::Clamp01,
+        Some("relu6") => Activation::Relu6,
         Some(other) => return Err(ConvertError::Malformed(format!("알 수 없는 act: {other}"))),
     })
 }
@@ -60,8 +61,14 @@ impl<'a> Lowerer<'a> {
             .and_then(|t| t.static_shape())
             .ok_or_else(|| ConvertError::ShapeUnresolved(name.into()))?;
         match s.len() {
+            // [1,1,1,N] (flatten 산물) — (h1,wN,c1)로 잡으면 GPU C4가 픽셀마다
+            // 레인 3개를 패딩해 평탄 버퍼와 어긋난다. 채널벡터로 접는다.
+            4 if s[1] == 1 && s[2] == 1 => Ok((1, 1, s[3] as u32)),
             4 => Ok((s[2] as u32, s[3] as u32, s[1] as u32)),
             3 if s[1] == 1 && s[2] == 1 => Ok((1, 1, s[0] as u32)), // [C,1,1] 채널벡터
+            // [1,a,b] — tf2onnx 디텍터 헤드의 flatten 산물 ([1,앵커,16] 등).
+            // 평탄 버퍼로 취급한다 — a×b 구조는 호스트가 해석 (reshape canon 참조)
+            3 if s[0] == 1 => Ok((1, 1, (s[1] * s[2]) as u32)),
             2 => Ok((1, 1, s[1] as u32)),
             1 => Ok((1, 1, s[0] as u32)),
             _ => Err(ConvertError::Malformed(format!("텐서 rank {} 미지원: {name}", s.len()))),
@@ -178,6 +185,7 @@ impl<'a> Lowerer<'a> {
             "Mul" => BinaryOp::Mul,
             "Add" => BinaryOp::Add,
             "Sub" => BinaryOp::Sub,
+            "PRelu" => BinaryOp::Prelu,
             other => return Err(ConvertError::Malformed(format!("binary 아님: {other}"))),
         };
         let act = parse_act(node.attr_s("act"))?;
@@ -229,7 +237,7 @@ pub fn lower(g: &Graph, ctx: &Ctx, name: &str) -> Result<(SwModel, Vec<u8>), Con
                 lw.tensors[out as usize].alias = Some(SwAlias { of: src, cg_off });
             }
             "Conv" => ops.push(lw.lower_conv(node)?),
-            "Mul" | "Add" | "Sub" => ops.push(lw.lower_binary(node)?),
+            "Mul" | "Add" | "Sub" | "PRelu" => ops.push(lw.lower_binary(node)?),
             "mix" => ops.push(SwOp::Mix {
                 a: lw.tid(&node.inputs[0])?,
                 b: lw.tid(&node.inputs[1])?,
@@ -252,6 +260,21 @@ pub fn lower(g: &Graph, ctx: &Ctx, name: &str) -> Result<(SwModel, Vec<u8>), Con
                     sh: s[0] as u32,
                     sw: s[1] as u32,
                     pad: [p[0] as u32, p[1] as u32, p[2] as u32, p[3] as u32],
+                });
+            }
+            "maxpool" => {
+                let k = node.attr_is("kernel_shape").unwrap().to_vec();
+                let s = node.attr_is("strides").map(|v| v.to_vec()).unwrap_or(vec![1, 1]);
+                let p = node.attr_is("pads").map(|v| v.to_vec()).unwrap_or(vec![0; 4]);
+                ops.push(SwOp::Maxpool {
+                    input: lw.tid(&node.inputs[0])?,
+                    out: lw.tid(&node.outputs[0])?,
+                    kh: k[0] as u32,
+                    kw: k[1] as u32,
+                    sh: s[0] as u32,
+                    sw: s[1] as u32,
+                    pad: [p[0] as u32, p[1] as u32, p[2] as u32, p[3] as u32],
+                    pad_c: node.attr_i("pad_c").unwrap_or(0) as u32,
                 });
             }
             "resize" => {
@@ -425,6 +448,7 @@ pub fn lower(g: &Graph, ctx: &Ctx, name: &str) -> Result<(SwModel, Vec<u8>), Con
             }
             SwOp::Gpool { input, .. }
             | SwOp::Avgpool { input, .. }
+            | SwOp::Maxpool { input, .. }
             | SwOp::Chcopy { input, .. }
             | SwOp::Act { input, .. } => vec![*input],
             SwOp::Concat { parts, .. } => parts.iter().map(|p| p.input).collect(),

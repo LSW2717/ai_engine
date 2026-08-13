@@ -27,9 +27,18 @@ fn act_tag(g: &Graph, idx: usize) -> Result<Option<&'static str>, ConvertError> 
             }
             Some("hsigmoid")
         }
-        "act" => n.attr_s("act").map(|s| match s {
-            "clamp01" => "clamp01",
-            _ => "none",
+        // ⚠ 알 수 없는 태그를 "none"으로 접으면 활성화가 조용히 증발한다
+        // (relu6가 실제로 그렇게 사라져 hand_landmarks 출력이 1e9까지 폭주했다).
+        // 모르는 태그는 융합하지 않고 standalone으로 남긴다.
+        "act" => n.attr_s("act").and_then(|s| match s {
+            "clamp01" => Some("clamp01"),
+            "relu6" => Some("relu6"),
+            "relu" => Some("relu"),
+            "sigmoid" => Some("sigmoid"),
+            "tanh" => Some("tanh"),
+            "hswish" => Some("hswish"),
+            "hsigmoid" => Some("hsigmoid"),
+            _ => None,
         }),
         _ => None,
     })

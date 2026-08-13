@@ -8,6 +8,8 @@ use ai_core::ops::{BinaryOp, Conv2d};
 use ai_core::Activation;
 use ai_gpu::kernel::KernelSpec;
 use ai_gpu::kernels::avgpool::AvgPoolSpec;
+use ai_gpu::kernels::flatten::FlattenSpec;
+use ai_gpu::kernels::maxpool::MaxPoolSpec;
 use ai_gpu::kernels::channel_gather::{ChannelGatherSpec, GatherPart};
 use ai_gpu::kernels::common::source::SrcView;
 use ai_gpu::kernels::conv_dw::ConvDwSpec;
@@ -292,6 +294,29 @@ pub fn lower_op(
                 writes: vec![map(*out)],
             }
         }
+        SwOp::Maxpool { input, out, kh, kw, sh, sw: swid, pad, pad_c } => {
+            let (ih, iw, c) = tdesc(sw, *input);
+            let spec = MaxPoolSpec {
+                ih,
+                iw,
+                c,
+                k: *kh,
+                s: *sh,
+                pad: *pad,
+                pad_c: *pad_c,
+                dt,
+            };
+            debug_assert_eq!(kh, kw);
+            debug_assert_eq!(sh, swid);
+            LoweredOp {
+                label: format!("maxpool k{kh}"),
+                spec: Box::new(spec),
+                bindings: vec![RtBinding::Tensor(map(*input)), RtBinding::Tensor(map(*out))],
+                params: [0; 16],
+                reads: vec![map(*input)],
+                writes: vec![map(*out)],
+            }
+        }
         SwOp::Resize { input, out, srcs, oh, ow, mode } => {
             let (ih, iw, _) = tdesc(sw, *input);
             let (_, _, c_out) = tdesc(sw, *out);
@@ -349,6 +374,22 @@ pub fn lower_op(
         }
         SwOp::Chcopy { input, out, src_c, n } => {
             let (h, w, in_c) = tdesc(sw, *input);
+            let (_, _, out_c) = tdesc(sw, *out);
+            if out_c != *n {
+                // flatten 실체화: (px,c) → (1,1,px*c). C4 레인 재배치 필요
+                // (reshape canon 산물 — src_c는 항상 0)
+                debug_assert_eq!(*src_c, 0);
+                debug_assert_eq!(out_c, h * w * in_c);
+                let spec = FlattenSpec { px: h * w, c_in: in_c, dt };
+                return Ok(LoweredOp {
+                    label: format!("flatten {}x{}c{}", h, w, in_c),
+                    spec: Box::new(spec),
+                    bindings: vec![RtBinding::Tensor(map(*input)), RtBinding::Tensor(map(*out))],
+                    params: [0; 16],
+                    reads: vec![map(*input)],
+                    writes: vec![map(*out)],
+                });
+            }
             let spec = ChannelGatherSpec {
                 px: h * w,
                 c_out: *n,

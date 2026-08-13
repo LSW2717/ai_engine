@@ -1,17 +1,29 @@
 //! 형태 연산 — Concat(채널 연결)·Chcopy(채널 슬라이스 실체화).
 //! 둘 다 뷰 → 밀집 복사가 전부다.
 
+use crate::simd::F32x4;
 use crate::view::View;
 
 /// 뷰를 밀집 out의 채널 구간 [c_off_out, c_off_out+view.c)에 복사.
 /// Concat = 파트마다 이 함수, Chcopy·alias 실체화 = c_off_out 0으로 한 번.
+/// 픽셀당 c가 작아(수십) copy_from_slice의 memcpy 호출 오버헤드가 지배한다 —
+/// 벡터 루프 + 스칼라 꼬리가 wasm에서 1.5배 빠르다.
 pub fn copy_view_into(view: View, px: usize, out: &mut [f32], out_stride: usize, c_off_out: usize) {
     debug_assert!(c_off_out + view.c <= out_stride);
     debug_assert!(out.len() >= px * out_stride);
+    let c = view.c;
+    let cv = c / 4 * 4;
     for p in 0..px {
         let b = view.base(p);
-        out[p * out_stride + c_off_out..p * out_stride + c_off_out + view.c]
-            .copy_from_slice(&view.data[b..b + view.c]);
+        let o = p * out_stride + c_off_out;
+        let mut cc = 0usize;
+        while cc < cv {
+            F32x4::load(view.data, b + cc).store(out, o + cc);
+            cc += 4;
+        }
+        for ch in cv..c {
+            out[o + ch] = view.data[b + ch];
+        }
     }
 }
 

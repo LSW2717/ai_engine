@@ -24,6 +24,16 @@ mod imp {
             debug_assert!(i + 4 <= s.len());
             unsafe { Self(vld1q_f32(s.as_ptr().add(i))) }
         }
+        /// 스칼라 1개를 로드하며 4레인 브로드캐스트 (ld1r — 로드+splat 1명령)
+        #[inline(always)]
+        pub fn load_splat(s: &[f32], i: usize) -> Self {
+            debug_assert!(i < s.len());
+            unsafe { Self(vld1q_dup_f32(s.as_ptr().add(i))) }
+        }
+        #[inline(always)]
+        pub fn from_array(a: [f32; 4]) -> Self {
+            unsafe { Self(vld1q_f32(a.as_ptr())) }
+        }
         #[inline(always)]
         pub fn store(self, s: &mut [f32], i: usize) {
             debug_assert!(i + 4 <= s.len());
@@ -33,6 +43,12 @@ mod imp {
         #[inline(always)]
         pub fn fma(self, a: Self, b: Self) -> Self {
             unsafe { Self(vfmaq_f32(self.0, a.0, b.0)) }
+        }
+        /// self + w * a[L] — lane 브로드캐스트 fma (fmla by element 1명령).
+        /// A 벡터 로드 1번이 splat 로드 4번을 대체한다 (XNNPACK gemm 구조).
+        #[inline(always)]
+        pub fn fma_lane<const L: i32>(self, a: Self, w: Self) -> Self {
+            unsafe { Self(vfmaq_laneq_f32::<L>(self.0, w.0, a.0)) }
         }
         #[inline(always)]
         pub fn add(self, o: Self) -> Self {
@@ -60,6 +76,11 @@ mod imp {
         pub fn sum(self) -> f32 {
             unsafe { vaddvq_f32(self.0) }
         }
+        /// [self0, self1, o0, o1] — 하위 2레인 결합 (c=2 픽셀 페어 패킹용)
+        #[inline(always)]
+        pub fn low2_concat(self, o: Self) -> Self {
+            unsafe { Self(vcombine_f32(vget_low_f32(self.0), vget_low_f32(o.0))) }
+        }
     }
 }
 
@@ -80,15 +101,40 @@ mod imp {
             debug_assert!(i + 4 <= s.len());
             unsafe { Self(v128_load(s.as_ptr().add(i) as *const v128)) }
         }
+        /// 스칼라 1개를 로드하며 4레인 브로드캐스트 (v128.load32_splat 1명령)
+        #[inline(always)]
+        pub fn load_splat(s: &[f32], i: usize) -> Self {
+            debug_assert!(i < s.len());
+            unsafe { Self(v128_load32_splat(s.as_ptr().add(i) as *const u32)) }
+        }
+        #[inline(always)]
+        pub fn from_array(a: [f32; 4]) -> Self {
+            unsafe { Self(v128_load(a.as_ptr() as *const v128)) }
+        }
         #[inline(always)]
         pub fn store(self, s: &mut [f32], i: usize) {
             debug_assert!(i + 4 <= s.len());
             unsafe { v128_store(s.as_mut_ptr().add(i) as *mut v128, self.0) }
         }
-        /// self + a*b — SIMD128에는 fma가 없어 mul+add (relaxed-simd 비의존)
+        /// self + a*b. 기본 SIMD128은 mul+add 2명령; `+relaxed-simd` 빌드는
+        /// relaxed_madd 1명령 (V8이 ARM FMLA로 내림 — wasm 격차의 절반이 이것).
+        /// Safari는 relaxed-simd 미지원이라 두 빌드를 만들고 로더가 고른다.
         #[inline(always)]
         pub fn fma(self, a: Self, b: Self) -> Self {
-            Self(f32x4_add(self.0, f32x4_mul(a.0, b.0)))
+            #[cfg(target_feature = "relaxed-simd")]
+            {
+                Self(f32x4_relaxed_madd(a.0, b.0, self.0))
+            }
+            #[cfg(not(target_feature = "relaxed-simd"))]
+            {
+                Self(f32x4_add(self.0, f32x4_mul(a.0, b.0)))
+            }
+        }
+        /// self + w * a[L] — shuffle 브로드캐스트(reg-reg, 로드포트 안 씀) + fma
+        #[inline(always)]
+        pub fn fma_lane<const L: usize>(self, a: Self, w: Self) -> Self {
+            let s = i32x4_shuffle::<L, L, L, L>(a.0, a.0);
+            self.fma(Self(s), w)
         }
         #[inline(always)]
         pub fn add(self, o: Self) -> Self {
@@ -117,6 +163,11 @@ mod imp {
             let a = self.to_array();
             (a[0] + a[1]) + (a[2] + a[3])
         }
+        /// [self0, self1, o0, o1] — 하위 2레인 결합 (c=2 픽셀 페어 패킹용)
+        #[inline(always)]
+        pub fn low2_concat(self, o: Self) -> Self {
+            Self(i32x4_shuffle::<0, 1, 4, 5>(self.0, o.0))
+        }
     }
 }
 
@@ -139,6 +190,14 @@ mod imp {
             Self([s[i], s[i + 1], s[i + 2], s[i + 3]])
         }
         #[inline(always)]
+        pub fn load_splat(s: &[f32], i: usize) -> Self {
+            Self::splat(s[i])
+        }
+        #[inline(always)]
+        pub fn from_array(a: [f32; 4]) -> Self {
+            Self(a)
+        }
+        #[inline(always)]
         pub fn store(self, s: &mut [f32], i: usize) {
             s[i..i + 4].copy_from_slice(&self.0);
         }
@@ -149,6 +208,10 @@ mod imp {
                 o[l] += a.0[l] * b.0[l];
             }
             Self(o)
+        }
+        #[inline(always)]
+        pub fn fma_lane<const L: usize>(self, a: Self, w: Self) -> Self {
+            self.fma(Self::splat(a.0[L]), w)
         }
         #[inline(always)]
         pub fn add(self, o: Self) -> Self {
@@ -189,6 +252,10 @@ mod imp {
         #[inline(always)]
         pub fn sum(self) -> f32 {
             (self.0[0] + self.0[1]) + (self.0[2] + self.0[3])
+        }
+        #[inline(always)]
+        pub fn low2_concat(self, o: Self) -> Self {
+            Self([self.0[0], self.0[1], o.0[0], o.0[1]])
         }
     }
 }

@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>MediaPipe 계열 모델 벤치 — ai-cpu vs ORT wasm vs MediaPipe</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: ui-sans-serif, system-ui, -apple-system, "Apple SD Gothic Neo", sans-serif;
+    max-width: 1000px; margin: 1.2rem auto; padding: 0 1rem; line-height: 1.5; }
+  h1 { font-size: 1.2rem; margin: 0 0 .25rem; }
+  .note { font-size: .85rem; opacity: .75; margin: 0 0 .9rem; }
+  table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: .35rem .6rem; border-bottom: 1px solid #8883; }
+  td.num { text-align: right; }
+  #status { padding: .5rem .8rem; border-radius: 8px; background: rgba(88,166,255,.12);
+    margin-bottom: .8rem; font-size: .9rem; }
+</style>
+</head>
+<body>
+  <h1>MediaPipe 계열 5모델 — 같은 그래프, 세 런타임 (1스레드 CPU)</h1>
+  <p class="note">시드 난수 입력, 워밍업 후 N프레임 p50. ai-cpu(.sw)와 ORT wasm은
+    <b>같은 onnx 계보의 fp32</b>라 정확도는 이미 네이티브 게이트(1e-4)에서 증명 —
+    여기는 속도만. MediaPipe 행은 tasks-vision(CDN, delegate CPU)의 detect 전체
+    (전처리+그래프 로직 포함 — 모델 단품보다 큰 범위)라 참고선이다.</p>
+  <div id="status">로딩 중…</div>
+  <table>
+    <thead><tr><th>모델</th><th class="num">ai-cpu (wasm)</th><th class="num">ai-gpu (WebGPU)</th><th class="num">ORT wasm 1T</th><th class="num">CPU 배율</th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <script type="module" src="./models-bench.js"></script>
+</body>
+</html>

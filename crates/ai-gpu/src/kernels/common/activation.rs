@@ -25,11 +25,12 @@ pub fn act_expr(act: Activation, var: &str) -> String {
             format!("clamp({var} / 6.0 + 0.5, vec4f(0.0), vec4f(1.0))")
         }
         Activation::Clamp01 => format!("clamp({var}, vec4f(0.0), vec4f(1.0))"),
+        Activation::Relu6 => format!("clamp({var}, vec4f(0.0), vec4f(6.0))"),
     }
 }
 
 /// 캐시 키·테스트 그리드용 전체 활성화 목록
-pub const ALL: [Activation; 7] = [
+pub const ALL: [Activation; 8] = [
     Activation::None,
     Activation::Relu,
     Activation::Sigmoid,
@@ -37,4 +38,5 @@ pub const ALL: [Activation; 7] = [
     Activation::Hardswish,
     Activation::Hardsigmoid,
     Activation::Clamp01,
+    Activation::Relu6,
 ];

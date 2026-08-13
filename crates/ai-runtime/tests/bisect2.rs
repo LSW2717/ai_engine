@@ -56,6 +56,7 @@ fn bisect_rvm_frame2() {
             | ai_core::format::SwOp::Binary { out, .. }
             | ai_core::format::SwOp::Gpool { out, .. }
             | ai_core::format::SwOp::Avgpool { out, .. }
+            | ai_core::format::SwOp::Maxpool { out, .. }
             | ai_core::format::SwOp::Resize { out, .. }
             | ai_core::format::SwOp::Concat { out, .. }
             | ai_core::format::SwOp::Chcopy { out, .. }

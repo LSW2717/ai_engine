@@ -3,6 +3,7 @@
 //! 내부(비경계) Transpose는 미지원.
 
 use crate::error::ConvertError;
+use crate::ir::graph::Attr;
 use crate::ir::Graph;
 use crate::passes::{Ctx, PassReport};
 
@@ -26,6 +27,18 @@ pub fn run(g: &mut Graph, _ctx: &Ctx) -> Result<PassReport, ConvertError> {
             report.rewrites += 1;
         } else if perm == [0, 2, 3, 1] && g.is_output(&out) {
             g.nhwc_outputs.push(out.clone());
+            g.make_alias(idx, &src, &out);
+            report.rewrites += 1;
+        } else if perm == [0, 2, 3, 1] && {
+            let cons = g.consumers(&out);
+            !cons.is_empty() && cons.iter().all(|&ci| g.nodes[ci].op == "Reshape")
+        } {
+            // tf2onnx 디텍터 헤드: NCHW→NHWC 뒤 flatten-Reshape. 물리 레이아웃이
+            // 이미 NHWC라 transpose는 항등 — 소비 Reshape에 flat_ok를 마킹해
+            // reshape 패스가 안전하게 chcopy로 실체화하게 한다.
+            for ci in g.consumers(&out) {
+                g.nodes[ci].attrs.insert("flat_ok".into(), Attr::I(1));
+            }
             g.make_alias(idx, &src, &out);
             report.rewrites += 1;
         } else {

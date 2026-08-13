@@ -6,6 +6,8 @@ pub enum BinaryOp {
     Add,
     Sub,
     Mul,
+    /// b는 채널별 slope — MediaPipe 랜드마크 계열 (a>0 ? a : a*b)
+    Prelu,
 }
 
 impl BinaryOp {
@@ -14,6 +16,13 @@ impl BinaryOp {
             BinaryOp::Add => a + b,
             BinaryOp::Sub => a - b,
             BinaryOp::Mul => a * b,
+            BinaryOp::Prelu => {
+                if a > 0.0 {
+                    a
+                } else {
+                    a * b
+                }
+            }
         }
     }
 
@@ -22,15 +31,20 @@ impl BinaryOp {
             BinaryOp::Add => "add",
             BinaryOp::Sub => "sub",
             BinaryOp::Mul => "mul",
+            BinaryOp::Prelu => "prelu",
         }
     }
 
-    /// WGSL 이항 연산자
-    pub fn wgsl_op(self) -> &'static str {
+    /// WGSL 표현식 — a/b는 vec4f로 캐스팅된 조각 (infix가 아닌 op이 있어 함수형)
+    pub fn wgsl_expr(self, a: &str, b: &str) -> String {
         match self {
-            BinaryOp::Add => "+",
-            BinaryOp::Sub => "-",
-            BinaryOp::Mul => "*",
+            BinaryOp::Add => format!("{a} + {b}"),
+            BinaryOp::Sub => format!("{a} - {b}"),
+            BinaryOp::Mul => format!("{a} * {b}"),
+            // max(a,0) + b*min(a,0) — 분기 없는 prelu
+            BinaryOp::Prelu => {
+                format!("max({a}, vec4f(0.0)) + {b} * min({a}, vec4f(0.0))")
+            }
         }
     }
 }

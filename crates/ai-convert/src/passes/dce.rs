@@ -19,7 +19,14 @@ pub fn run(g: &mut Graph, _ctx: &Ctx) -> Result<PassReport, ConvertError> {
     while let Some(t) = live_tensors.pop() {
         if let Some(p) = g.producer(&t) {
             if live_nodes.insert(p) {
-                for i in g.nodes[p].inputs.clone() {
+                let mut reads: Vec<String> = g.nodes[p].inputs.clone();
+                // res 에필로그(fuse_residual)는 inputs가 아니라 attr로 읽는다 —
+                // 추적 안 하면 res 유일 소비자인 생산자가 여기서 죽는다
+                // (facelm의 maxpool 전멸로 발견).
+                if let Some(r) = g.nodes[p].attr_s("res") {
+                    reads.push(r.to_string());
+                }
+                for i in reads {
                     let r = g.resolve_alias(&i).to_string();
                     if seen.insert(r.clone()) {
                         live_tensors.push(r);

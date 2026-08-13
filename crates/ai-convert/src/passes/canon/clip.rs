@@ -20,17 +20,18 @@ pub fn run(g: &mut Graph, _ctx: &Ctx) -> Result<PassReport, ConvertError> {
         };
         let (min, max) = (scalar(1, "min"), scalar(2, "max"));
         match (min, max) {
-            (Some(lo), Some(hi)) if lo == 0.0 && hi == 1.0 => {
+            (Some(lo), Some(hi)) if lo == 0.0 && (hi == 1.0 || hi == 6.0) => {
+                let tag = if hi == 1.0 { "clamp01" } else { "relu6" };
                 let n = &mut g.nodes[idx];
                 n.op = "act".into();
                 n.inputs.truncate(1);
                 n.attrs.clear();
-                n.attrs.insert("act".into(), Attr::S("clamp01".into()));
+                n.attrs.insert("act".into(), Attr::S(tag.into()));
                 report.rewrites += 1;
             }
             other => {
                 return Err(ConvertError::Unsupported(vec![format!(
-                    "Clip 경계 {other:?} ({}) — clamp01만 지원 (Relu6 미지원)",
+                    "Clip 경계 {other:?} ({}) — clamp01/relu6만 지원",
                     node.name
                 )]))
             }
