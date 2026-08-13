@@ -21,7 +21,7 @@ impl Compose {
             "video-compose",
             &src,
             target,
-            &[Bind::Tex, Bind::Tex, Bind::Tex, Bind::Tex, Bind::Sampler, Bind::Uniform],
+            &[Bind::Tex, Bind::Tex, Bind::Tex, Bind::Tex, Bind::Sampler, Bind::Uniform, Bind::Tex],
         );
         Compose { fs, params: ubo(ctx, "video-compose", 160) }
     }
@@ -33,6 +33,7 @@ impl Compose {
         st: &EffectsState,
         (fw, fh): (u32, u32),
         bg_dims: Option<(u32, u32)>,
+        use_fgr: bool,
     ) {
         let d = st.derived();
         let (mode, color) = match &st.background {
@@ -61,7 +62,7 @@ impl Compose {
         for v in [color[0], color[1], color[2], 1.0] {
             b.extend_from_slice(&v.to_le_bytes());
         }
-        for v in [sx, sy, (1.0 - sx) * 0.5, (1.0 - sy) * 0.5, d.light_wrapping, 0.0, 0.0, 0.0] {
+        for v in [sx, sy, (1.0 - sx) * 0.5, (1.0 - sy) * 0.5, d.light_wrapping, if use_fgr { 1.0 } else { 0.0 }, 0.0, 0.0] {
             b.extend_from_slice(&v.to_le_bytes());
         }
         // 스튜디오 조명: relight vec4 + lights 4×vec4 (2광원 × [pos/radius/int, color/target])

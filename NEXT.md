@@ -1,28 +1,54 @@
-# 다음 세션 시작점 (2026-08-13 마감)
+# 다음 세션 시작점 (2026-08-14 마감)
 
-## 5분 안에 상태 확인
+## 다음 작업 (우선순위 — 2026-08-14 정리)
 
-```sh
-cargo test --workspace --release        # 57개 스위트, 전부 ok 여야 한다
-make build-wasm                         # web/pkg 갱신 (+simd128, 725KB)
-node tools/run_web.mjs compare/index.html   # webgl2 vs 우리 (GPU 다른 앱 닫고)
-node tools/run_web.mjs demo/cpu-ab.html --camera   # R11 CPU 3자 A/B: ai-cpu ~6.8ms < tflite 6.9 / ort 11 (§2.5)
-node tools/run_web.mjs demo/face-ab.html   # face_detector 좌표 diff 게이트: MediaPipe 대비 ≤3px PASS + 3모델 상주 스모크 (§4)
-node tools/profile_web.mjs 'demo/cpu-ab.html?only=ours' --ops   # wasm 스텝별 예산표
-# per-op 예산표 (커널 만졌으면 여기부터):
-AI_ONNX=$(pwd)/models/segm_mnv4s050_s2_160x288_nhwc.onnx \
-  cargo test --release -p ai-cpu --test prof_cpu -- --ignored --nocapture
-# ai-cpu 정확도 (R11) — AI_ONNX는 절대경로 (test CWD가 크레이트 루트):
-AI_ONNX=$(pwd)/models/segm_mnv4s050_s2_160x288_nhwc.onnx \
-  cargo test --release -p ai-cpu --test oracle_real -- --ignored --nocapture   # max_err ~1.4e-5
-```
+**A. P1 마무리 — VideoPipeline 완성** (지금 여기)
+1. **웹 파이프라인 픽셀 diff 게이트** — 같은 프레임+같은 마스크를 v-ai GLSL 스택과
+   우리 WGSL 스택에 넣어 채널별 diff. "상수가 같다"의 증명이 아직 없다 —
+   이게 P1의 완료 조건이다.
+2. **프레이밍(인물 중앙화)** — GPU bbox 리덕션(마스크 해상도 컴퓨트 → 16B 비동기
+   리드백 링) + 순수 Rust 활강(데드밴드 0.045/0.055 · 2s 지속이탈 커밋 · EMA 0.5s ·
+   슬루 0.35/s — 웹 상수) + compose person-crop(이미지 배경은 인물만, 그 외 전체).
+   studio 토글. ⚠ 리드백은 프레임당 16B뿐 — 저사양 원칙 유지.
+3. **mirror/degree + 이미지배경 자체 블러** — compose 확장 (웹 파리티 항목 잔여분).
+4. **studio HUD 정직화** — 지금은 제출 벽시계(허수). rAF 간격 실측 + 5초마다
+   동기화 1회 샘플로 교체.
 
-기대: ORT 게이트 `fp32 max_err <5e-5 / 가중치f16 6e-4 / 전경 18.5%`,
-compare에서 `webgl2 ~1.57ms / ai_engine 가중치fp16 ~2.01ms`.
+**B. P2 티어 — 저사양이 제품 타깃 (사용자 최우선 강조, target-hardware-lowend)**
+5. **B 티어(CPU 추론 + GPU 합성)**: ai-cpu 마스크를 write_texture로 인제스트
+   (스테이징 진입점 이미 있음 — 37KB/프레임 업로드뿐) + **p90>66ms 2윈도우 강등**
+   (승격 없음) + 효과별 최소 티어 게이팅. studio에 티어 강제 토글+현재 티어 표시.
+   완료 기준: GPU 추론을 인위로 막아도 배경·블러·조명이 산다.
+
+**C. P3 얼굴 스택 — 아바타(표정 포함 인물 교체)의 전제**
+6. **blendshape 모델 개통** — face_blendshapes.tflite 변환+게이트. 아바타
+   eyeBlink/jawOpen과 blink 판정이 소비 (필수 확정, INTEGRATION.md §1.6).
+7. **Horn 피팅 이관 + Expression Stream API** — FaceResult를 {points 478,
+   blendshapes 52, pose(quat·t·scale)}로. 웹 face-3d.ts/모바일 items3d와 같은
+   FIT_PTS 15점·파워이터레이션. studio 3D 아이템이 첫 소비자(지금은 롤만 반영).
+8. **FaceTask 입력 GPU화** — 레터박스·회전 크롭을 커널로 (지금 getImageData
+   CPU 픽셀 경유 — 저사양 필수 항목).
+9. 터치업/메이크업 기하 이관 (vcxrust_ai가 이미 Rust — features/face/로).
+10. OneEuroFilter VIDEO 파리티 (filter 파라미터 미확정 주석 해소).
+
+**D. P4 웹 연결**
+11. **VbEngine 3함수** (config/destroy/processWorkerFrame) ai-wasm 구현 —
+    v-ai 4번째 티어로 A/B. 계약: 1프레임 직렬화 · passthrough=입력 비트맵
+    제로카피 반환 · **destroy는 모델 유지**(웜 워커). 착수 전 사용자 확인(v-ai 연결 보류 중).
+
+**E. 이후 순서**: P5 아바타 replace 합성 모드 → hand/gaze 태스크(웹 크롭 규약
+주의 — 게이즈는 비회전 bbox+종횡비 무시) → ai-ffi(vcxrust_ai 표면 재현, ncnn 제거
+= 모바일 최대 성능 카드) → 오디오 #6(STFT는 vcxrust_ai에서 이관).
+
+**대기/보류 결정 (건드리기 전 확인)**
+- RVM fgr 해상도 한계(모델 해상도로 소프트) → mnv4-RVM 교체 때 입력 해상도와 함께 결정
+- 3D 렌더 파리티(three.js vs items3d WGSL) — 사용자가 "나중에" 확정
+- webgl2 성능 추격(1.28배) — mnv4-RVM 교체 후 재개 (기확정)
+- v-ai 실연결 — 사용자가 보류, 착수 전 확인 필수
 
 ---
 
-## 바로 다음 — v-ai/vcxrust_ai 전체 정찰 완료 (2026-08-13), 통합 설계 확정 대기
+## P1 진행 기록 (이력·함정 — 새 세션은 위 "다음 작업"만 보면 됨)
 
 **`INTEGRATION.md`가 통합 설계의 단일 진실** (정찰 지도는 메모리 `vai-runtime-map`).
 핵심 발견: 웹·모바일은 "다른 구현"이 아니라 **같은 알고리즘의 TS판/Rust판**
@@ -58,6 +84,35 @@ refined 마스크를 소비. ② **스튜디오 조명**(relight): compose.wgsl�
 (target person/bg/all, 방사감쇠², 소프트 롤오프) + EffectsPatch studioLight
 (hex 색, null=해제) + studio 조명 토글 — 스크린샷 검증(배경 냉광·인물 온광 확인).
 Fullscreen::new_entry(한 wgsl 다중 fs 엔트리) 헬퍼 추가.
+**마스크 전멸 사고 수리 (2026-08-14) — 필독**: 새 GPU 전처리에 f16 변형을 얹으며
+①f32 파이프라인의 auto-layout으로 만든 바인드그룹을 f16 파이프라인에 재사용 —
+**auto-layout은 파이프라인마다 별개 정체성이라 비호환 → 컴퓨트 패스 조용히 무효
+→ 입력 버퍼에 아무것도 안 써서 마스크 전멸** ②f16 파이프라인 생성을 adapter
+caps로 게이트 — 디바이스 기능(SHADER_F16) 미요청 기기에선 생성만으로 검증 에러.
+수리: preprocess에 **명시적 공유 레이아웃** + device.features() 게이트.
+게이트 신설 `ai-tasks/tests/vb_pipeline.rs`: 0입력→pha 0 확인 후 파이프라인이
+실프레임으로 pha 0.185·합성 전경 18.5%를 만들어야 PASS — **"크래시 없음" 스모크가
+마스크 전멸을 PASS시킨 구멍을 막는 진짜 게이트**. 교훈: 파이프라인 변형 추가 시
+레이아웃은 반드시 명시적 공유. **studio는 RVM 고정** (사용자 확정 — R11 셀렉터
+삭제, R11은 P2 CPU 폴백 티어 전용).
+
+**RVM 매팅 합성 정식 연결 (2026-08-14, 사용자 지시 "정석대로")**: compose가
+**fgr×α + bg×(1−α)** 교과서 식으로 합성 — fgr(모델이 복원한 순수 전경색)을 전면
+사용, 배경색 오염(머리카락에 옛 배경이 배는 것) 원리적 제거. 스필 억제/엣지
+다크닝은 매팅 모드에서도 **파라미터로 유지** (사용자 지적 — 정석은 합성식이지
+노브 차단이 아니다; 잔여 스필은 실제 조명 반사·fgr 오차로도 남는다). fgr은 c==3
+출력 자동 탐색(fgr_output, 256정렬 확인), 스테이징은 dtype 규약 동일,
+pipe.uses_fgr() 게이트 단언 포함. ⚠ 한계 기록: fgr은 모델 해상도(256×144)라
+카메라가 더 크면 인물이 모델 해상도로 소프트해짐 — 원리적 해결은 RVM guided
+filter 풀해상 변형 또는 입력 해상도 상향(mnv4-RVM 교체 때 결정).
+
+**RVM 개통 (2026-08-14)**: studio에 RVM(fp16)이 안 돌던 원인 3개 수리 — ① 마스크
+출력을 outputs[0](RVM은 fgr) 하드코딩 → **c==1(pha)>c==2(로짓) 자동 선택**
+(pipeline.rs mask_output) ② Logits2 모드 하드코딩 → out c로 자동(1=Alpha)
+③ **fp16 모델**: 전처리가 f32 가정 → dt.vec4_bytes()로 f16 스토리지 변형
+(preprocess enable f16) + 스테이징 rgba16float/bpr 분기. studio에 세그 모델
+셀렉트(R11/RVM) + studio_invalidate(세션 교체 시 바인드그룹 폐기 필수 — 안 하면
+이전 모델 버퍼를 문 채 조용히 오동작). ?model=rvm 헤드리스 PASS.
 **P1 잔여**: 프레이밍(GPU bbox 리덕션), mirror/degree, 이미지배경 blur,
 **웹 파이프라인 픽셀 diff 게이트**, HUD 프레임타임 동기화(지금은 제출 벽시계 — 허수). 3D 렌더 파리티(three.js vs
 WGSL 차이)는 사용자가 보류 확정.

@@ -22,7 +22,7 @@ struct P {
     bg_scale: vec2f,     // 이미지 cover 크롭
     bg_offset: vec2f,
     light_wrap: f32,
-    _pad0: f32,
+    use_fgr: f32,
     _pad1: f32,
     _pad2: f32,
     // 스튜디오 조명 (v-ai RELIGHT 등가): x=enabled, y=ambient, z=aspect
@@ -31,6 +31,8 @@ struct P {
     lights: array<vec4f, 4>,
 }
 @group(0) @binding(5) var<uniform> p: P;
+// RVM 전경색 (매팅) — use_fgr=0이면 미사용 (프레임 뷰가 더미로 바인딩됨)
+@group(0) @binding(6) var fgr_tex: texture_2d<f32>;
 
 fn apply_relight(base: vec3f, pm: f32, uv: vec2f) -> vec3f {
     if (p.relight.x < 0.5) { return base; }
@@ -70,7 +72,12 @@ fn gray(c: vec3f) -> f32 {
         bg = textureSampleLevel(bg_image, samp, in.uv * p.bg_scale + p.bg_offset, 0.0).rgb;
     }
 
+    // 정석 매팅 합성 (RVM): 전경 = fgr — 원래 배경색이 섞인 카메라 픽셀 대신
+    // 모델이 복원한 순수 전경색을 쓴다. com = fgr×α + bg×(1−α).
     var fg = color;
+    if (p.use_fgr > 0.5) {
+        fg = textureSampleLevel(fgr_tex, samp, in.uv, 0.0).rgb;
+    }
     if (p.bg_mode == 3u) {
         // light wrapping — 배경 빛이 인물 윤곽에 감기는 효과 (screen 블렌드)
         let lwm = 1.0 - max(0.0, raw - p.cov.y) / (1.0 - p.cov.y);
@@ -79,6 +86,9 @@ fn gray(c: vec3f) -> f32 {
     }
 
     let pm = smoothstep(p.cov.x, p.cov.y, raw);
+    // 스필 억제/엣지 다크닝은 매팅 모드에서도 살아있는 조정 파라미터다 —
+    // fgr가 오염을 원리적으로 줄이지만 잔여 스필(실제 조명 반사·fgr 추정 오차)은
+    // 남는다. 끄고 싶으면 파라미터를 0으로 (코드로 막지 않는다).
     let edge = clamp(1.0 - abs(pm * 2.0 - 1.0), 0.0, 1.0);
     fg = mix(fg, vec3f(gray(fg)), edge * clamp(p.spill, 0.0, 1.0));
     bg = mix(bg, vec3f(gray(bg)), clamp(p.grayscale, 0.0, 1.0)) * p.brightness;

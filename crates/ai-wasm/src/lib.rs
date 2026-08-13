@@ -903,6 +903,18 @@ pub fn studio_bg_image(rgba: &[u8], w: u32, h: u32) -> Result<(), JsValue> {
     })
 }
 
+/// 세그 세션 교체 후 필수 — 파이프라인 바인드그룹이 이전 모델 버퍼를 물고 있다
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn studio_invalidate() -> Result<(), JsValue> {
+    STUDIO.with(|c| {
+        if let Some(s) = c.borrow_mut().as_mut() {
+            s.pipeline.invalidate();
+        }
+        Ok(())
+    })
+}
+
 /// 프레임 1장: 소스 캔버스 → GPU 전처리 → 세그 추론 → 마스크 스택 → 캔버스.
 /// seg = GPU 세션 핸들. CPU 픽셀 왕복 0 — JS는 캔버스만 넘긴다.
 #[cfg(target_arch = "wasm32")]

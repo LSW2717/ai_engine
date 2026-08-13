@@ -76,7 +76,7 @@ impl Studio {
         };
         let view = frame.texture.create_view(&Default::default());
         self.pipeline
-            .process_gpu(ctx, seg, fw, fh, &view, false)
+            .process_gpu(ctx, seg, fw, fh, &view)
             .await
             .map_err(|e| e.to_string())?;
         drop(frame); // present

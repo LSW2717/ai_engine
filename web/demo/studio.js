@@ -191,7 +191,7 @@ async function main() {
   if (!navigator.gpu) throw new Error('WebGPU 미지원');
   await aiMod.init_engine();
   const bytes = new Uint8Array(
-    await (await fetch('../models/segm_r11_160x288.sw')).arrayBuffer()
+    await (await fetch('../models/rvm_256x144.sw')).arrayBuffer()
   );
   const seg = (await aiMod.load_model_h(bytes)).handle;
   aiMod.studio_attach($('out'));
