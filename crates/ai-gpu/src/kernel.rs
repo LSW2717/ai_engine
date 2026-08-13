@@ -44,6 +44,7 @@ pub struct CompiledKernel {
 /// 실행 준비가 끝난 op 하나. Phase 2 executor는 그래프를 `Vec<OpDispatch>`로 lowering한다.
 /// bind_group이 Arc인 이유: 상태 ping-pong의 even/odd 디스패치 리스트 2벌이
 /// 상태 무관 op의 bind group을 공유하기 위해서다.
+#[derive(Clone)]
 pub struct OpDispatch {
     pub kernel: Arc<CompiledKernel>,
     pub bind_group: Arc<wgpu::BindGroup>,

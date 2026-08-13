@@ -36,6 +36,12 @@
     <b>추론</b> = 3초마다 각 엔진을 단독으로 N프레임 돌려 마지막에 한 번만 동기화해 잰
     실제 GPU 시간(양쪽 동일 방법론). <b>제출</b> = CPU가 명령을 다 낸 시점이라
     엔진 비교에 쓰면 안 되는 값이다.</p>
+  <p class="note">⚠ <b>사파리 주의</b>: WebGL2와 WebGPU가 같은 Metal 큐를 쓴다. 우리
+    <code>wait_idle</code>은 디바이스 전체가 빌 때까지 기다리므로 옆에서 도는 webgl2 뒤에
+    줄을 서고, 사파리의 <code>gl.finish()</code>는 GPU 완료까지 막아주지 않는다.
+    실측: 둘 다 돌리면 우리 값이 2.7 → 6.1ms로 부풀었고 <code>?only=ours</code>로는
+    2.7ms로 평평했다. 그래서 측정 전에 실제 시간으로 큐를 비운다.
+    한쪽만 보려면 <code>?only=ours</code> / <code>?only=webgl2</code>.</p>
 
   <div id="status">대기 — “시작”을 누르면 카메라 권한을 요청합니다.</div>
 

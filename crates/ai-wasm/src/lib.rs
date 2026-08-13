@@ -19,7 +19,7 @@ use wasm_bindgen::prelude::*;
 
 thread_local! {
     static ENGINE: RefCell<Option<Rc<GpuContext>>> = const { RefCell::new(None) };
-    static MODEL: RefCell<Option<ai_runtime::Model>> = const { RefCell::new(None) };
+    static MODEL: RefCell<Option<ai_tasks::Segmenter>> = const { RefCell::new(None) };
 }
 
 #[wasm_bindgen(start)]
@@ -109,13 +109,29 @@ struct JsModelBench {
     output_names: Vec<String>,
 }
 
+/// 프레임타임을 **CPU 인코딩**과 **GPU 대기**로 쪼갠 결과.
+///
+/// 우리는 프레임당 116 디스패치를 wasm↔JS 경계로 넘긴다(set_pipeline +
+/// set_bind_group + dispatch = ~350 JS 호출). webgl2는 순수 JS 80 draw다.
+/// "시간이 갈수록 우리만 느려진다"가 GPU 쪽인지 이 경계 쪽인지 합계로는 못 가른다.
+#[derive(serde::Serialize)]
+struct JsBenchSplit {
+    /// 총 시간 / 프레임 (기존 bench_current와 같은 정의)
+    ms_per_frame: f64,
+    /// 제출까지 걸린 시간 / 프레임 = CPU 인코딩 + wasm↔JS 경계
+    submit_ms: f64,
+    /// 마지막 제출 후 GPU가 다 끝날 때까지 / 프레임
+    wait_ms: f64,
+}
+
 /// .sw 모델 로드 (fetch한 바이트 전달)
 #[wasm_bindgen]
 pub async fn load_model(bytes: Vec<u8>) -> Result<JsValue, JsValue> {
     let ctx = engine()?;
-    let model = ai_runtime::Model::load(&ctx, &bytes)
+    let seg = ai_tasks::Segmenter::load(&ctx, &bytes)
         .await
         .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let model = seg.model();
     let report = JsModelReport {
         name: model.sw.name.clone(),
         ops: model.report.ops,
@@ -123,7 +139,7 @@ pub async fn load_model(bytes: Vec<u8>) -> Result<JsValue, JsValue> {
         arena_mb: model.report.arena_bytes as f64 / 1e6,
         weights_mb: model.report.weights_bytes as f64 / 1e6,
     };
-    MODEL.with(|m| *m.borrow_mut() = Some(model));
+    MODEL.with(|m| *m.borrow_mut() = Some(seg));
     serde_wasm_bindgen::to_value(&report).map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
@@ -131,43 +147,41 @@ pub async fn load_model(bytes: Vec<u8>) -> Result<JsValue, JsValue> {
 #[wasm_bindgen]
 pub async fn model_bench(frames: u32) -> Result<JsValue, JsValue> {
     let ctx = engine()?;
-    let mut model = MODEL
+    let mut seg = MODEL
         .with(|m| m.borrow_mut().take())
         .ok_or_else(|| JsValue::from_str("모델 미로드"))?;
 
     let result: Result<JsModelBench, JsValue> = async {
         // 첫 입력에 시드 데이터
-        let in_tid = model.sw.inputs[0];
-        let t = &model.sw.tensors[in_tid as usize];
-        let (name, elems) = (t.name.clone(), (t.h * t.w * t.c) as usize);
+        let t = &seg.model().sw.tensors[seg.model().sw.inputs[0] as usize];
+        let elems = (t.h * t.w * t.c) as usize;
         let input = ai_core::rng::XorShift32::new(7).vec_f32(elems);
-        model
-            .upload_input(&ctx, &name, &input)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        seg.upload(&ctx, &input).map_err(|e| JsValue::from_str(&e.to_string()))?;
 
         for _ in 0..3 {
-            model.infer(&ctx).await.map_err(|e| JsValue::from_str(&e.to_string()))?;
+            seg.infer(&ctx).await.map_err(|e| JsValue::from_str(&e.to_string()))?;
         }
         ai_gpu::readback::wait_idle(&ctx).await.map_err(|e| JsValue::from_str(&e))?;
 
         let t0 = web_time::Instant::now();
         for _ in 0..frames {
-            model.infer(&ctx).await.map_err(|e| JsValue::from_str(&e.to_string()))?;
+            seg.infer(&ctx).await.map_err(|e| JsValue::from_str(&e.to_string()))?;
         }
         ai_gpu::readback::wait_idle(&ctx).await.map_err(|e| JsValue::from_str(&e))?;
         let ms = t0.elapsed().as_secs_f64() * 1e3 / frames.max(1) as f64;
 
-        let output_names: Vec<String> = model
+        let output_names: Vec<String> = seg
+            .model()
             .sw
             .outputs
             .iter()
-            .map(|&o| model.sw.tensors[o as usize].name.clone())
+            .map(|&o| seg.model().sw.tensors[o as usize].name.clone())
             .collect();
         Ok(JsModelBench { ms_per_frame: ms, frames, output_names })
     }
     .await;
 
-    MODEL.with(|m| *m.borrow_mut() = Some(model));
+    MODEL.with(|m| *m.borrow_mut() = Some(seg));
     let bench = result?;
     serde_wasm_bindgen::to_value(&bench).map_err(|e| JsValue::from_str(&e.to_string()))
 }
@@ -181,12 +195,40 @@ struct JsFrameInfo {
     outputs: Vec<String>,
 }
 
+/// 프레임타임 분포 — 호스트의 **런타임 강등 판정 입력**.
+///
+/// 평균이 아니라 p90을 준다: 평균은 가끔 튀는 프레임을 감춘다.
+/// 강등 기준은 "프레임 예산"이 아니라 "마스크 갱신율 하한"으로 잡아야 한다 —
+/// 이 벽시계엔 GPU 큐 대기와 이벤트루프 대기가 섞이기 때문이다.
+#[wasm_bindgen]
+pub fn model_stats() -> Result<JsValue, JsValue> {
+    MODEL.with(|m| {
+        let b = m.borrow();
+        let s = b.as_ref().ok_or_else(|| JsValue::from_str("모델 미로드"))?.stats();
+        serde_wasm_bindgen::to_value(&JsStats {
+            frames: s.frames,
+            p50_ms: s.p50_ms,
+            p90_ms: s.p90_ms,
+            last_ms: s.last_ms,
+        })
+        .map_err(|e| JsValue::from_str(&e.to_string()))
+    })
+}
+
+#[derive(serde::Serialize)]
+struct JsStats {
+    frames: u32,
+    p50_ms: f32,
+    p90_ms: f32,
+    last_ms: f32,
+}
+
 /// 로드된 모델의 입력 크기·이름 (호스트가 프레임을 어떤 크기로 만들지 알아야 한다)
 #[wasm_bindgen]
 pub fn model_io() -> Result<JsValue, JsValue> {
     MODEL.with(|m| {
         let b = m.borrow();
-        let model = b.as_ref().ok_or_else(|| JsValue::from_str("모델 미로드"))?;
+        let model = b.as_ref().ok_or_else(|| JsValue::from_str("모델 미로드"))?.model();
         let t = &model.sw.tensors[model.sw.inputs[0] as usize];
         let info = JsFrameInfo {
             h: t.h,
@@ -210,21 +252,18 @@ pub fn model_io() -> Result<JsValue, JsValue> {
 #[wasm_bindgen]
 pub async fn infer_frame(rgb: Vec<f32>, output: String) -> Result<Vec<f32>, JsValue> {
     let ctx = engine()?;
-    let mut model = MODEL
+    let mut seg = MODEL
         .with(|m| m.borrow_mut().take())
         .ok_or_else(|| JsValue::from_str("모델 미로드"))?;
 
     let result: Result<Vec<f32>, JsValue> = async {
-        let in_name = model.sw.tensors[model.sw.inputs[0] as usize].name.clone();
-        model
-            .upload_input(&ctx, &in_name, &rgb)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        model.infer(&ctx).await.map_err(|e| JsValue::from_str(&e.to_string()))?;
-        model.read_output(&ctx, &output).await.map_err(|e| JsValue::from_str(&e.to_string()))
+        seg.upload(&ctx, &rgb).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        seg.infer(&ctx).await.map_err(|e| JsValue::from_str(&e.to_string()))?;
+        seg.read_output(&ctx, &output).await.map_err(|e| JsValue::from_str(&e.to_string()))
     }
     .await;
 
-    MODEL.with(|m| *m.borrow_mut() = Some(model));
+    MODEL.with(|m| *m.borrow_mut() = Some(seg));
     result
 }
 
@@ -257,16 +296,13 @@ pub async fn infer_and_present(
     bg: u32,
 ) -> Result<(), JsValue> {
     let ctx = engine()?;
-    let mut model = MODEL
+    let mut seg = MODEL
         .with(|m| m.borrow_mut().take())
         .ok_or_else(|| JsValue::from_str("모델 미로드"))?;
     let result: Result<(), JsValue> = async {
-        let in_name = model.sw.tensors[model.sw.inputs[0] as usize].name.clone();
-        model
-            .upload_input(&ctx, &in_name, &rgb)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        model.infer(&ctx).await.map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let (buf, desc) = model
+        seg.upload(&ctx, &rgb).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        seg.infer(&ctx).await.map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let (buf, desc) = seg
             .output_storage(&output)
             .ok_or_else(|| JsValue::from_str(&format!("출력 아님: {output}")))?;
         PRESENT.with(|c| -> Result<(), JsValue> {
@@ -279,18 +315,16 @@ pub async fn infer_and_present(
                 origin: ai_gpu::wgpu::Origin2d::ZERO,
                 flip_y: false,
             };
-            p.upload_frame(&ctx, &srcinfo, fw, fh).map_err(|e| JsValue::from_str(&e))?;
-            p.draw(&ctx, buf, &desc, ch, mode, bg).map_err(|e| JsValue::from_str(&e))
+            p.upload_frame(&ctx, &srcinfo, fw, fh);
+            p.draw(&ctx, buf, &desc, ai_tasks::CompositeOpts { channel: ch, mode, bg })
+                .map_err(|e| JsValue::from_str(&e))
         })?;
-        // ⚠ 제출만 하고 안 기다리면 큐가 무한정 쌓인다. 그러면 화면은 점점 과거
-        // 프레임을 보여주고(마스크가 뒤처짐), 뒤에 도는 벤치의 wait_idle이 밀린
-        // 큐 전체를 기다려 측정값이 계속 커진다. 사파리에서 실제로 그랬다
-        // (추론 3.13 → 10.00ms 단조 증가). 프레임당 완료를 기다려 1프레임으로 묶는다.
-        ai_gpu::readback::wait_idle(&ctx).await.map_err(|e| JsValue::from_str(&e))?;
+        // 프레임 완료 대기 + 프레임타임 기록 (큐가 쌓이면 안 되는 이유는 finish_frame 참조)
+        seg.finish_frame(&ctx).await.map_err(|e| JsValue::from_str(&e.to_string()))?;
         Ok(())
     }
     .await;
-    MODEL.with(|m| *m.borrow_mut() = Some(model));
+    MODEL.with(|m| *m.borrow_mut() = Some(seg));
     result
 }
 
@@ -298,25 +332,34 @@ pub async fn infer_and_present(
 /// `model_bench`와 달리 입력을 시드 난수로 덮지 않아 라이브 데모 중에도 부를 수 있다.
 /// 반환 = ms/frame. 상태 순환이 프레임 간 의존을 만들어 실제로 직렬 실행된다.
 #[wasm_bindgen]
-pub async fn bench_current(frames: u32) -> Result<f64, JsValue> {
+pub async fn bench_current(frames: u32) -> Result<JsValue, JsValue> {
     let ctx = engine()?;
-    let mut model = MODEL
+    let mut seg = MODEL
         .with(|m| m.borrow_mut().take())
         .ok_or_else(|| JsValue::from_str("모델 미로드"))?;
-    let result: Result<f64, JsValue> = async {
+    let result: Result<JsValue, JsValue> = async {
         for _ in 0..2 {
-            model.infer(&ctx).await.map_err(|e| JsValue::from_str(&e.to_string()))?;
+            seg.infer(&ctx).await.map_err(|e| JsValue::from_str(&e.to_string()))?;
         }
         ai_gpu::readback::wait_idle(&ctx).await.map_err(|e| JsValue::from_str(&e))?;
         let t0 = web_time::Instant::now();
         for _ in 0..frames {
-            model.infer(&ctx).await.map_err(|e| JsValue::from_str(&e.to_string()))?;
+            seg.infer(&ctx).await.map_err(|e| JsValue::from_str(&e.to_string()))?;
         }
+        // 제출만 끝난 시점 — 여기까지가 CPU(인코딩 + wasm↔JS 경계)
+        let t_sub = t0.elapsed().as_secs_f64() * 1e3;
         ai_gpu::readback::wait_idle(&ctx).await.map_err(|e| JsValue::from_str(&e))?;
-        Ok(t0.elapsed().as_secs_f64() * 1e3 / frames.max(1) as f64)
+        let t_all = t0.elapsed().as_secs_f64() * 1e3;
+        let n = frames.max(1) as f64;
+        serde_wasm_bindgen::to_value(&JsBenchSplit {
+            ms_per_frame: t_all / n,
+            submit_ms: t_sub / n,
+            wait_ms: (t_all - t_sub) / n,
+        })
+        .map_err(|e| JsValue::from_str(&e.to_string()))
     }
     .await;
-    MODEL.with(|m| *m.borrow_mut() = Some(model));
+    MODEL.with(|m| *m.borrow_mut() = Some(seg));
     result
 }
 

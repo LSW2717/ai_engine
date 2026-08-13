@@ -1,0 +1,21 @@
+[package]
+name = "ai-tasks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# 태스크 레이어 = **공개 API의 본체**.
+# ai-wasm(웹)과 ai-ffi(모바일)는 이 크레이트를 타입 변환만 해서 노출한다.
+# 바인딩에 분기(if)가 생겼다면 그건 로직이고 여기로 내려와야 한다 —
+# 그 규칙이 깨지는 순간 웹/모바일 동작이 갈라진다.
+
+[dependencies]
+ai-core.workspace = true
+ai-gpu.workspace = true
+ai-runtime.workspace = true
+bytemuck.workspace = true
+thiserror.workspace = true
+log.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-time.workspace = true

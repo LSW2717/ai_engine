@@ -19,6 +19,17 @@ const FRAME_MS = 1000 / TARGET_FPS;
 const PLAN = '../compare/assets/rvm_144x256.plan.json';
 const WEIGHTS = '../compare/assets/rvm_144x256.weights.bin';
 
+// ?only=ours / ?only=webgl2 — 한쪽 엔진만 프레임 루프에서 돌린다.
+//
+// 왜 필요한가: 사파리는 WebGL2와 WebGPU가 **같은 Metal 큐**를 쓴다. 우리 wait_idle
+// (= onSubmittedWorkDone)은 디바이스 전체가 빌 때까지 기다리므로 옆에서 도는 webgl2
+// 작업 뒤에 줄을 선다. 반대로 webgl2의 gl.finish()는 GL만 비워서 자기 숫자는 안
+// 오염된다 — "우리만 시간이 갈수록 느려진다"가 그 비대칭일 수 있다.
+// ?only=ours로 재서 평평해지면 원인은 동거(간섭)고, 그대로 오르면 우리 루프다.
+const ONLY = new URLSearchParams(location.search).get('only');
+const RUN_OURS = ONLY !== 'webgl2';
+const RUN_WGL = ONLY !== 'ours';
+
 const $ = (id) => document.getElementById(id);
 const say = (t, err = false) => {
   $('status').textContent = t;
@@ -268,7 +279,7 @@ async function frame() {
   // 죽이면 안 된다 — 실제로 그렇게 만들어서 "1프레임 후 정지"를 겪었다.
   const bgMode = { gradient: 0, black: 1, blur: 2 }[$('bg').value] ?? 0;
   const ta0 = performance.now();
-  try {
+  if (RUN_OURS) try {
     // ⚠ 모델은 한 번에 하나만 쓸 수 있다 (wasm 쪽에서 꺼냈다 돌려놓는 구조).
     // 두 프레임을 겹쳐 제출하면 "모델 미로드"가 난다 — 실제로 그렇게 만들었었다.
     // 그래서 **직전 프레임을 먼저 기다린 뒤** 제출한다. 위의 CPU 준비 작업
@@ -288,20 +299,22 @@ async function frame() {
   push(tA, performance.now() - ta0);
 
   // 3) webgl2 — 단계별로 쪼개 잰다. "느리다"를 주장하기 전에 어디가 느린지 봐야 한다.
-  const tb0 = performance.now();
-  wgl.upload('input_1', rgbNchw);
-  const tUp = performance.now();
-  wgl.run();
-  swapWglState();
-  wglDrawAlpha(wgl.tex.get('pha')); // GPU에서 바로 알파 캔버스로 (리드백 없음)
-  const tRun = performance.now();
-  push(tB, tRun - tb0);
-  push(tBup, tUp - tb0);
-  push(tBrun, tRun - tUp);
+  if (RUN_WGL) {
+    const tb0 = performance.now();
+    wgl.upload('input_1', rgbNchw);
+    const tUp = performance.now();
+    wgl.run();
+    swapWglState();
+    wglDrawAlpha(wgl.tex.get('pha')); // GPU에서 바로 알파 캔버스로 (리드백 없음)
+    const tRun = performance.now();
+    push(tB, tRun - tb0);
+    push(tBup, tUp - tb0);
+    push(tBrun, tRun - tUp);
 
-  // 4) 합성 — 마스크 소스는 각 엔진이 GPU에서 그린 캔버스 그대로
-  // ai_engine 패널은 셰이더가 직접 그렸다 — 캔버스 합성 없음.
-  composite(ctxB, wgl.gl.canvas, fgB, fgBCtx, w, h);
+    // 4) 합성 — 마스크 소스는 각 엔진이 GPU에서 그린 캔버스 그대로
+    // ai_engine 패널은 셰이더가 직접 그렸다 — 캔버스 합성 없음.
+    composite(ctxB, wgl.gl.canvas, fgB, fgBCtx, w, h);
+  }
 
   fps++;
   const now = performance.now();
@@ -455,10 +468,33 @@ async function autoBench() {
     // 모델은 한 번에 하나만 쓸 수 있다 — in-flight 프레임을 먼저 비운다.
     // 안 그러면 bench_current가 "모델 미로드"로 실패해 값이 NaN이 된다.
     if (pendingPresent) { await pendingPresent; pendingPresent = null; }
+    // ⚠ 두 엔진 모두 **빈 GPU에서** 출발해야 한다.
+    // 프레임 루프의 webgl2는 매 프레임 동기화를 안 하므로 미완료 GL 작업이 쌓여 있다.
+    // 사파리는 WebGL/WebGPU가 같은 Metal 큐를 공유해서, 우리 wait_idle
+    // (= on_submitted_work_done)이 그 GL 백로그까지 기다린다 — 우리 수치만 2.88→7.88ms로
+    // 부풀고 webgl2는 자기 finish 덕에 멀쩡했다. 엔진 차이가 아니라 하네스 비대칭이었다.
+    wgl.gl.finish();
+    // ⚠ 사파리의 gl.finish()는 GPU 완료까지 막지 않는다 (실측: finish를 부르고도
+    // 우리 wait_idle이 webgl2 작업을 계속 물어 2.7 → 6.1ms로 부풀었다. ?only=ours로
+    // 재면 2.7ms로 평평하다). finish 의미론에 기대지 말고 **실제 시간**으로 비운다.
+    // 100ms면 프레임 몇 개치 잔여 작업을 다 흘려보낸다.
+    await new Promise((r) => setTimeout(r, 100));
+    // 한쪽만 도는 모드에서는 그쪽만 잰다 (안 도는 엔진 값은 갱신하지 않는다)
+    if (!RUN_OURS) autoTurn = 1;
+    if (!RUN_WGL) autoTurn = 0;
     if (autoTurn === 0) {
-      gpuMsA = await bench_current(AUTO_FRAMES);
+      // **두 번 연속** 잰다. 1회차만 크면 그 앞에 밀려 있던 작업을 문 것이고,
+      // 두 번 다 크면 엔진 자체가 느려진 것이다 — 합계만 봐서는 못 가른다.
+      // 각 회차는 submit(CPU 인코딩 + wasm↔JS 경계)과 wait(GPU)로 쪼개 찍는다.
+      const r1 = await bench_current(AUTO_FRAMES);
+      const r2 = await bench_current(AUTO_FRAMES);
+      gpuMsA = r2.ms_per_frame;
+      console.log(
+        `AI_ENGINE_RESULT: split t=${((performance.now() - t0Page) / 1000).toFixed(1)}s ` +
+          `1회 ${r1.ms_per_frame.toFixed(2)}(cpu ${r1.submit_ms.toFixed(2)} gpu ${r1.wait_ms.toFixed(2)}) ` +
+          `2회 ${r2.ms_per_frame.toFixed(2)}(cpu ${r2.submit_ms.toFixed(2)} gpu ${r2.wait_ms.toFixed(2)})`
+      );
     } else {
-      wgl.gl.finish();
       const t0 = performance.now();
       for (let i = 0; i < AUTO_FRAMES; i++) { wgl.run(); swapWglState(); }
       wgl.gl.finish();
@@ -484,6 +520,10 @@ async function runBench() {
   if (pendingPresent) { await pendingPresent; pendingPresent = null; }
   $('benchout').textContent = '측정 중…';
   try {
+    // 두 엔진 모두 빈 GPU에서 출발 (autoBench와 같은 이유 — 사파리 공유 큐).
+    // 사파리 gl.finish()는 GPU 완료를 안 막으므로 실제 시간으로도 비운다.
+    wgl.gl.finish();
+    await new Promise((r) => setTimeout(r, 150));
     // ai_engine — 내부에서 워밍업 3 + N프레임 + wait_idle 1회
     const a = await model_bench(BENCH_FRAMES);
 

@@ -452,6 +452,67 @@ impl Model {
         &self.labels
     }
 
+    /// 진단: op 하나만 `reps`번 반복 제출하고 1회당 wall 시간(ms)을 돌려준다.
+    ///
+    /// Apple GPU는 컴퓨트 패스 경계 타임스탬프를 샘플링하지 않아 `profile_infer`의
+    /// 수치가 0이거나 부풀려진다. 반복 격리 측정은 타임스탬프에 전혀 의존하지 않으므로
+    /// 이 기기에서 유일하게 믿을 수 있는 per-op 비용이다.
+    /// 같은 op을 연달아 쓰므로 가중치가 캐시에 남아 실제보다 낙관적일 수 있다 —
+    /// **반드시 합계를 실제 프레임타임과 대조할 것**.
+    pub async fn bench_op(
+        &mut self,
+        ctx: &GpuContext,
+        idx: usize,
+        reps: usize,
+    ) -> Result<f64, RuntimeError> {
+        // ⚠ 컴퓨트 **패스** 1개에 디스패치 reps개를 넣어야 한다. record()를 reps번
+        // 부르면 패스가 reps개 생기고, Metal은 패스마다 인코더를 새로 만들어
+        // ~17µs가 붙는다 — 모든 op이 17µs로 보이는 가짜 바닥이 생긴다.
+        let batch = vec![self.ops_even[idx].clone(); reps];
+        for _ in 0..8 {
+            let mut enc =
+                ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            ai_gpu::kernel::record(&mut enc, &batch[..1]);
+            ctx.queue.submit([enc.finish()]);
+        }
+        readback::wait_idle(ctx).await.map_err(RuntimeError::Gpu)?;
+        // 인코딩 비용을 측정에서 빼려고 한 인코더에 reps개를 넣는다.
+        let mut enc =
+            ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        ai_gpu::kernel::record(&mut enc, &batch);
+        let cmd = enc.finish();
+        let t0 = std::time::Instant::now();
+        ctx.queue.submit([cmd]);
+        readback::wait_idle(ctx).await.map_err(RuntimeError::Gpu)?;
+        Ok(t0.elapsed().as_secs_f64() * 1e3 / reps as f64)
+    }
+
+    /// 진단: 앞 `n`개 op만 `frames`번 제출 — 프리픽스 차분 프로파일용.
+    pub async fn bench_prefix(
+        &mut self,
+        ctx: &GpuContext,
+        n: usize,
+        frames: usize,
+    ) -> Result<f64, RuntimeError> {
+        let ops = &self.ops_even[..n];
+        for _ in 0..2 {
+            let mut enc =
+                ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            ai_gpu::kernel::record(&mut enc, ops);
+            ctx.queue.submit([enc.finish()]);
+        }
+        readback::wait_idle(ctx).await.map_err(RuntimeError::Gpu)?;
+        let t0 = std::time::Instant::now();
+        for _ in 0..frames {
+            let mut enc =
+                ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            ai_gpu::kernel::record(&mut enc, ops);
+            ctx.queue.submit([enc.finish()]);
+        }
+        readback::wait_idle(ctx).await.map_err(RuntimeError::Gpu)?;
+        Ok(t0.elapsed().as_secs_f64() * 1e3 / frames as f64)
+    }
+
     /// per-op 프로파일 추론 — op마다 별도 패스 + 타임스탬프. 느리므로 진단 전용.
     /// 반환: (label, ms) — op 순서대로.
     pub async fn profile_infer(

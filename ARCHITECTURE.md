@@ -10,13 +10,21 @@ webgl2-engine-span.js(~3ms)와 ORT-web WebGPU(~2ms)를 넘는 추론 성능, mem
 |---|---|---|
 | `ai-core` | GPU 무의존 코어: TensorDesc(NHWC-C4), pack/unpack, 활성화 정의, CPU 레퍼런스, 그래프 IR·컨테이너 포맷 타입 | rlib. 변환기·런타임이 공유하는 계약 |
 | `ai-gpu` | wgpu 30 실행 계층: context/caps, arena, params, 커널, 캐시, 프로파일러 | 타겟별 의존성 테이블(native=metal/vulkan/dx12, wasm=webgpu) |
-| `ai-runtime` | (Phase 2) 그래프 executor: 컨테이너 로드 → lowering → 상태 텐서 ping-pong | 스켈레톤 |
-| `ai-convert` | (Phase 3) ONNX → 컨테이너 CLI: BN 폴딩·사전 패킹·융합 마킹 | 스켈레톤 |
+| `ai-runtime` | 그래프 executor: 컨테이너 로드 → lowering → 상태 텐서 ping-pong | |
+| `ai-tasks` | **공개 API 본체** — 태스크(세그멘테이션/랜드마크/노이즈억제) + 전·후처리 + 합성 + 폴백 정책 | 플랫폼 무관. 바인딩이 여기를 감싸기만 한다 |
+| `ai-convert` | ONNX → 컨테이너 CLI: BN 폴딩·사전 패킹·융합 마킹 | |
 | `ai-bench` | 네이티브 벤치 러너 | wasm 데모와 동일 루틴 |
-| `ai-wasm` | wasm-bindgen 경계 (`cdylib`) | 이 크레이트만 JS를 안다 |
-| (향후) `ai-ffi` | 모바일/데스크탑 C ABI (`staticlib`+`cdylib`) | crate-type은 leaf가 소유 — 플랫폼별 수동 편집 금지 |
+| `ai-wasm` | wasm-bindgen 경계 (`cdylib`) — **웹 API** | 서피스·프레임 임포트·타입 변환만 |
+| (향후) `ai-cpu` | SIMD128/NEON + 스레드 실행 계층 | GPU 미지원·저사양 폴백 |
+| (향후) `ai-ffi` | 모바일 C ABI (`staticlib`+`cdylib`) — **모바일 API** | crate-type은 leaf가 소유 — 플랫폼별 수동 편집 금지 |
 
-의존 그래프: `ai-core ← ai-gpu ← {ai-runtime, ai-bench, ai-wasm}`, `ai-convert ← ai-core`.
+의존 그래프: `ai-core ← ai-gpu ← ai-runtime ← ai-tasks ← {ai-wasm, ai-ffi}`, `ai-convert ← ai-core`.
+
+**바인딩 규칙**: `ai-wasm`/`ai-ffi`에는 분기(`if`)가 없다. 분기가 생겼다면 그건 로직이고
+`ai-tasks`로 내려가야 한다. 이 규칙이 깨지면 웹과 모바일 동작이 갈라진다 — 지금 랜드마크가
+웹(mediapipe-wasm)과 모바일(vcxrust_ai/ncnn) 두 벌로 갈라져 있는 것과 같은 실수를
+한 층 아래에서 반복하게 된다. 플랫폼마다 **진짜** 다른 것만 바인딩에 남긴다:
+서피스 획득, 프레임 임포트, 스레드 모델, 모델 바이트 조달.
 
 ## 설계 원칙 (요약)
 

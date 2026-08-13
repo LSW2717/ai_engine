@@ -84,12 +84,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "ai-tasks"
+version = "0.1.0"
+dependencies = [
+ "ai-core",
+ "ai-gpu",
+ "ai-runtime",
+ "bytemuck",
+ "log",
+ "thiserror",
+ "web-time",
+]
+
+[[package]]
 name = "ai-wasm"
 version = "0.1.0"
 dependencies = [
  "ai-core",
  "ai-gpu",
  "ai-runtime",
+ "ai-tasks",
  "bytemuck",
  "console_error_panic_hook",
  "console_log",

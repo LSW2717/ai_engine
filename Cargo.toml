@@ -4,6 +4,7 @@ members = [
     "crates/ai-core",
     "crates/ai-gpu",
     "crates/ai-runtime",
+    "crates/ai-tasks",
     "crates/ai-convert",
     "crates/ai-bench",
     "crates/ai-wasm",
@@ -19,6 +20,7 @@ license = "MIT"
 ai-core = { path = "crates/ai-core" }
 ai-gpu = { path = "crates/ai-gpu" }
 ai-runtime = { path = "crates/ai-runtime" }
+ai-tasks = { path = "crates/ai-tasks" }
 
 # GPU
 wgpu = { version = "30", default-features = false }
