@@ -105,6 +105,9 @@ dependencies = [
  "ai-gpu-runtime",
  "bytemuck",
  "log",
+ "naga",
+ "serde",
+ "serde_json",
  "thiserror",
  "web-time",
 ]

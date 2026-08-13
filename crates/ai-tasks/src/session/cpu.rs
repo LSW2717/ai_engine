@@ -6,7 +6,7 @@
 //! 어떤 티어를 쓸지는 호스트가 정한다 (모델 바이트 조달이 호스트 몫이라 —
 //! 폴백은 더 가벼운 모델(R11 등)을 CPU로 싣는 것까지가 한 묶음).
 
-use crate::clock::{FrameClock, Stats};
+use crate::session::clock::{FrameClock, Stats};
 use crate::detect::{Detection, DetectorPost};
 use crate::error::TaskError;
 

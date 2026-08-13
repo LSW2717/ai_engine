@@ -79,3 +79,10 @@ setup-wasm:
 clean:
 	cargo clean
 	rm -rf web/pkg
+
+# studio 데모 실제 제품 에셋 (배경 이미지 + 3D GLB) — v-ai/v-room에서 복사 (gitignore)
+V_ROOM ?= ../../vcxreact/packages/v-room
+studio-assets:
+	mkdir -p web/demo/assets/bg web/demo/assets/glb
+	for i in 1 2 3 4 5 6; do cp $(V_ROOM)/assets/images/room/filters/study/$$i.jpg web/demo/assets/bg/ 2>/dev/null || true; done
+	cp $(V_AI)/assets/models/*.glb web/demo/assets/glb/

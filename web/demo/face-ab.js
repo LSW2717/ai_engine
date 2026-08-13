@@ -221,6 +221,103 @@ async function main() {
     }
   }
 
+  // ── 랜드마크 스테이지: MediaPipe FaceLandmarker(IMAGE) vs FaceTask ──
+  // 같은 프레임에서 검출→ROI→회전 크롭→478점→역투영 전체 파이프라인 파리티
+  say('MediaPipe FaceLandmarker 실행 중…');
+  try {
+    const vision = await import(
+      'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs'
+    );
+    const fileset = await vision.FilesetResolver.forVisionTasks(
+      'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm'
+    );
+    const flm = await vision.FaceLandmarker.createFromOptions(fileset, {
+      baseOptions: { modelAssetPath: BASE + 'face_landmarker.task', delegate: 'CPU' },
+      runningMode: 'IMAGE',
+      numFaces: 1,
+    });
+    const mpLm = flm.detect(frame).faceLandmarks[0].map((p) => [p.x * W, p.y * H]);
+    flm.close();
+    log(`face-ab lm-mp n=${mpLm.length}`);
+    draw(view, [], '#2da44e', []); // no-op — 아래서 점만 찍는다
+    const vc = view.getContext('2d');
+    vc.fillStyle = '#2da44e';
+    for (const [x, y] of mpLm) vc.fillRect(x - 0.4, y - 0.4, 0.8, 0.8);
+
+    // u8 RGB 프레임 (FaceTask는 픽셀 처리 전부를 엔진 안에서 한다)
+    const img = frame.getContext('2d').getImageData(0, 0, W, H).data;
+    const rgb = new Uint8Array(W * H * 3);
+    for (let i = 0, j = 0; i < img.length; i += 4, j += 3) {
+      rgb[j] = img[i];
+      rgb[j + 1] = img[i + 1];
+      rgb[j + 2] = img[i + 2];
+    }
+    const detB = new Uint8Array(
+      await (await fetch(BASE + 'face_detector.sw')).arrayBuffer()
+    );
+    const lmB = new Uint8Array(
+      await (await fetch(BASE + 'face_landmarks.sw')).arrayBuffer()
+    );
+
+    const lmDiff = (ours) => {
+      let mx = 0, sum = 0;
+      for (let i = 0; i < mpLm.length; i++) {
+        const d = Math.hypot(ours[i][0] * W - mpLm[i][0], ours[i][1] * H - mpLm[i][1]);
+        mx = Math.max(mx, d);
+        sum += d;
+      }
+      return { max: mx, mean: sum / mpLm.length };
+    };
+
+    for (const [tag, color, run] of [
+      ['cpu', '#d1242f', async () => {
+        const det = aiMod.load_model_cpu_h(detB).handle;
+        const lm = aiMod.load_model_cpu_h(lmB).handle;
+        const task = aiMod.face_task_new(false);
+        const r = aiMod.face_task_cpu(task, det, lm, rgb, W, H, 0.0);
+        aiMod.face_task_free(task);
+        aiMod.unload_model_cpu_h(det);
+        aiMod.unload_model_cpu_h(lm);
+        return r;
+      }],
+      ['gpu', '#58a6ff', async () => {
+        await aiMod.init_engine();
+        const det = (await aiMod.load_model_h(detB)).handle;
+        const lm = (await aiMod.load_model_h(lmB)).handle;
+        const task = aiMod.face_task_new(false);
+        const r = await aiMod.face_task_gpu(task, det, lm, rgb, W, H, 0.0);
+        aiMod.face_task_free(task);
+        aiMod.unload_model_h(det);
+        aiMod.unload_model_h(lm);
+        return r;
+      }],
+    ]) {
+      say(`FaceTask ${tag} 실행 중…`);
+      try {
+        const r = await run();
+        if (!r) throw new Error('얼굴 못 찾음 (null)');
+        const d = lmDiff(r.points);
+        const ok = r.points.length === mpLm.length && d.max <= TOL_PX;
+        pass = pass && ok;
+        verdicts.push(`lm-${tag}=${ok ? 'ok' : 'FAIL'}`);
+        log(
+          `face-ab lm-${tag} n=${r.points.length} presence=${r.presence.toFixed(3)} ` +
+            `dpx max=${d.max.toFixed(2)} mean=${d.mean.toFixed(2)}`
+        );
+        vc.fillStyle = color;
+        for (const [x, y] of r.points) vc.fillRect(x * W - 0.4, y * H - 0.4, 0.8, 0.8);
+      } catch (e) {
+        pass = false;
+        verdicts.push(`lm-${tag}=ERR`);
+        log(`face-ab lm-${tag} ERR ${String(e).slice(0, 150)}`);
+      }
+    }
+  } catch (e) {
+    pass = false;
+    verdicts.push('lm=ERR');
+    log(`face-ab lm ERR ${String(e).slice(0, 150)}`);
+  }
+
   // vision 워커 최소 상주(det+lm+게이즈) 스모크 — 핸들 API로 3모델을 GPU에
   // 동시에 올려 번갈아 추론한다 (게이즈 체인: face_detector→face_landmarks→gaze)
   say('3모델 동시 상주 스모크…');

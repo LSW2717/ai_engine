@@ -22,16 +22,72 @@ compare에서 `webgl2 ~1.57ms / ai_engine 가중치fp16 ~2.01ms`.
 
 ---
 
-## 바로 다음 — 로드맵 #4 계속 (ROI 파이프라인)
+## 바로 다음 — v-ai/vcxrust_ai 전체 정찰 완료 (2026-08-13), 통합 설계 확정 대기
 
-1·2단계는 끝났다(§4 — 핸들 API + face_detector 후처리, 디텍터 좌표 게이트 PASS).
-남은 순서:
-3. **ROI 파이프라인**: 박스+눈 키포인트→회전 정규화 크롭(RectTransformation
-   scale 1.5 square)→face_landmarks 256²→역변환, 이전 프레임 ROI 트래킹
-   (검출은 놓쳤을 때만) + OneEuroFilter
-4. **게이트: MediaPipe wasm과 같은 프레임 랜드마크 좌표 diff** — 파리티 증명 전
-   교체 금지 (디텍터 게이트 face-ab.html과 같은 방식으로 lm까지 확장)
-(face 먼저 — hand는 같은 골격 복제. 게이즈는 lm 다음: face 크롭→gaze 448².)
+**`INTEGRATION.md`가 통합 설계의 단일 진실** (정찰 지도는 메모리 `vai-runtime-map`).
+핵심 발견: 웹·모바일은 "다른 구현"이 아니라 **같은 알고리즘의 TS판/Rust판**
+(상수까지 동일)이고, 두 벌 다 추론+후처리 12스테이지+합성이 한 덩어리 →
+**추론만 교체하면 이원화·모바일 왕복 문제가 안 풀린다. ai_engine이 비디오
+파이프라인 전체의 코어가 되어야 한다** (ai-tasks에 Pipeline층 신설).
+
+**P1 1차분 완료 (2026-08-13 심야)**: `ai-tasks/src/video/` — VideoPipeline
+(Pipeline층 신설). 구조: params.rs(EffectsPatch JSON 머지: 없음=유지/null=해제/
+값=설정) + stage.rs(스테이지 추가 절차 문서화 — 1스테이지=1rs+1wgsl+naga테스트,
+dyn 트레이트 없이 고정 배선인 이유 포함) + stages/{preprocess(컴퓨트→모델 입력
+버퍼 직결), mask_ingest(softmax|pha+시간EMA 핑퐁), mask_upsample(JBF),
+bg_blur(1/5해상도 7탭×6), compose(배경4모드+coverage+spill+edge+lightwrap+
+밝기/흑백)}. **프레임당 CPU 픽셀 0, 리드백 0** (uniform 몇십B가 전부) —
+ai-gpu-runtime에 `input_storage()` 추가(전처리 컴퓨트가 모델 입력 버퍼에 직접
+씀). 바인드그룹은 전부 Res 생성 시 1회(프레임 루프 재생성 0). 데모
+`web/demo/studio.html`(+studio.js, wasm exports studio_attach/config/bg_image/
+frame) — 헤드리스 `node tools/run_web.mjs demo/studio.html --camera --long`
+PASS(원본→블러→단색배경 90프레임), 스크린샷 눈검증 완료.
+**실제 제품 에셋 연결 (2026-08-14)**: `make studio-assets` — v-room 가상배경
+6종(assets/bg) + v-ai GLB 13종(assets/glb) 복사(gitignore). studio에 배경 프리셋
+셀렉트(이미지 배경 모드 실검증 — 스크린샷 OK) + **3D 아이템 오버레이**: three.js
+투명 캔버스(#fx)가 FaceTask(face_task_gpu) 478pt를 소비, 유사변환(위치·스케일·롤)
+피팅. ⚠ 데모용 임시 스탠드인 — 정밀 Horn 피팅+yaw/pitch는 P3 Expression Stream,
+**최종 방향은 vcxrust_ai items3d(wgpu PBR) 이관으로 웹·모바일 렌더러 통일**
+(모바일엔 three.js가 없다 — INTEGRATION.md §1.6). 함정 기록: three.js 오버레이는
+`setClearColor(0,0)` 필수 — 기본 클리어가 불투명 검정이라 출력을 통째로 덮는다.
+FaceTask 입력이 아직 u8 프레임(getImageData)이라 아이템 켜면 CPU 픽셀 경유 —
+P3에서 GPU 크롭으로.
+**P1 2차분 (2026-08-14)**: ① mask_refine 스테이지(분리 5탭 blur h/v + 엣지 인지
+재혼합 — maskBlurPx/edgeBlend/edgeGamma/edgeFeather 웹 상수) — compose·bg_blur가
+refined 마스크를 소비. ② **스튜디오 조명**(relight): compose.wgsl에 광원 2개
+(target person/bg/all, 방사감쇠², 소프트 롤오프) + EffectsPatch studioLight
+(hex 색, null=해제) + studio 조명 토글 — 스크린샷 검증(배경 냉광·인물 온광 확인).
+Fullscreen::new_entry(한 wgsl 다중 fs 엔트리) 헬퍼 추가.
+**P1 잔여**: 프레이밍(GPU bbox 리덕션), mirror/degree, 이미지배경 blur,
+**웹 파이프라인 픽셀 diff 게이트**, HUD 프레임타임 동기화(지금은 제출 벽시계 — 허수). 3D 렌더 파리티(three.js vs
+WGSL 차이)는 사용자가 보류 확정.
+
+**실행 계획 (2026-08-13, INTEGRATION.md §3)** — 데모 HTML 주도
+(사용자 제안): `web/demo/studio.html` = 제품 UI 미니어처, 단계마다 효과를 켜며
+게이트+눈검증. P1 VideoPipeline(vcxrust_ai WGSL 이관) → P2 티어 정책(§1.5
+매트릭스: 추론×합성 2축, A=GPU+GPU / B=CPU추론+GPU합성 / C=lite — "GPU 안 되면
+효과 전부 끔"의 이분법 제거) → P3 얼굴 스택(blendshape+Horn+터치업/메이크업 =
+**Expression Stream**, 아바타 전제) → P4 웹 연결(VbEngine) → P5 아바타
+스파이크(person-replacement 모드) → P6+ Gaze/Hand/ai-ffi/오디오.
+아바타(사람 전체 교체, 표정 포함)는 §1.6 — 지금부터 계약에 반영.
+
+**GPU↔CPU 왕복에 대해 (사용자 질문, 2026-08-13)**: 소형 텐서 리드백(det 출력
+~60KB → ROI 결정, lm 출력 6KB)은 **구조적으로 불가피** — ROI는 다음 디스패치를
+결정하는 제어 흐름이라 MediaPipe GPU 파이프라인도 똑같이 내린다. 반면 지금
+스파이크에서 **이미지가 CPU를 왕복하는 것**(레터박스·회전 크롭을 CPU에서 하고
+결과를 업로드)은 단순화일 뿐: 프레임을 GPU 텍스처로 상주시키고(카메라 임포트
+경로는 이미 있음 — present.rs copy_external_image_to_texture) 레터박스/회전
+warp를 커널로 만들면 업로드는 프레임 1회로 줄고, 트래킹 중엔 디텍터 생략이라
+사실상 크롭 커널 1개+6KB 리드백만 남는다. **vision 워커 조립 때 GPU 상주 크롭
+커널로 전환** — 지금은 파리티 게이트가 우선이라 CPU 크롭을 임시 허용했지만,
+**⚠ 타깃은 M1이 아니라 저사양 PC다 (사용자 강조, 메모리 target-hardware-lowend)**:
+구형 iGPU·저가 노트북에선 업로드·왕복·wasm 픽셀 루프가 실비용이므로 GPU 상주
+전처리 커널은 "나중에 하면 좋은 것"이 아니라 vision 워커 조립의 필수 항목.
+세그(가상배경)도 같은 그림: 합성·카메라 프레임은 **이미 GPU 직행**
+(infer_and_present — copy_external_image_to_texture 임포트, 마스크 GPU 상주,
+Compositor가 캔버스에 합성)이고, **모델 입력(축소 f32)만 CPU 경유** — GPU
+전처리 커널(리사이즈+정규화) 하나면 프레임당 CPU를 오가는 픽셀이 0이 된다.
+합성 결과를 트랙으로 내보내는 건 canvas.captureStream() (CPU 리드백 없음).
 
 **fastenhancer(#6, 오디오)는 그다음**: 선행조건(ai-cpu)은 풀렸지만 DFT·1D
 conv·복소 = 새 커널 계열이라 스파이크 단위가 크고, #4는 이미 변환해둔 5모델을
@@ -49,8 +105,8 @@ v-ai 정찰 전체 지도(런타임·티어·플래그·file:line)는 메모리 
 | 1 | 폴백 트리거 3종 | **엔진 쪽 완료** (2026-08-13) — v-ai 연결만 보류, §1 참조 |
 | 2 | `ai-cpu` (SIMD128/NEON + 스레드) + R11 vs tflite-simd A/B | **완료** (2026-08-13) — 브라우저 A/B + 커널 스프린트로 **tflite-simd 동률**, §2·§2.5 |
 | 3 | `Reshape` canon + `PRELU` + `MAX_POOL_2D` | **완료** (2026-08-13) — 5모델 전부 개통+ORT 게이트+벤치, §3.5 |
-| 4 | 랜드마크 스파이크 (face_detector → 좌표 diff) | **1·2단계 완료** (2026-08-13) — 핸들 API+디텍터 후처리+게이트 PASS, §4. ← ROI 파이프라인이 다음 |
-| 5 | 파이프라인 로직 (ROI 트래킹 / 회전 정규화 / OneEuroFilter / Horn 피팅) | |
+| 4 | 랜드마크 스파이크 (face_detector → 좌표 diff) | **face 완료** (2026-08-13) — FaceTask+게이트 lm 0.30px PASS, §4. hand 복제·게이즈 체인 남음 |
+| 5 | 파이프라인 로직 (ROI 트래킹 / 회전 정규화 / OneEuroFilter / Horn 피팅) | **대부분 #4에서 선반영** — 남은 것: OneEuroFilter VIDEO 파리티, Horn 피팅, 게이즈 페이싱 |
 | 6 | 오디오 (DFT / 1D conv / 복소) | |
 
 **폴백 사다리 (사용자 확정, 2026-08-13)**: ①로드 시 GPU 체크(`NoGpu`) → ②돌렸을 때
@@ -319,8 +375,28 @@ diff — 로드맵 #4의 검증 게이트와 한 몸), ④face_blendshapes(잡op
 **전처리 규약 (파리티의 절반)**: 디텍터 입력은 **[-1,1] + keep_aspect 레터박스
 (검정 패딩=-1)** — MediaPipe ImageToTensor(BORDER_ZERO) 등가. 웹은 검정 캔버스에
 drawImage, 캔버스 없는 호스트는 `letterbox_u8_rgb`. 검출 좌표는 엔진이 레터박스
-역투영까지 해서 원본 프레임 정규화 좌표로 돌려준다. (face_landmarks는 [0,1]
-ROI 크롭 입력 — 3단계에서.)
+역투영까지 해서 원본 프레임 정규화 좌표로 돌려준다. **랜드마크 입력은 [0,1] 회전
+ROI 크롭, replicate 경계** — 샘플링은 OpenCV warpPerspective 규약(dst 정수픽셀
+코너정합, +0.5 없음; GL 경로와 반픽셀 다르지만 기준인 CPU delegate가 이쪽).
+
+**3·4단계 — FaceTask + 랜드마크 게이트 완료 (2026-08-13 심야)**:
+- `detect/roi.rs` — DetectionsToRects(kp 2점 회전) + RectTransformation(1.5
+  square_long) + ROI warp 크롭(`crop_u8_rgb`) + LandmarkProjection 역투영.
+  전부 절대 px `Roi` 하나로 (MediaPipe의 NormalizedRect 왕복 실수 방지).
+- `face.rs` — **FaceTask** (첫 `~Task` 타입): prev ROI 트래킹(검출은 놓쳤을 때만),
+  presence sigmoid 게이트(<0.5 → reset), 랜드마크 기반 다음 ROI(kp 33/263 회전),
+  process_cpu/process_gpu 드라이버 (수학 공유, 세션은 주입 — 백엔드 선택은 호스트).
+  lm 출력 식별: 최대 길이=랜드마크(0~256 px 좌표), 순서상 첫 1원소=presence 로짓
+  (실측: 얼굴 +19.7/빈화면 -14.1; Identity_2 [1,1]은 상수 0 — 미사용).
+- `filter.rs` — OneEuroFilter+LandmarkSmoother (객체크기 정규화, MediaPipe 구조).
+  **파라미터 미확정** — VIDEO 게이트 검증 전까지 smoothing=false 권장.
+- wasm: `face_task_new/free/reset`, `face_task_cpu/gpu(task, det, lm, frame_u8,
+  w, h, t_ms)` — 픽셀 처리 전부 엔진 안 (JS는 u8 RGB만 넘긴다).
+- 게이트: `ai-tasks/tests/face_task.rs`(트래킹 계약: 2프레임째 디텍터 생략,
+  presence 미달 시 검출 복귀 — det.stats().frames로 검증) + face-ab.html 랜드마크
+  스테이지 — **MediaPipe FaceLandmarker(IMAGE) 대비 478점 max 0.30px/mean 0.13px**
+  (CPU/GPU 동일). 디텍터(1.10px)보다 좋은 이유: lm 게이트는 MediaPipe도 같은
+  검출→ROI를 거치므로 크롭 보간 차만 남는다.
 
 ## 3~5. 랜드마크 — 조사 끝, 결론
 

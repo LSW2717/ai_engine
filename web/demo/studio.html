@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>studio — VideoPipeline 데모 (P1)</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: ui-sans-serif, system-ui, -apple-system, "Apple SD Gothic Neo", sans-serif;
+    max-width: 1100px; margin: 1.2rem auto; padding: 0 1rem; line-height: 1.5; }
+  h1 { font-size: 1.2rem; margin: 0 0 .25rem; }
+  .note { font-size: .85rem; opacity: .75; margin: 0 0 .9rem; }
+  #status { padding: .5rem .8rem; border-radius: 8px; background: rgba(88,166,255,.12);
+    margin-bottom: .8rem; font-size: .9rem; }
+  .row { display: flex; gap: 1rem; flex-wrap: wrap; }
+  canvas { border: 1px solid #8886; border-radius: 6px; max-width: 100%; }
+  .panel { display: grid; grid-template-columns: 7rem 1fr 3rem; gap: .4rem .6rem;
+    align-items: center; min-width: 320px; font-size: .9rem; }
+  .panel label { text-align: right; opacity: .85; }
+  #hud { font-variant-numeric: tabular-nums; font-size: .85rem; opacity: .8; margin-top: .5rem; }
+  button { padding: .35rem .9rem; }
+</style>
+</head>
+<body>
+<h1>studio — VideoPipeline (ai_engine WebGPU, CPU 픽셀 0)</h1>
+<p class="note">카메라 프레임이 GPU 텍스처로 직행: 전처리 컴퓨트 → 세그 추론 →
+시간EMA → joint bilateral 업샘플 → 배경블러(1/5) → 합성(coverage/spill/edge/조도).
+프레임당 CPU↔GPU = uniform 몇십 바이트.</p>
+<div id="status">대기 — 시작을 누르세요</div>
+<button id="start">시작</button>
+<div class="row" style="margin-top:.8rem">
+  <div style="position:relative; width:640px; height:360px">
+    <canvas id="out" width="640" height="360"></canvas>
+    <canvas id="fx" width="640" height="360"
+      style="position:absolute; left:0; top:0; pointer-events:none; border:none"></canvas>
+  </div>
+  <div class="panel">
+    <label>배경</label>
+    <select id="bg">
+      <option value="none">없음</option>
+      <option value="color">단색(초록)</option>
+      <option value="asset:1">스터디 1</option>
+      <option value="asset:2">스터디 2</option>
+      <option value="asset:3">스터디 3</option>
+      <option value="asset:4">스터디 4</option>
+      <option value="asset:5">스터디 5</option>
+      <option value="asset:6">스터디 6</option>
+      <option value="image">파일…</option>
+    </select>
+    <input type="file" id="bgfile" accept="image/*" style="grid-column: span 1" />
+    <label>3D 아이템</label>
+    <select id="item" style="grid-column: span 2">
+      <option value="none">없음</option>
+      <option value="hat1">모자 1</option>
+      <option value="hat3">모자 3</option>
+      <option value="hat_christmas">산타 모자</option>
+      <option value="hat_cat_ears">고양이 귀</option>
+      <option value="glasses1">안경 1</option>
+      <option value="glasses_heart">하트 안경</option>
+      <option value="mustache1">콧수염</option>
+    </select>
+    <label>조명</label><input type="checkbox" id="light" /><span></span>
+    <label>블러</label><input type="range" id="blur" min="0" max="100" value="0" /><span id="blurv">0</span>
+    <label>밝기(배경)</label><input type="range" id="bright" min="0" max="200" value="100" /><span id="brightv">100</span>
+    <label>흑백(배경)</label><input type="range" id="gray" min="0" max="100" value="0" /><span id="grayv">0</span>
+  </div>
+</div>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+<div id="hud"></div>
+<canvas id="src" width="640" height="360" style="display:none"></canvas>
+<script type="module" src="studio.js"></script>
+</body>
+</html>

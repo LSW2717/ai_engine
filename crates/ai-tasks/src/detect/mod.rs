@@ -11,6 +11,7 @@ pub mod anchors;
 pub mod decode;
 pub mod letterbox;
 pub mod nms;
+pub mod roi;
 
 use std::sync::OnceLock;
 

@@ -10,7 +10,7 @@ use ai_core::TensorDesc;
 use ai_gpu::wgpu;
 use ai_gpu::GpuContext;
 
-const SHADER: &str = include_str!("shaders/composite.wgsl");
+const SHADER: &str = include_str!("shaders/compositor.wgsl");
 
 /// 합성 파라미터 (셰이더 uniform과 1:1)
 #[derive(Clone, Copy, Debug)]

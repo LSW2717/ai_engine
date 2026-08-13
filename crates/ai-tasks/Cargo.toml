@@ -16,7 +16,12 @@ ai-gpu.workspace = true
 ai-gpu-runtime.workspace = true
 bytemuck.workspace = true
 thiserror.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
 log.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 web-time.workspace = true
+
+[dev-dependencies]
+naga.workspace = true

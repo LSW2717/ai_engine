@@ -14,6 +14,8 @@ use ai_gpu::GpuContext;
 // 게이트하지 않으면 `cargo test --workspace`(네이티브)가 깨진다.
 #[cfg(target_arch = "wasm32")]
 mod present;
+#[cfg(target_arch = "wasm32")]
+mod studio;
 
 use wasm_bindgen::prelude::*;
 
@@ -27,6 +29,9 @@ thread_local! {
     static GPU_MODELS: RefCell<ai_tasks::Pool<ai_tasks::GpuSession>> =
         RefCell::new(ai_tasks::Pool::new());
     static CPU_MODELS: RefCell<ai_tasks::Pool<ai_tasks::CpuSession>> =
+        RefCell::new(ai_tasks::Pool::new());
+    // 파이프라인 태스크 (상태: 트래킹 ROI + 필터) — 세션과 별도 수명
+    static FACE_TASKS: RefCell<ai_tasks::Pool<ai_tasks::FaceTask>> =
         RefCell::new(ai_tasks::Pool::new());
 }
 
@@ -719,6 +724,203 @@ pub fn detect_cpu(
         b.get_mut(handle).map_err(js_err)?.detect(post, rgb, src_w, src_h).map_err(js_err)
     })?;
     js_detections(dets)
+}
+
+// ───────── FaceTask (검출→ROI 트래킹→랜드마크 파이프라인) ─────────
+
+#[derive(serde::Serialize)]
+struct JsRoi {
+    cx: f32,
+    cy: f32,
+    w: f32,
+    h: f32,
+    rotation: f32,
+}
+
+#[derive(serde::Serialize)]
+struct JsFaceResult {
+    presence: f32,
+    /// 원본 프레임 정규화 [x,y,z] × 478
+    points: Vec<[f32; 3]>,
+    roi: JsRoi,
+}
+
+fn js_face_result(r: Option<ai_tasks::FaceResult>) -> Result<JsValue, JsValue> {
+    match r {
+        None => Ok(JsValue::NULL),
+        Some(r) => serde_wasm_bindgen::to_value(&JsFaceResult {
+            presence: r.presence,
+            points: r.points,
+            roi: JsRoi {
+                cx: r.roi.cx,
+                cy: r.roi.cy,
+                w: r.roi.w,
+                h: r.roi.h,
+                rotation: r.roi.rotation,
+            },
+        })
+        .map_err(js_err),
+    }
+}
+
+/// FaceTask 생성 → 핸들. smoothing: OneEuroFilter 적용 (파라미터 검증 전 — 기본 false 권장)
+#[wasm_bindgen]
+pub fn face_task_new(smoothing: bool) -> u32 {
+    FACE_TASKS.with(|p| p.borrow_mut().insert(ai_tasks::FaceTask::new(smoothing)))
+}
+
+#[wasm_bindgen]
+pub fn face_task_free(handle: u32) -> Result<(), JsValue> {
+    FACE_TASKS.with(|p| p.borrow_mut().remove(handle)).map_err(js_err)?;
+    Ok(())
+}
+
+/// 트래킹 상태 폐기 — 다음 프레임은 검출부터 (탭 전환·시킹 등 불연속 지점에서)
+#[wasm_bindgen]
+pub fn face_task_reset(handle: u32) -> Result<(), JsValue> {
+    FACE_TASKS.with(|p| {
+        let mut b = p.borrow_mut();
+        b.get_mut(handle).map_err(js_err)?.reset();
+        Ok(())
+    })
+}
+
+/// CPU 한 프레임: u8 RGB 프레임 → null | {presence, points[478][3], roi}.
+/// det/lm은 CPU 세션 핸들. t_ms는 단조 증가 타임스탬프 (performance.now()).
+#[wasm_bindgen]
+pub fn face_task_cpu(
+    task: u32,
+    det: u32,
+    lm: u32,
+    frame: &[u8],
+    img_w: u32,
+    img_h: u32,
+    t_ms: f64,
+) -> Result<JsValue, JsValue> {
+    // 세션 둘을 풀에서 꺼내 태스크에 주입 (같은 핸들이면 두 번째 take가 실패한다)
+    let mut det_s = CPU_MODELS.with(|p| p.borrow_mut().take(det)).map_err(js_err)?;
+    let lm_r = CPU_MODELS.with(|p| p.borrow_mut().take(lm));
+    let mut lm_s = match lm_r {
+        Ok(s) => s,
+        Err(e) => {
+            CPU_MODELS.with(|p| p.borrow_mut().put(det, det_s));
+            return Err(js_err(e));
+        }
+    };
+    let result = FACE_TASKS.with(|p| {
+        let mut b = p.borrow_mut();
+        b.get_mut(task)
+            .map_err(js_err)?
+            .process_cpu(&mut det_s, &mut lm_s, frame, img_w, img_h, t_ms)
+            .map_err(js_err)
+    });
+    CPU_MODELS.with(|p| {
+        let mut b = p.borrow_mut();
+        b.put(det, det_s);
+        b.put(lm, lm_s);
+    });
+    js_face_result(result?)
+}
+
+/// GPU 한 프레임 — face_task_cpu와 같은 계약, det/lm은 GPU 세션 핸들
+#[wasm_bindgen]
+pub async fn face_task_gpu(
+    task: u32,
+    det: u32,
+    lm: u32,
+    frame: Vec<u8>,
+    img_w: u32,
+    img_h: u32,
+    t_ms: f64,
+) -> Result<JsValue, JsValue> {
+    let ctx = engine()?;
+    let mut task_s = FACE_TASKS.with(|p| p.borrow_mut().take(task)).map_err(js_err)?;
+    let mut det_s = match GPU_MODELS.with(|p| p.borrow_mut().take(det)) {
+        Ok(s) => s,
+        Err(e) => {
+            FACE_TASKS.with(|p| p.borrow_mut().put(task, task_s));
+            return Err(js_err(e));
+        }
+    };
+    let mut lm_s = match GPU_MODELS.with(|p| p.borrow_mut().take(lm)) {
+        Ok(s) => s,
+        Err(e) => {
+            FACE_TASKS.with(|p| p.borrow_mut().put(task, task_s));
+            GPU_MODELS.with(|p| p.borrow_mut().put(det, det_s));
+            return Err(js_err(e));
+        }
+    };
+    let result = task_s
+        .process_gpu(&ctx, &mut det_s, &mut lm_s, &frame, img_w, img_h, t_ms)
+        .await;
+    FACE_TASKS.with(|p| p.borrow_mut().put(task, task_s));
+    GPU_MODELS.with(|p| {
+        let mut b = p.borrow_mut();
+        b.put(det, det_s);
+        b.put(lm, lm_s);
+    });
+    js_face_result(result.map_err(js_err)?)
+}
+
+// ───────── studio — VideoPipeline 데모/게이트 (web/demo/studio.html) ─────────
+
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static STUDIO: RefCell<Option<studio::Studio>> = const { RefCell::new(None) };
+}
+
+/// VideoPipeline을 출력 캔버스(WebGPU 서피스)에 연결
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn studio_attach(canvas: web_sys::HtmlCanvasElement) -> Result<(), JsValue> {
+    let ctx = engine()?;
+    let s = studio::Studio::new(&ctx, canvas).map_err(js_err)?;
+    STUDIO.with(|c| *c.borrow_mut() = Some(s));
+    Ok(())
+}
+
+/// EffectsPatch JSON 적용 (없음=유지 / null=해제 / 값=설정)
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn studio_config(json: String) -> Result<(), JsValue> {
+    STUDIO.with(|c| {
+        let mut b = c.borrow_mut();
+        let s = b.as_mut().ok_or_else(|| JsValue::from_str("studio_attach 먼저"))?;
+        s.pipeline.apply_json(&json).map_err(js_err)
+    })
+}
+
+/// 배경 이미지 업로드 (RGBA8)
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn studio_bg_image(rgba: &[u8], w: u32, h: u32) -> Result<(), JsValue> {
+    let ctx = engine()?;
+    STUDIO.with(|c| {
+        let mut b = c.borrow_mut();
+        let s = b.as_mut().ok_or_else(|| JsValue::from_str("studio_attach 먼저"))?;
+        s.pipeline.set_background_image(&ctx, rgba, w, h);
+        Ok(())
+    })
+}
+
+/// 프레임 1장: 소스 캔버스 → GPU 전처리 → 세그 추론 → 마스크 스택 → 캔버스.
+/// seg = GPU 세션 핸들. CPU 픽셀 왕복 0 — JS는 캔버스만 넘긴다.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub async fn studio_frame(
+    seg: u32,
+    source: web_sys::HtmlCanvasElement,
+) -> Result<(), JsValue> {
+    let ctx = engine()?;
+    let mut seg_s = GPU_MODELS.with(|p| p.borrow_mut().take(seg)).map_err(js_err)?;
+    let mut st = STUDIO.with(|c| c.borrow_mut().take());
+    let result = match st.as_mut() {
+        Some(s) => s.frame(&ctx, &mut seg_s, &source).await.map_err(js_err),
+        None => Err(JsValue::from_str("studio_attach 먼저")),
+    };
+    STUDIO.with(|c| *c.borrow_mut() = st);
+    GPU_MODELS.with(|p| p.borrow_mut().put(seg, seg_s));
+    result
 }
 
 /// 공유 벤치마크 실행 — 네이티브 ai-bench와 동일 루틴

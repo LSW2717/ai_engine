@@ -441,6 +441,17 @@ impl Model {
     /// 출력 텐서가 실제로 들어있는 **스토리지 버퍼**와 desc.
     /// 리드백 없이 GPU에서 바로 그리려면(present) 이게 필요하다 —
     /// out_staging의 버퍼는 MAP_READ라 셰이더에 바인딩할 수 없다.
+    /// 입력 텐서의 스토리지 버퍼 + desc — **GPU 전처리 직결용** (컴퓨트 패스가
+    /// 프레임 텍스처에서 NHWC-C4로 바로 쓴다, CPU 픽셀 왕복 0). upload_input의
+    /// GPU 짝. 상태 텐서가 아닌 그래프 입력은 parity와 무관하다.
+    pub fn input_storage(&self, name: &str) -> Option<(&wgpu::Buffer, TensorDesc)> {
+        let tid = *self.name_to_tid.get(name)?;
+        let (root, _) = self.sw.resolve_alias(tid);
+        let desc = desc_of(&self.sw, root);
+        let slot = *self.slot_of.get(&root)?;
+        Some((&self.buffers[slot], desc))
+    }
+
     pub fn output_storage(&self, name: &str) -> Option<(&wgpu::Buffer, TensorDesc)> {
         let (tid, _, _) = self.out_staging.iter().find(|(_, n, _)| n == name)?;
         // pha 같은 그래프 출력은 상태 텐서가 아니라 parity와 무관하다

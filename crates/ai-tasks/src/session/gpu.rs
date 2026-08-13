@@ -11,7 +11,7 @@ use ai_gpu::wgpu;
 use ai_gpu::GpuContext;
 use ai_gpu_runtime::Model;
 
-use crate::clock::{FrameClock, Stats};
+use crate::session::clock::{FrameClock, Stats};
 use crate::detect::{Detection, DetectorPost};
 use crate::error::TaskError;
 

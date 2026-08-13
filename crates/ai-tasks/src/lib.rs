@@ -10,18 +10,22 @@
 //! 플랫폼마다 **진짜** 다른 것만 바인딩에 남긴다:
 //! 서피스 획득, 프레임 임포트, 스레드 모델, 모델 바이트 조달.
 
-pub mod clock;
-pub mod composite;
-pub mod cpu_session;
+// 폴더 = 제품 기능(소비하는 데이터 기준), 파일 = 개념 하나 (사용자 확정 규칙):
+//   session/ 모델 인스턴스 · detect/ 얼굴·손 공용 디텍터 수학
+//   features/vb/ 가상배경(마스크 소비: 배경·블러·조명·프레이밍·밝기)
+//   features/face/ 얼굴(랜드마크 소비: 화장·터치업·3D·아바타 예정)
+//   (예정) hand/ gaze/ audio/
 pub mod detect;
 pub mod error;
-pub mod gpu_session;
-pub mod pool;
+pub mod features;
+pub mod session;
 
-pub use clock::Stats;
-pub use composite::{CompositeOpts, Compositor};
-pub use cpu_session::CpuSession;
+// 공개 표면은 재수출로 고정 — 내부 재배치가 바인딩·테스트를 깨지 않는다
 pub use detect::{Detection, DetectorPost};
 pub use error::TaskError;
-pub use gpu_session::GpuSession;
-pub use pool::Pool;
+pub use features::face::{FaceResult, FaceTask};
+pub use session::clock::Stats;
+pub use session::cpu::CpuSession;
+pub use session::gpu::GpuSession;
+pub use session::pool::Pool;
+pub use features::vb::compositor::{CompositeOpts, Compositor};
