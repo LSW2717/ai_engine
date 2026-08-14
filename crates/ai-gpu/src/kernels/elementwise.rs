@@ -26,6 +26,13 @@ pub enum EwOperand {
     Scalar { scalar_first: bool },
     /// tensor∘vector([1,1,C] 채널 브로드캐스트, B 인덱스 = i % P.cg) — SE 스케일 경로
     ChannelVector,
+    /// tensor∘pvec([px] 픽셀 브로드캐스트 — 픽셀별 스칼라를 전 채널에) — LayerNorm 경로.
+    /// grid=false: B가 채널벡터(1,1,px — 4/vec4 팩) / grid=true: B가 픽셀그리드
+    /// (px,1,1 — 픽셀당 vec4 1개, lane0만 유효)
+    PixelVector { grid: bool },
+    /// tensor∘tile([L] 반복 브로드캐스트, L | 4 — 좌표쌍 평균점 빼기 등). B 패턴은
+    /// vec4 하나로 고정되어 코드젠 시 전개된다
+    Tiled { l: u32 },
     /// 단항 (op 무시, v = A[i] → act) — 단독 활성화 op의 lowering 대상
     Unary,
     /// GRU 갱신 mix(A,B,Z) = (1-Z)·A + Z·B (op 무시) — sub/mul/mul/add 4패스 융합
@@ -73,6 +80,11 @@ impl KernelSpec for ElementwiseSpec {
             EwOperand::Scalar { scalar_first: false } => "ts",
             EwOperand::Scalar { scalar_first: true } => "st",
             EwOperand::ChannelVector => "tv",
+            EwOperand::PixelVector { grid: false } => "pv",
+            EwOperand::PixelVector { grid: true } => "pvg",
+            EwOperand::Tiled { l: 1 } => "tile1",
+            EwOperand::Tiled { l: 2 } => "tile2",
+            EwOperand::Tiled { .. } => "tile4",
             EwOperand::Unary => "u",
             EwOperand::Mix => "mix",
         };
@@ -121,6 +133,28 @@ impl KernelSpec for ElementwiseSpec {
             EwOperand::ChannelVector => {
                 format!("var v = {};\n", self.op.wgsl_expr(&av, "vec4f(B[i % P.cg])"))
             }
+            // 픽셀 벡터 — 그룹 i의 픽셀 = i / cg, 전 레인 동일. B 레이아웃 2종
+            EwOperand::PixelVector { grid } => {
+                let b_read = if grid {
+                    "vec4f(f32(B[pix][0u]))" // (px,1,1): 픽셀당 vec4 1개, lane0
+                } else {
+                    "vec4f(f32(B[pix / 4u][pix % 4u]))" // (1,1,px): 4/vec4 팩
+                };
+                format!(
+                    "let pix = i / max(P.cg, 1u);\nvar v = {};\n",
+                    self.op.wgsl_expr(&av, b_read)
+                )
+            }
+            // 타일 벡터: B는 L(∈1,2,4)개 값 — vec4 패턴 하나로 전개 (그룹 무관 상수)
+            EwOperand::Tiled { l } => {
+                let pat = match l {
+                    1 => "vec4f(f32(B[0u][0u]))".to_string(),
+                    2 => "vec4f(f32(B[0u][0u]), f32(B[0u][1u]), f32(B[0u][0u]), f32(B[0u][1u]))"
+                        .to_string(),
+                    _ => "vec4f(B[0u])".to_string(),
+                };
+                format!("var v = {};\n", self.op.wgsl_expr(&av, &pat))
+            }
             EwOperand::Unary => format!("var v = {av};\n"),
             EwOperand::Mix => format!("var v = mix({av}, vec4f({b}), vec4f({z}));\n"),
         };
@@ -164,6 +198,11 @@ mod tests {
             EwOperand::Scalar { scalar_first: false },
             EwOperand::Scalar { scalar_first: true },
             EwOperand::ChannelVector,
+            EwOperand::PixelVector { grid: false },
+            EwOperand::PixelVector { grid: true },
+            EwOperand::Tiled { l: 1 },
+            EwOperand::Tiled { l: 2 },
+            EwOperand::Tiled { l: 4 },
             EwOperand::Unary,
             EwOperand::Mix,
         ];

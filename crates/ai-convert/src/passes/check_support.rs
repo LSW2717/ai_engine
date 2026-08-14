@@ -7,7 +7,7 @@ use crate::passes::{Ctx, PassReport};
 const LOWERABLE: &[&str] = &[
     "Conv", "Mul", "Add", "Sub", "Relu", "Sigmoid", "Tanh", "HardSigmoid", "hswish", "act",
     "Concat", "chview", "chcopy", "resize", "avgpool", "gpool", "maxpool", "mix", "segate",
-    "PRelu",
+    "PRelu", "Sqrt", "Neg", "Reciprocal", "transpose", "relayout",
 ];
 
 pub fn run(g: &mut Graph, _ctx: &Ctx) -> Result<PassReport, ConvertError> {

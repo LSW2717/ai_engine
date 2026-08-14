@@ -1,0 +1,22 @@
+[package]
+name = "ai-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# 모바일 C ABI 바인딩 — vcxrust_ai(vcx-segmentation) 표면 재현이 목표.
+# ai-wasm과 같은 규칙: 분기(if)가 생기면 로직이고 ai-tasks로 내려간다.
+# 플랫폼 몫만 여기: C 타입 변환, YUV 프레임 임포트, 전역 상태 수명, panic 방벽.
+
+[lib]
+# staticlib(iOS)/cdylib(Android) + rlib(네이티브 테스트)
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+ai-gpu.workspace = true
+ai-tasks.workspace = true
+log.workspace = true
+pollster.workspace = true
+
+[dev-dependencies]
+ai-core.workspace = true

@@ -25,8 +25,10 @@ fn face_detect_e2e_cpu() {
     let mut seg = CpuSession::load(&sw).expect("모델 로드");
     let post = DetectorPost::face_short_range();
     let (iw, ih) = post.input_size();
-    let input =
-        ai_tasks::detect::letterbox::letterbox_u8_rgb(&frame, 256, 144, iw as usize, ih as usize);
+    let [lo, hi] = post.input_range();
+    let input = ai_tasks::detect::letterbox::letterbox_u8_rgb(
+        &frame, 256, 144, iw as usize, ih as usize, lo, hi,
+    );
 
     let dets = seg.detect(&post, &input, 256, 144).expect("detect");
     for d in &dets {

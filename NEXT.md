@@ -1,5 +1,108 @@
 # 다음 세션 시작점 (2026-08-14 마감)
 
+## ⚡ 야간 자율 작업 지시 (사용자, 2026-08-14 밤 — 중단 없이 순서대로)
+
+1. ~~blendshape 마감~~ **완료** (§C-6)
+2. **집중도 모드(GazeTask) — 코어 완료 (2026-08-15)**: `features/gaze/` —
+   preprocess(비회전 크롭: bbox 전체 min/max + margin 0.18X/0.22Y **×bbox 크기**,
+   비대칭 클램프·재센터 없음·8px 게이트, cv2 반픽셀 bilinear, ImageNet 정규화
+   **인터리브 NHWC — 엔진 업로드 규약**, 90bin softmax 기댓값 ×4−180) +
+   one_euro(freq 없는 변형: minCutoff 1.3/beta 0.45/dCutoff 1.0, dt=타임스탬프차
+   하한 1ms) + state(집중 판정은 원뿔이 아니라 **비대칭 박스** |yaw|≤24°·pitch
+   [−22,+16]°, 히스테리시스 집중→이탈 350ms/이탈→집중 250ms/무얼굴 600ms/눈감김
+   450ms, **무얼굴 600ms 미만은 직전 상태 유지**, score 30s 창 raw값, baseline
+   24샘플 독립 upper-median idx12) + task(CNN 페이싱 83.3ms, 출력 이름 매칭
+   yaw/pitch, 얼굴 소실 시 필터만 리셋). 테스트 8종 그린. gaze.sw 게이트 기통과.
+   ~~남은 것: wasm export + studio HUD + 웹 diff 게이트~~ **전부 완료 (2026-08-14)**:
+   ① wasm `gaze_task_new/free/reset/gpu`(FaceTask 478pt flat [x,y] 배선, 빈 배열
+   =소실 틱) + 게이트 헬퍼 `gaze_crop_box/crop_pixels/normalize/decode_bins`
+   (preprocess 순수 함수 1:1 노출), GazeTask에 `last_filtered`/`last_cnn()` 노출.
+   ② studio 집중도 체크박스+HUD — FaceTask lm 1회 추론을 아이템 오버레이와 공유
+   (v-ai 이중 로드 낭비의 수리 지점), 비전 틱 10fps 페이싱. 헤드리스 스모크:
+   무얼굴 INITIALIZING→NO_FACE 전이 확인, 스크린샷 OK.
+   ③ **게이트 `web/demo/gaze-ab.html` 전부 PASS**: box 3.6e-9 / crop 6.2e-6
+   (cv2 f64 기준 vs 엔진 f32) / angle 0.000°(gaze.sw+rust decode vs ORT+JS
+   decode, 같은 크롭) / e2e-resample 0.50°≤1.5°(같은 u8 양자화끼리 — cv2
+   재양자화 vs drawImage) / task FOCUSED·score 100 / noface 홀드→NO_FACE.
+   재현: `node tools/run_web.mjs demo/gaze-ab.html`.
+   **게이트 설계 교훈 (vb-diff EMA와 같은 원리)**: |엔진 f32 − 웹 drawImage u8|
+   절대각은 게이트 불가 — u8 재양자화만으로 5.6° 이동 (이 테스트 프레임은 얼굴
+   ~100px→448² 4.5배 업스케일이라 softmax가 평평해 서브 LSB 노이즈가 수 °로
+   증폭). 웹 경로 자체가 getImageData u8이고 우리 f32가 상위 정밀도, 웹 규약상
+   절대각은 baseline 상대 일관성만 필요 (gazeModel.ts 주석). 게이트는 같은
+   양자화끼리 비교해 리샘플 차만 격리한다.
+   잔여: 다중 모니터 투영 분류기는 레이아웃 입력이 호스트 몫이라 API만 열면
+   됨(단일 모니터는 현 구현으로 완결).
+   ⚠ blink의 blendshape 절반(eyeBlinkL/R≥0.55 AND)은 face_blendshapes.sw 개통
+   완료로 배선 가능 — EAR와 OR 결합(웹 규약). Horn/Expression Stream(#7)에서
+   blendshape 상시 추론이 생길 때 같이 배선.
+3. **박수 인식 — 판정 로직 완료**: `features/hand/gesture.rs` —
+   ClapDetector **개선판** (웹 실패모드 수리: ①접촉 순간 양손→한손 융합 미발화
+   → **융합 브리지 트랙**(FUSE_D 1.0·GRACE 5·접근속도) ②handedness 오판 무발화
+   → 보조 신호로 강등(팜 중심 거리 겸용) ③1프레임 드랍에 pair 리셋 → 드랍 용서.
+   웹 상수 CLOSE 0.4/APART 1.2/쿨다운 350ms 유지, 테스트 4종: 느린 박수 rising
+   edge·빠른 박수 융합 브리지·한손 무발화·오판 내성) + thumbsUp/handRaise 1:1
+   이식.
+   **HandTask 조립 + hand-ab 게이트 완료 (2026-08-14)**: `features/hand/`
+   roi.rs(팜 det→ROI + lm→다음 ROI) + task.rs(2손 트래킹 — HandAssociation
+   축정렬 IoU 0.5·num_hands 클립·presence 0.5 게이트·월드 lm 회전 투영) +
+   wasm `hand_task_*`/`gesture_*` exports. **게이트 web/demo/hand-ab.html
+   PASS**: MediaPipe HandLandmarker(wasm, 같은 .task) 대비 **21pt max 1.02px /
+   mean 0.33px** (CPU=GPU 동일), handedness 라벨 일치, 2프레임째 디텍터 생략
+   (트래킹 계약), gesture export 합성 박수 발화+실손 무발화. 프레임은 MediaPipe
+   공식 hands.jpg (make convert-mediapipe가 다운로드).
+   **MediaPipe 출하 quirk 3개 — 원본 소스로 확정, 파리티 우선 복제 (재론 금지)**:
+   ①팜 det ROI target angle이 **90 라디안** (tasks가 도(°) 필드 대신 라디안
+   필드에 90을 넣음 — hand_detector_graph.cc; NEXT.md의 "90° 추정"은 이거였다)
+   ②lm→ROI 회전 조인트 0/4/6/8 = 12점 서브셋 시절 인덱스가 전체 21점에 그대로
+   (실제로는 wrist/thumb-tip/index-PIP/index-tip) ③handedness 원시값은
+   **P(Right)** (TensorsToClassification binary: index0=raw=label "Right") —
+   HandResult 필드는 1−raw=P(Left)로 통일.
+   **게이트가 잡은 버그**: 팜 검출 입력 범위는 **[0,1]** (face는 [-1,1]) —
+   letterbox_u8_rgb에 범위 인자 추가, DetectorPost::input_range() 신설
+   (face-ab 무회귀 재확인 1.10px/0.30px). 잔여: 개선 상수 실카메라 튜닝(사용자),
+   HandTask studio/워커 배선은 vision 워커 조립 때.
+4. ~~3D 에셋 = wgpu로~~ **완료 (2026-08-14)**: vcxrust_ai items3d 이관 —
+   `ai-tasks/features/face/items3d.{rs,wgsl}` + env_room.bin (Horn 피팅·GLB
+   직파싱·PBR·MSAA4·씬 광원 프로브 전부). **studio three.js 오버레이 삭제**
+   (importmap·#fx 캔버스 제거) — 오버레이가 서피스에 직접 알파-오버
+   (`ItemsOverlay`: 렌더→리졸브→블릿). 이관 차이 4개는 items3d.rs 헤더 주석:
+   ①에셋 파일 IO → **호스트 bytes 주입**(`preload_glb` — wasm fetch/ffi fs)
+   ②pollster 에러스코프 제거(naga 정적 테스트가 게이트, MSL+SPIR-V 코드젠까지)
+   ③RGB 프레임 광원 프로브 추가(웹 probeSceneLight 등가 — YUV판은 모바일용 보존)
+   ④ai_engine wgpu 30은 API가 다른 빌드(Option 필드들·multiview_mask 등).
+   wasm exports: `studio_items/studio_item_glb/studio_items_pose/studio_items_probe`.
+   검증: 유닛 11종(피팅 3·GLB 5·env·wgsl 2) 그린 + **합성 얼굴 카메라(y4m)
+   헤드리스에서 hat1이 B티어·배경블러 위에 실렌더 — 스크린샷 확인**. 실카메라
+   착용감(스케일·앵커) 눈검증은 사용자 몫 — 보정값은 웹 GLB_HATS와 동일.
+   ⚠ 카드: wasm 1.96MB (image png/jpeg/webp 디코더 추가분) — 저사양 로드타임
+   상 텍스처 디코드 외부화(createImageBitmap→RGBA 주입) 또는 feature 분리 검토.
+   ⚠ 프레이밍 크롭 중 아이템 좌표 보정은 여전히 P3 이월분 (INTEGRATION.md §2).
+5. ~~wasm 빌드 + 웹 테스트~~ **완료 (2026-08-14)** — 전 게이트 그린: vb-diff /
+   face-ab 1.10px / hand-ab 1.02px / gaze-ab / ffi-diff / studio 헤드리스+스크린샷
+   (합성 얼굴 y4m으로 아이템 실렌더까지). 네이티브 전 스위트 0 실패.
+6. ~~ai-ffi 뼈대 + 네이티브 구현·테스트 → 웹과 diff~~ **완료 (2026-08-14)**:
+   `crates/ai-ffi` (staticlib+cdylib+rlib) — **vcxrust_ai C ABI 표면 재현**
+   (모바일이 .so 교체만으로 갈아타는 seam): `set_video_stream_info(.sw 경로)` /
+   `update_effects_config(JSON — 웹 studio_config와 같은 EffectsPatch 계약)` /
+   `render_mask(I420 in-place — 실추론+이펙트 스택)` / `destroy` /
+   `vcx_string_free`. panic 방벽(catch_unwind), YUV는 BT.601 full-range
+   (yuv.rs — ⚠ CPU 왕복은 임시, GPU 상주 변환이 모바일 필수 카드).
+   내부는 GateHarness 재사용 — `frame_infer` 신설(오프스크린 실추론+리드백,
+   frame()과 타깃 공유). 미배선 표면(update_video_config, face/hand/item/focus)은
+   헤더 주석에 명시 — 태스크는 ai-tasks에 완비, 배선은 모바일 실연결 때(로드맵 E).
+   cbindgen 헤더 생성(ffi-header 타깃)도 그때.
+   **게이트**: ①C 표면 스모크(실추론 — 무인물 프레임에 #00a05a 배경이 덮여
+   Y평면 평균 ~104 확인) ②**네이티브=웹 교차 증명 `web/demo/ffi-diff.html`**:
+   같은 픽스처(vb-diff makeFrame/makeMask Rust 1:1 포팅)를 네이티브(Metal/naga)가
+   덤프 → 브라우저(Chrome/Tint)와 채널 diff — **color max=0 (비트 일치!) /
+   blur max=1 mean 0.010**. 재현: `cargo test -p ai-ffi --release &&
+   node tools/run_web.mjs demo/ffi-diff.html`.
+- **성능 최우선** (저사양 타깃 원칙 유지)
+
+**야간 지시 1~6 전부 완료 (2026-08-14)** — 남은 사용자 몫: 실카메라 눈검증
+(아이템 착용감·집중도·박수 상수 튜닝).
+
 ## 다음 작업 (우선순위 — 2026-08-14 정리)
 
 **A. P1 마무리 — VideoPipeline 완성** (지금 여기)
@@ -42,8 +145,47 @@
      C 티어(소프트 합성) 생기면.
 
 **C. P3 얼굴 스택 — 아바타(표정 포함 인물 교체)의 전제**
-6. **blendshape 모델 개통** — face_blendshapes.tflite 변환+게이트. 아바타
-   eyeBlink/jawOpen과 blink 판정이 소비 (필수 확정, INTEGRATION.md §1.6).
+6. ~~blendshape 모델 개통~~ **완료 (2026-08-15 새벽)** — **CPU max_err 7.5e-7 /
+   GPU 6.6e-7 / GPU 1.34ms**, 기존 5모델+RVM 전부 무회귀(전 스위트 59 그린).
+   재현: ort_dump(오라클 2벌 — 게이트는 최종만, 이등분은 --intermediates) →
+   gate_ort_models(CPU)/gate_models_gpu(GPU).
+   **이번에 뚫은 것 (MLP-Mixer 일반화 — 다음 트랜스포머류 모델의 초석)**:
+   ①Activation 3종(Sqrt/Neg/Recip — 전 백엔드) ②비상수 Div→Recip+Mul
+   ③ReduceSum/중간축 ReduceMean → 희소 pointwise conv ④h==1 채널평균 →
+   transpose+gpool (conv 출력 채널벡터 폴딩 충돌 회피) ⑤**Transpose 커널**(h=1
+   W↔C 실전치, CPU+GPU) ⑥**Relayout 커널**(desc 스트림 항등 재배치 — flatten
+   일반화) ⑦W-concat(AddExtraTokens) → 플랫 concat 샌드위치 ⑧외적 Mul(pvec×
+   cvec상수) → transpose+1×1 conv ⑨행 브로드캐스트 → relayout 샌드위치+PvecTensor
+   ⑩**SwOperand 3종 신설**: PvecTensor(픽셀벡터, grid/packed 2레이아웃)·
+   TiledTensor(L|4)·cvec c=1은 스칼라/Tiled(1)로 ⑪**SwConst**(프리로드 상수
+   텐서 — 학습된 토큰; 전 실행기 로드 시 주입) ⑫rank-2 [M,K] desc (1,M,K)
+   (M>1 Mixer dense — 종전 M=1 가정) ⑬Reshape 일반화: desc 동일→chcopy /
+   스트림 동일→relayout / 채널-major 한쪽→relayout+transpose 분해.
+   **함정 기록 (재발 방지)**: ⓐReshape는 ONNX NCHW row-major 보존이지 desc(NHWC)
+   스트림 보존이 아니다 — C>1·HW>1 텐서가 끼면 transpose 보정 필수
+   ⓑ채널벡터(1,1,N)→그리드(N,1,1) Reshape를 chcopy로 내리면 GPU flatten 경로로
+   새어 지오메트리 오염 — **desc3 비교로 갈라야** 한다 (16곳 오배선, NO_REUSE에선
+   무증상 → 재사용에서만 발병; **debug 빌드로 게이트 1회 돌리면 assert가 잡는다**)
+   ⓒ노드 삽입 canon은 반드시 while 루프 (for+캐시 len은 꼬리 누락 — 실제로 당함)
+   ⓓ진단 시 act 융합된 텐서(sqrt/recip)는 ORT 중간값과 다르게 보이는 위양성
+   ⓔ파일명 긴 tf2onnx 이름은 FNV-1a 절단 (ort_dump.py/dump_all.rs 동일 규칙).
+   모델 정찰: MLP-Mixer(GhumMarkerPoser), 입력 [1,146,2] → 출력 52계수, 195노드.
+   변환: `models/mediapipe/face/face_blendshapes.onnx` 생성됨(prep_mediapipe).
+   **뚫은 것**: ①ReduceSum(L2 norm의 마지막 축 합) → 희소 가중치 pointwise Conv
+   캐논 (rank-3 [1,a,k]는 평탄 채널벡터라 쌍합=1×1 conv, canon/reduce.rs)
+   ②Activation에 **Sqrt/Neg/Recip 3종 추가** (ai-core apply + ai-cpu apply4 +
+   ai-gpu act_expr/ALL 11종 — 전 스위트 그린) ③비상수 Div → Reciprocal+Mul 분해
+   (fold_constants.rs — 노드 삽입은 원 위치+바로 뒤, topo 유지).
+   ④W축 프리픽스 Slice — **뚫음**: h==1 & start==0이면 레이아웃 [w][cg]에서
+   주소식 동일한 연속 프리픽스 = 순수 alias (canon/slice.rs).
+   **다음 관문 (여기서부터)**: ⑤Transpose perm=[0,3,2,1] 19개(토큰↔채널,
+   [1,64,1,97]→[1,97,1,64], h=1) — 실데이터 2D 전치라 **transpose 커널
+   신설(CPU+GPU)** + lower 배선 필요. (w,c)→(c,w) 하나면 된다. GPU는 C4 레인
+   재배치(flatten 커널 참조 — ai-gpu/kernels/flatten.rs가 유사 선례).
+   ⑥변환 후 게이트:
+   `gate_ort_models.rs`(CPU)/`gate_models_gpu.rs`(GPU)에 추가 + MediaPipe 대비
+   계수 diff(face-ab.html 확장). 재현: `cargo run --release -q -p ai-convert --
+   models/mediapipe/face/face_blendshapes.onnx -o /tmp/bs.sw --name face-bs`.
 7. **Horn 피팅 이관 + Expression Stream API** — FaceResult를 {points 478,
    blendshapes 52, pose(quat·t·scale)}로. 웹 face-3d.ts/모바일 items3d와 같은
    FIT_PTS 15점·파워이터레이션. studio 3D 아이템이 첫 소비자(지금은 롤만 반영).

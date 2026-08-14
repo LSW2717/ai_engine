@@ -24,6 +24,8 @@ pub mod session;
 pub use detect::{Detection, DetectorPost};
 pub use error::TaskError;
 pub use features::face::{FaceResult, FaceTask};
+pub use features::gaze::{FocusResult, FocusStatus, GazeTask};
+pub use features::hand::{HandResult, HandTask};
 pub use session::clock::Stats;
 pub use session::cpu::CpuSession;
 pub use session::gpu::GpuSession;

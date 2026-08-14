@@ -76,6 +76,14 @@ function wireControls() {
     $(id).addEventListener('input', push);
   }
   $('item').addEventListener('input', () => setItem($('item').value).catch(console.warn));
+  $('focus').addEventListener('input', () => {
+    if ($('focus').checked) ensureGaze().catch(console.warn);
+    else {
+      $('focushud').textContent = '';
+      lastFocus = null;
+      if (gazeF) aiMod.gaze_task_reset(gazeF.task); // 스트림 파기 규약 — 재켬은 백지에서
+    }
+  });
   $('bgfile').addEventListener('change', async () => {
     const f = $('bgfile').files[0];
     if (!f) return;
@@ -86,18 +94,10 @@ function wireControls() {
   push();
 }
 
-// ── 3D 아이템 오버레이 — three.js가 FaceTask(478pt) 랜드마크를 소비 ──
-// 정밀 Horn 피팅(P3 Expression Stream)은 나중 — 여기선 유사변환(위치·스케일·롤)만.
-let three = null; // { renderer, scene, camera, item, kind }
+// ── 3D 아이템 오버레이 — 엔진 wgpu items3d (three.js 대체, 웹·모바일 통일) ──
+// Horn 피팅·PBR·씬 광원 매칭 전부 엔진 안 — JS는 GLB bytes·랜드마크만 넘긴다.
 let face = null;  // { task, det, lm }
-
-const ITEM_FIT = {
-  // [앵커 계산, 폭 배율, 세로 오프셋(faceW 배)]
-  hat1: ['hat', 1.9, -0.75], hat3: ['hat', 1.8, -0.7], hat_christmas: ['hat', 1.7, -0.8],
-  hat_cat_ears: ['hat', 1.6, -0.75],
-  glasses1: ['eyes', 1.15, 0], glasses_heart: ['eyes', 1.2, 0],
-  mustache1: ['mouth', 0.6, 0],
-};
+const itemsLoaded = new Set(); // GLB 주입 완료 종류
 
 // ── B티어: CPU 추론(R11) + GPU 합성 ──
 // 폴백 사다리 §1.5: 추론이 CPU로 떨어져도 합성 GPU가 살아있으면 효과 전부 산다.
@@ -133,79 +133,37 @@ async function ensureFaceTask() {
   face = { task: aiMod.face_task_new(false), det, lm };
 }
 
+// ── 집중도 (GazeTask) — FaceTask 478pt를 소비, CNN(gaze.sw)은 엔진 내부 페이싱 ──
+let gazeF = null;     // { task, handle }
+let lastFocus = null; // 마지막 FocusResult (HUD·헤드리스 로그)
+async function ensureGaze() {
+  if (gazeF) return;
+  await ensureFaceTask();
+  const b = new Uint8Array(
+    await (await fetch('../models/mediapipe/gaze.sw')).arrayBuffer()
+  );
+  gazeF = { task: aiMod.gaze_task_new(), handle: (await aiMod.load_model_h(b)).handle };
+  log('studio gaze ready');
+}
+
 async function setItem(kind) {
-  const fx = $('fx');
   if (kind === 'none') {
-    if (three) three.item.visible = false;
-    fx.getContext && null;
+    aiMod.studio_items('none', 'none', 'none');
     return;
   }
   await ensureFaceTask();
-  const THREE = await import('three');
-  const { GLTFLoader } = await import('three/addons/loaders/GLTFLoader.js');
-  if (!three) {
-    const renderer = new THREE.WebGLRenderer({ canvas: fx, alpha: true, antialias: true });
-    renderer.setSize(fx.width, fx.height, false);
-    renderer.setClearColor(0x000000, 0); // 오버레이 — 반드시 투명 클리어
-    const scene = new THREE.Scene();
-    scene.add(new THREE.AmbientLight(0xffffff, 1.6));
-    const key = new THREE.DirectionalLight(0xffffff, 1.4);
-    key.position.set(-0.4, 1, 1);
-    scene.add(key);
-    // 픽셀 좌표계 정사영 (y 아래 방향)
-    const camera = new THREE.OrthographicCamera(0, fx.width, 0, -fx.height, -2000, 2000);
-    three = { THREE, renderer, scene, camera, item: null, kind: null };
+  if (!itemsLoaded.has(kind)) {
+    const b = new Uint8Array(await (await fetch(`assets/glb/${kind}.glb`)).arrayBuffer());
+    aiMod.studio_item_glb(kind, b);
+    itemsLoaded.add(kind);
+    log(`studio item ${kind} glb ok (${(b.length / 1024) | 0}KB)`);
   }
-  if (three.kind !== kind) {
-    if (three.item) three.scene.remove(three.item);
-    const gltf = await new GLTFLoader().loadAsync(`assets/glb/${kind}.glb`);
-    const root = gltf.scene;
-    // 정규화: bbox 중심을 원점으로 — 프레임마다 위치·스케일·롤만 갱신
-    const box = new three.THREE.Box3().setFromObject(root);
-    const c = box.getCenter(new three.THREE.Vector3());
-    root.position.sub(c);
-    const holder = new three.THREE.Group();
-    holder.add(root);
-    holder.userData.width = box.getSize(new three.THREE.Vector3()).x || 1;
-    three.scene.add(holder);
-    three.item = holder;
-    three.kind = kind;
-  }
-  three.item.visible = true;
-}
-
-function drawItem(pts, W, H) {
-  if (!three || !three.item || !three.item.visible) return;
-  const px = (i) => [pts[i][0] * W, pts[i][1] * H];
-  const [lx, ly] = px(33);
-  const [rx, ry] = px(263);
-  const [c1x, c1y] = px(234);
-  const [c2x, c2y] = px(454);
-  const faceW = Math.hypot(c2x - c1x, c2y - c1y);
-  const roll = Math.atan2(ry - ly, rx - lx);
-  const [mode, widthK, dyK] = ITEM_FIT[three.kind] || ['eyes', 1, 0];
-  let ax;
-  let ay;
-  if (mode === 'hat') {
-    [ax, ay] = px(10); // 이마 상단
-  } else if (mode === 'eyes') {
-    ax = (lx + rx) / 2;
-    ay = (ly + ry) / 2;
-  } else {
-    [ax, ay] = px(164); // 인중
-  }
-  // 세로 오프셋은 얼굴 '위' 방향(눈선에 수직)으로
-  ax += Math.sin(roll) * -dyK * faceW * -1;
-  ay += Math.cos(roll) * dyK * faceW;
-  const s = (faceW * widthK) / three.item.userData.width;
-  three.item.position.set(ax, -ay, 0);
-  three.item.scale.setScalar(s);
-  three.item.rotation.z = -roll;
-  three.renderer.render(three.scene, three.camera);
-}
-
-function clearItem() {
-  if (three) three.renderer.clear(true, true, true);
+  // 종류 분류는 이름 접두사로 (엔진 KINDS 목록과 일치)
+  aiMod.studio_items(
+    kind.startsWith('hat') ? kind : 'none',
+    kind.startsWith('glasses') ? kind : 'none',
+    kind.startsWith('mustache') ? kind : 'none'
+  );
 }
 
 async function main() {
@@ -244,6 +202,7 @@ async function main() {
   const times = [];   // 제출 벽시계 (참고용 유지)
   const rafIv = [];   // 프레임 간격 실측
   let lastTick = 0;
+  let lastVision = 0; // 집중도 비전 틱 페이싱 (10fps)
   let gpuMs = null;
   let gpuPending = false;
   let lastGpuSample = 0;
@@ -338,9 +297,15 @@ async function main() {
             gpuPending = false;
           });
       }
-      // 3D 아이템 — FaceTask 랜드마크로 오버레이 갱신
+      // 3D 아이템 + 집중도 — FaceTask 랜드마크 공유 (얼굴 lm 1회 추론 공유가
+      // v-ai 이중 로드 낭비의 수리 지점). 아이템은 매 프레임(오버레이 부드러움),
+      // 집중도만 켜져 있으면 비전 틱 10fps(웹 visionFps)로 페이싱.
       // (FaceTask 입력이 아직 u8 프레임이라 여기만 CPU 픽셀 경유 — P3에서 GPU화)
-      if ($('item').value !== 'none' && face) {
+      const wantItem = $('item').value !== 'none' && face;
+      const wantFocus = $('focus').checked && gazeF;
+      const visionDue = wantFocus && now0 - lastVision >= 100;
+      let faceR = null;
+      if (wantItem || visionDue) {
         const d = sctx.getImageData(0, 0, src.width, src.height).data;
         const rgb = new Uint8Array(src.width * src.height * 3);
         for (let i = 0, j = 0; i < d.length; i += 4, j += 3) {
@@ -348,13 +313,44 @@ async function main() {
           rgb[j + 1] = d[i + 1];
           rgb[j + 2] = d[i + 2];
         }
-        const r = await aiMod.face_task_gpu(
+        faceR = await aiMod.face_task_gpu(
           face.task, face.det, face.lm, rgb, src.width, src.height, performance.now()
         );
-        if (r) drawItem(r.points, $('fx').width, $('fx').height);
-        else clearItem();
-      } else if (three) {
-        clearItem();
+        if (wantItem) {
+          if (faceR) {
+            const flat = new Float32Array(faceR.points.length * 3);
+            for (let i = 0; i < faceR.points.length; i++) {
+              flat[i * 3] = faceR.points[i][0];
+              flat[i * 3 + 1] = faceR.points[i][1];
+              flat[i * 3 + 2] = faceR.points[i][2];
+            }
+            aiMod.studio_items_pose(flat);
+            aiMod.studio_items_probe(rgb, src.width, src.height); // 씬 광원 (8틱 스로틀)
+          } else {
+            aiMod.studio_items_pose(new Float32Array(0)); // 소실 — 스무딩 리셋
+          }
+        }
+        if (visionDue) {
+          lastVision = now0;
+          // FaceTask 랜드마크 배선: 정규화 478pt → flat [x,y]×N (없으면 빈 배열 = 소실 틱)
+          let flat = new Float32Array(0);
+          if (faceR) {
+            flat = new Float32Array(faceR.points.length * 2);
+            for (let i = 0; i < faceR.points.length; i++) {
+              flat[i * 2] = faceR.points[i][0];
+              flat[i * 2 + 1] = faceR.points[i][1];
+            }
+          }
+          lastFocus = await aiMod.gaze_task_gpu(
+            gazeF.task, gazeF.handle, rgb, src.width, src.height,
+            flat, faceR ? 1 : 0, performance.now()
+          );
+          $('focushud').textContent =
+            `집중도: ${lastFocus.status} score=${lastFocus.score}` +
+            (lastFocus.yaw != null
+              ? ` yaw=${lastFocus.yaw.toFixed(1)}° pitch=${lastFocus.pitch.toFixed(1)}°`
+              : '');
+        }
       }
     } catch (e) {
       log(`studio frame ERR ${String(e).slice(0, 150)}`);
@@ -384,10 +380,20 @@ async function main() {
       // B티어 강제 — 완료 기준 검증: GPU 추론 없이 배경·블러·조명·프레이밍 생존
       if (cpuSeg) $('tier').value = 'b';
       // 3D 아이템은 얼굴이 있어야 의미가 있다 — 가짜 카메라(무얼굴)에선 배경만 검증
-
+      // 집중도 스모크 — 무얼굴이라 소실 틱 경로(INITIALIZING→NO_FACE)를 돈다
+      $('focus').checked = true;
+      $('focus').dispatchEvent(new Event('input'));
+      // 3D 아이템 스모크 — GLB wasm 주입+파싱+오버레이 경로. 무얼굴이라
+      // draw는 조용히 스킵된다 (크래시 없이 도는지가 목적, 에셋 없으면 warn만)
+      $('item').value = 'hat1';
+      $('item').dispatchEvent(new Event('input'));
     }
     if (frames === 90) {
       log(`studio asset-bg+item ${hudStats()} face=${face ? 'loaded' : 'off'}`);
+      log(
+        `studio focus ${lastFocus ? `${lastFocus.status} score=${lastFocus.score}` : 'no-tick'}` +
+          ` gaze=${gazeF ? 'loaded' : 'off'}`
+      );
       log('studio verdict PASS');
       log('studio-done');
     }

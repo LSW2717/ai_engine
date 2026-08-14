@@ -71,6 +71,10 @@ convert-mediapipe:
 	cp tests/data/frame_256x144.rgb web/models/mediapipe/
 	# face-ab 좌표 diff 게이트의 MediaPipe 비교 상대 (같은 가중치의 원본 tflite)
 	cp models/mediapipe/face/face_detector.tflite web/models/mediapipe/
+	# hand-ab 게이트의 손 테스트 프레임 (MediaPipe 공식 샘플 — 얼굴 프레임엔 손이 없다)
+	test -f web/models/mediapipe/hands.jpg || \
+	  curl -sL -o web/models/mediapipe/hands.jpg \
+	  "https://storage.googleapis.com/mediapipe-tasks/hand_landmarker/woman_hands.jpg"
 
 setup-wasm:
 	rustup target add wasm32-unknown-unknown

@@ -66,6 +66,12 @@ pub enum SwOperand {
     Cvec { w: WRef, c: u32 },
     /// [1,1,C] 채널 벡터 런타임 텐서 (SE 게이트)
     CvecTensor { tid: u32 },
+    /// [px] 픽셀 벡터 런타임 텐서 — 픽셀별 스칼라를 전 채널에 브로드캐스트
+    /// (LayerNorm의 [1,1,H,W] 평균·분산 경로 — face_blendshapes)
+    PvecTensor { tid: u32 },
+    /// [L] 타일 벡터 런타임 텐서 (L | 4) — 채널 인덱스 % L 브로드캐스트
+    /// (평탄 좌표쌍 텐서에서 평균점 빼기 등)
+    TiledTensor { tid: u32 },
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -169,6 +175,21 @@ pub enum SwOp {
         out: u32,
         act: Activation,
     },
+    /// (h=1 전용) W↔C 2D 전치 — in(1,w,c) → out(1,c,w). MLP-Mixer 토큰↔채널
+    /// (face_blendshapes). 레인 재배치가 필요해 view가 아니라 실복사 커널.
+    Transpose {
+        #[serde(rename = "in")]
+        input: u32,
+        out: u32,
+    },
+    /// 논리 순서(row-major) 보존 desc 재배치 — tf2onnx의 [0,2,3,1]/[0,3,1,2]
+    /// 언팩/팩 전치가 이것 (데이터 전치 아님). CPU는 밀집이라 단순 복사,
+    /// GPU만 C4 레인 재패킹 (flatten의 일반화).
+    Relayout {
+        #[serde(rename = "in")]
+        input: u32,
+        out: u32,
+    },
     /// GRU mix(a,b,z) = a + z*(b-a) — fuse_mix 패스가 sub/mul/mul/add 체인에서 방출
     Mix {
         z: u32,
@@ -237,8 +258,20 @@ pub struct SwModel {
     pub outputs: Vec<u32>,
     #[serde(default)]
     pub states: Vec<SwState>,
+    /// 로드 시 블롭에서 채우는 상수 텐서 (학습된 토큰 등 — op이 텐서로 소비).
+    /// 블롭 저장은 **논리 NHWC 밀집 f32 LE** — CPU는 memcpy, GPU는 로드 시 pack.
+    #[serde(default)]
+    pub consts: Vec<SwConst>,
     /// 토폴로지 정렬 완료 상태
     pub ops: Vec<SwOp>,
+}
+
+/// 로드 시 프리로드되는 상수 텐서
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
+pub struct SwConst {
+    pub tid: u32,
+    /// 밀집 f32 LE (h·w·c 개)
+    pub w: WRef,
 }
 
 impl SwModel {
@@ -299,6 +332,7 @@ mod tests {
             inputs: vec![0],
             outputs: vec![2],
             states: vec![],
+            consts: vec![],
             ops: vec![SwOp::Conv {
                 input: 0,
                 out: 1,

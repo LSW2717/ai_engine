@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>gaze 크롭·각도 diff 게이트 — 웹 focus-tracker vs ai_engine</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: ui-sans-serif, system-ui, -apple-system, "Apple SD Gothic Neo", sans-serif;
+    max-width: 1000px; margin: 1.2rem auto; padding: 0 1rem; line-height: 1.5; }
+  h1 { font-size: 1.2rem; margin: 0 0 .25rem; }
+  .note { font-size: .85rem; opacity: .75; margin: 0 0 .9rem; }
+  table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: .35rem .6rem; border-bottom: 1px solid #8883; }
+  td.num { text-align: right; }
+  #status { padding: .5rem .8rem; border-radius: 8px; background: rgba(88,166,255,.12);
+    margin-bottom: .8rem; font-size: .9rem; }
+  canvas { image-rendering: pixelated; border: 1px solid #8886; margin-top: .8rem; }
+</style>
+</head>
+<body>
+<h1>gaze 크롭·각도 diff 게이트</h1>
+<p class="note">같은 프레임 + 같은 478 랜드마크(FaceTask)로 ①크롭 박스 수학
+②크롭 픽셀(cv2 bilinear 규약) ③CNN 각도(gaze.sw vs ORT) ④리샘플 차
+(같은 u8 양자화끼리 — cv2 재양자화 vs drawImage) ⑤GazeTask 상태머신을 검증한다.
+웹 focus-tracker(faceCrop.ts/gazeModel.ts)가 기준. |엔진 f32 − 웹 u8| 절대각 차는
+u8 양자화 민감도(흐린 업스케일 입력에서 수 °)라 게이트가 아니라 참고 로그다 —
+웹 규약상 절대각은 baseline 상대 일관성만 필요하다.</p>
+<div id="status">준비 중…</div>
+<table>
+  <thead><tr><th>검사</th><th class="num">diff</th><th class="num">tol</th><th>판정</th></tr></thead>
+  <tbody id="rows"></tbody>
+</table>
+<div>
+  <canvas id="view" width="256" height="144" style="width:512px;height:288px"></canvas>
+  <canvas id="crop" width="448" height="448" style="width:224px;height:224px"></canvas>
+</div>
+<script type="module" src="gaze-ab.js"></script>
+</body>
+</html>

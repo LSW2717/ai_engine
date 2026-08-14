@@ -47,7 +47,8 @@ fn gpu_outputs_match_ort() {
                 Conv { out, .. } | Binary { out, .. } | Gpool { out, .. }
                 | Avgpool { out, .. } | Maxpool { out, .. } | Resize { out, .. }
                 | Concat { out, .. } | Chcopy { out, .. } | SeGate { out, .. }
-                | Act { out, .. } | Mix { out, .. } => *out,
+                | Act { out, .. } | Mix { out, .. } | Transpose { out, .. }
+                | Relayout { out, .. } => *out,
             };
             let got = pollster::block_on(model.debug_read_tensor(&gctx, out_tid)).unwrap();
             let want = cpu.read(out_tid).unwrap();
@@ -95,8 +96,16 @@ fn gpu_outputs_match_ort() {
             continue;
         };
         let want = read_f32s(&path);
-        let got = pollster::block_on(model.read_output(&gctx, name))
-            .unwrap_or_else(|e| panic!("출력 {name} 읽기 실패: {e:?}"));
+        // ort_dump가 파일명에서 ':' '/' 를 '_'로 치환한다 — 원명 복원 매칭
+        let sanitize = |s: &str| s.replace([':', '/'], "_");
+        let real_name = sw
+            .outputs
+            .iter()
+            .map(|&t| sw.tensors[t as usize].name.clone())
+            .find(|n| sanitize(n) == name)
+            .unwrap_or_else(|| name.to_string());
+        let got = pollster::block_on(model.read_output(&gctx, &real_name))
+            .unwrap_or_else(|e| panic!("출력 {real_name} 읽기 실패: {e:?}"));
         assert_eq!(want.len(), got.len(), "{name} 길이");
         let mut max_err = 0f32;
         for (a, g) in want.iter().zip(&got) {

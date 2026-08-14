@@ -31,23 +31,28 @@ impl Letterbox {
     }
 }
 
-/// u8 RGB 프레임 → dst 크기 레터박스 + [-1,1] 정규화 (bilinear, 패딩은 검정=-1).
+/// u8 RGB 프레임 → dst 크기 레터박스 + [lo,hi] 정규화 (bilinear, 패딩은 검정=lo).
 ///
 /// MediaPipe ImageToTensor(BORDER_ZERO)와 같은 기하: 검정 패딩 픽셀이 범위 변환을
-/// 거쳐 -1이 된다. 웹은 검정으로 채운 캔버스에 drawImage가 같은 일을 하므로
-/// 이 함수는 캔버스 없는 호스트(ffi)와 네이티브 테스트용이다.
+/// 거쳐 lo가 된다. **범위는 디텍터마다 다르다** — face short-range는 [-1,1],
+/// palm detection full은 [0,1] (각 .pbtxt output_tensor_float_range). 프리셋의
+/// `DetectorPost::input_range()`를 넘길 것. 웹은 검정으로 채운 캔버스에
+/// drawImage가 같은 일을 하므로 이 함수는 캔버스 없는 호스트(ffi)와 태스크
+/// 내부·네이티브 테스트용이다.
 pub fn letterbox_u8_rgb(
     src: &[u8],
     src_w: usize,
     src_h: usize,
     dst_w: usize,
     dst_h: usize,
+    lo: f32,
+    hi: f32,
 ) -> Vec<f32> {
     assert_eq!(src.len(), src_w * src_h * 3);
     let scale = (dst_w as f32 / src_w as f32).min(dst_h as f32 / src_h as f32);
     let (cw, ch) = (src_w as f32 * scale, src_h as f32 * scale);
     let (ox, oy) = ((dst_w as f32 - cw) * 0.5, (dst_h as f32 - ch) * 0.5);
-    let mut out = vec![-1.0f32; dst_w * dst_h * 3];
+    let mut out = vec![lo; dst_w * dst_h * 3];
     for dy in 0..dst_h {
         for dx in 0..dst_w {
             let fx = dx as f32 + 0.5 - ox;
@@ -67,7 +72,7 @@ pub fn letterbox_u8_rgb(
                     + p(x1, y0) * tx * (1.0 - ty)
                     + p(x0, y1) * (1.0 - tx) * ty
                     + p(x1, y1) * tx * ty;
-                out[(dy * dst_w + dx) * 3 + c] = v / 127.5 - 1.0;
+                out[(dy * dst_w + dx) * 3 + c] = v / 255.0 * (hi - lo) + lo;
             }
         }
     }
@@ -82,7 +87,7 @@ mod tests {
     fn letterbox_pixels_pad_black() {
         // 2×1 흰 프레임 → 4×4: 콘텐츠는 가운데 두 행 부근, 위아래는 -1
         let src = [255u8; 6];
-        let out = letterbox_u8_rgb(&src, 2, 1, 4, 4);
+        let out = letterbox_u8_rgb(&src, 2, 1, 4, 4, -1.0, 1.0);
         assert_eq!(out.len(), 48);
         assert!(out[0] == -1.0, "좌상단은 패딩");
         // 중앙 행(y=1,2 경계)의 중심 픽셀은 흰색

@@ -27,10 +27,37 @@ pub fn copy_view_into(view: View, px: usize, out: &mut [f32], out_stride: usize,
     }
 }
 
+/// (1,w,c) → (1,c,w) 2D 전치 (h=1 전용 — MLP-Mixer 토큰↔채널, face_blendshapes).
+/// out은 밀집 (c픽셀 × w채널). 소형(97×64급)이라 스칼라 이중 루프로 충분 —
+/// 읽기 순차·쓰기 스트라이드(w) 방향이 캐시에 유리하다.
+pub fn transpose_wc(view: View, w: usize, c: usize, out: &mut [f32]) {
+    debug_assert!(out.len() >= w * c);
+    for x in 0..w {
+        let b = view.base(x);
+        for j in 0..c {
+            out[j * w + x] = view.data[b + j];
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ai_core::rng::XorShift32;
+
+    #[test]
+    fn transpose_wc_roundtrip() {
+        let (w, c) = (5usize, 3usize);
+        let data: Vec<f32> = (0..w * c).map(|i| i as f32).collect();
+        let v = View { data: &data, c_off: 0, stride: c, c };
+        let mut out = vec![0f32; w * c];
+        transpose_wc(v, w, c, &mut out);
+        for x in 0..w {
+            for j in 0..c {
+                assert_eq!(out[j * w + x], data[x * c + j]);
+            }
+        }
+    }
 
     #[test]
     fn concat_two_parts() {

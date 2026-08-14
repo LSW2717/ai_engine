@@ -60,6 +60,7 @@ fn synthetic_graph_matches_cpuexec() {
         inputs: vec![0],
         outputs: vec![5, 6],
         states: vec![],
+        consts: vec![],
         ops: vec![
             SwOp::Conv {
                 input: 0, out: 1, srcs: vec![], res: None,

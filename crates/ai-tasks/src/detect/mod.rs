@@ -81,6 +81,9 @@ pub struct DetectorPost {
     nms_threshold: f32,
     input_w: u32,
     input_h: u32,
+    /// 모델 입력 픽셀 범위 [lo, hi] — .pbtxt output_tensor_float_range.
+    /// **디텍터마다 다르다**: face short-range [-1,1] / palm full [0,1].
+    input_range: [f32; 2],
 }
 
 impl DetectorPost {
@@ -102,6 +105,7 @@ impl DetectorPost {
             nms_threshold: 0.3,
             input_w: 128,
             input_h: 128,
+            input_range: [-1.0, 1.0],
         }
     }
 
@@ -123,12 +127,18 @@ impl DetectorPost {
             nms_threshold: 0.3,
             input_w: 192,
             input_h: 192,
+            input_range: [0.0, 1.0],
         }
     }
 
     /// 모델 입력 크기 (호스트가 레터박스 캔버스를 이 크기로 만든다)
     pub fn input_size(&self) -> (u32, u32) {
         (self.input_w, self.input_h)
+    }
+
+    /// 모델 입력 픽셀 범위 [lo, hi] — 레터박스 정규화·패딩 값이 이걸 따른다
+    pub fn input_range(&self) -> [f32; 2] {
+        self.input_range
     }
 
     /// 모델 출력들(순서 무관)에서 박스/점수 텐서를 **원소 수로** 식별해 디코드+NMS.

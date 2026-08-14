@@ -5,13 +5,16 @@
 //! (reshape은 transpose의 flat_ok 마킹 뒤, pad는 pool의 maxpool 재작성 뒤여야 한다)
 
 pub mod clip;
+pub mod concat_w;
 pub mod expand;
 pub mod gemm;
 pub mod hswish;
 pub mod identity;
+pub mod outer;
 pub mod pad;
 pub mod pool;
 pub mod reduce;
+pub mod rowvec;
 pub mod reshape;
 pub mod resize;
 pub mod slice;
@@ -34,6 +37,9 @@ pub fn run_all(g: &mut Graph, ctx: &Ctx) -> Result<PassReport, ConvertError> {
         pool::run,
         hswish::run,
         transpose::run,
+        concat_w::run,
+        outer::run,
+        rowvec::run,
         reshape::run,
         gemm::run,
         pad::run,

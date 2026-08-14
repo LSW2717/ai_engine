@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>hand 좌표 diff 게이트 — MediaPipe vs ai_engine HandTask</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: ui-sans-serif, system-ui, -apple-system, "Apple SD Gothic Neo", sans-serif;
+    max-width: 1000px; margin: 1.2rem auto; padding: 0 1rem; line-height: 1.5; }
+  h1 { font-size: 1.2rem; margin: 0 0 .25rem; }
+  .note { font-size: .85rem; opacity: .75; margin: 0 0 .9rem; }
+  table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: .35rem .6rem; border-bottom: 1px solid #8883; }
+  td.num { text-align: right; }
+  #status { padding: .5rem .8rem; border-radius: 8px; background: rgba(88,166,255,.12);
+    margin-bottom: .8rem; font-size: .9rem; }
+  #view { border: 1px solid #8886; margin-top: .8rem; }
+  .legend span { display: inline-block; margin-right: 1rem; font-size: .85rem; }
+</style>
+</head>
+<body>
+<h1>hand 좌표 diff 게이트 — HandTask (팜 det→ROI→lm, 2손)</h1>
+<p class="note">같은 프레임을 MediaPipe HandLandmarker(wasm, 같은 .task 가중치)와
+우리 HandTask(팜 검출→ROI[90rad quirk]→회전 크롭→21pt→역투영→트래킹)에 먹여
+좌표·handedness를 비교한다. 2프레임째 디텍터 생략(트래킹 계약)과 제스처
+export(clap 융합 브리지)도 여기서 검증.</p>
+<div id="status">준비 중…</div>
+<table>
+  <thead><tr><th>경로</th><th class="num">손 수</th><th class="num">presence</th>
+    <th class="num">lm diff px (max)</th><th class="num">(mean)</th><th>handedness</th></tr></thead>
+  <tbody id="rows"></tbody>
+</table>
+<div class="legend">
+  <span style="color:#2da44e">■ MediaPipe</span>
+  <span style="color:#d1242f">■ ai_engine CPU</span>
+  <span style="color:#58a6ff">■ ai_engine GPU</span>
+</div>
+<canvas id="view" width="320" height="480" style="width:320px;height:480px"></canvas>
+<script type="module" src="hand-ab.js"></script>
+</body>
+</html>

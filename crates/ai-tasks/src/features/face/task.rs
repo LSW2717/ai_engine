@@ -126,8 +126,9 @@ impl FaceTask {
             Some(r) => r,
             None => {
                 let (iw, ih) = self.post.input_size();
+                let [lo, hi] = self.post.input_range();
                 let input = letterbox_u8_rgb(
-                    frame, img_w as usize, img_h as usize, iw as usize, ih as usize,
+                    frame, img_w as usize, img_h as usize, iw as usize, ih as usize, lo, hi,
                 );
                 let dets = det.detect(self.post, &input, img_w, img_h)?;
                 match self.roi_from_dets(&dets, w, h) {
@@ -165,8 +166,9 @@ impl FaceTask {
             Some(r) => r,
             None => {
                 let (iw, ih) = self.post.input_size();
+                let [lo, hi] = self.post.input_range();
                 let input = letterbox_u8_rgb(
-                    frame, img_w as usize, img_h as usize, iw as usize, ih as usize,
+                    frame, img_w as usize, img_h as usize, iw as usize, ih as usize, lo, hi,
                 );
                 let dets = det.detect(ctx, self.post, &input, img_w, img_h).await?;
                 match self.roi_from_dets(&dets, w, h) {

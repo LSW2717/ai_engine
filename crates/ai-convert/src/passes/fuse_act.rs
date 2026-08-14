@@ -16,6 +16,9 @@ fn act_tag(g: &Graph, idx: usize) -> Result<Option<&'static str>, ConvertError> 
         "Sigmoid" => Some("sigmoid"),
         "Tanh" => Some("tanh"),
         "hswish" => Some("hswish"),
+        "Sqrt" => Some("sqrt"),
+        "Neg" => Some("neg"),
+        "Reciprocal" => Some("recip"),
         "HardSigmoid" => {
             let a = n.attr_f("alpha").unwrap_or(0.2);
             let b = n.attr_f("beta").unwrap_or(0.5);

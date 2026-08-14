@@ -36,7 +36,8 @@ pub fn apply4(act: Activation, v: F32x4) -> F32x4 {
             .min(F32x4::splat(1.0)),
         Activation::Clamp01 => v.max(F32x4::splat(0.0)).min(F32x4::splat(1.0)),
         Activation::Relu6 => v.max(F32x4::splat(0.0)).min(F32x4::splat(6.0)),
-        Activation::Sigmoid | Activation::Tanh => {
+        Activation::Neg => v.mul(F32x4::splat(-1.0)),
+        Activation::Sqrt | Activation::Recip | Activation::Sigmoid | Activation::Tanh => {
             let a = v.to_array();
             F32x4::from_array([
                 act.apply(a[0]),

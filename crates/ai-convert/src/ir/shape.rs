@@ -43,7 +43,7 @@ pub fn infer(g: &Graph, node: &Node) -> Result<Option<Vec<Vec<i64>>>, ConvertErr
     match node.op.as_str() {
         // 단항 (elementwise) — PRelu는 slope가 채널벡터라 shape은 입력 그대로
         "Relu" | "Sigmoid" | "Tanh" | "HardSigmoid" | "HardSwish" | "Clip" | "Identity" | "Erf"
-        | "hswish" | "PRelu" => match shape_of(g, &node.inputs[0]) {
+        | "hswish" | "PRelu" | "Sqrt" | "Neg" | "Reciprocal" => match shape_of(g, &node.inputs[0]) {
             Some(s) => one(s),
             None => Ok(None),
         },
@@ -298,7 +298,7 @@ pub fn infer(g: &Graph, node: &Node) -> Result<Option<Vec<Vec<i64>>>, ConvertErr
                 .unwrap_or_else(|| (0..x.len() as i64).rev().collect());
             one(perm.iter().map(|p| x[*p as usize]).collect())
         }
-        "ReduceMean" => {
+        "ReduceMean" | "ReduceSum" => {
             let Some(x) = shape_of(g, &node.inputs[0]) else { return Ok(None) };
             let axes: Vec<i64> = if let Some(a) = node.attr_is("axes") {
                 a.to_vec()

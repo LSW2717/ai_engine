@@ -54,7 +54,8 @@ fn bisect_real_frame() {
         let out_tid = match op {
             Conv { out, .. } | Binary { out, .. } | Gpool { out, .. } | Avgpool { out, .. }
             | Maxpool { out, .. } | Resize { out, .. } | Concat { out, .. }
-            | Chcopy { out, .. } | SeGate { out, .. } | Act { out, .. } | Mix { out, .. } => *out,
+            | Chcopy { out, .. } | SeGate { out, .. } | Act { out, .. } | Mix { out, .. } | Transpose { out, .. }
+                | Relayout { out, .. } => *out,
         };
         if sw.states.iter().any(|s| s.output == out_tid || s.input == out_tid) {
             continue;

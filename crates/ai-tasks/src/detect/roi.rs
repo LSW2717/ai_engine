@@ -22,20 +22,51 @@ pub struct Roi {
 }
 
 /// MediaPipe NormalizeRadians — (-π, π]로 접기
-fn normalize_radians(a: f32) -> f32 {
+pub(crate) fn normalize_radians(a: f32) -> f32 {
     a - 2.0 * std::f32::consts::PI
         * ((a + std::f32::consts::PI) / (2.0 * std::f32::consts::PI)).floor()
 }
 
-/// 두 키포인트(절대 px)를 잇는 선이 X축과 이루는 각을 target 0으로 보정하는 회전
+/// 두 키포인트(절대 px)를 잇는 선을 target 각(라디안)으로 보정하는 회전
 /// (`DetectionsToRectsCalculator::ComputeRotation` 등가)
+pub(crate) fn rotation_from_points_target(
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    target: f32,
+) -> f32 {
+    normalize_radians(target - (-(y1 - y0)).atan2(x1 - x0))
+}
+
+/// target 0 특례 (face 등 — 두 점을 수평으로)
 fn rotation_from_points(x0: f32, y0: f32, x1: f32, y1: f32) -> f32 {
-    normalize_radians(-(-(y1 - y0)).atan2(x1 - x0))
+    rotation_from_points_target(x0, y0, x1, y1, 0.0)
 }
 
 /// 중심·크기(절대 px)에 square_long + scale을 적용해 Roi로
 /// (`RectTransformationCalculator{scale, square_long, shift 0}` 등가)
 fn expand_square(cx: f32, cy: f32, w: f32, h: f32, rotation: f32, scale: f32) -> Roi {
+    let side = w.max(h) * scale;
+    Roi { cx, cy, w: side, h: side, rotation }
+}
+
+/// `RectTransformationCalculator` 완전판: **shift(회전 프레임, 확장 전 크기 기준)
+/// → square_long → scale** — 원본 calculator의 적용 순서 그대로.
+/// (hand: 팜 det scale 2.6/shift_y −0.5, lm→다음 ROI scale 2.0/shift_y −0.1)
+pub(crate) fn expand_shift_square(
+    cx: f32,
+    cy: f32,
+    w: f32,
+    h: f32,
+    rotation: f32,
+    scale: f32,
+    shift_x: f32,
+    shift_y: f32,
+) -> Roi {
+    let (sinr, cosr) = rotation.sin_cos();
+    let cx = cx + w * shift_x * cosr - h * shift_y * sinr;
+    let cy = cy + w * shift_x * sinr + h * shift_y * cosr;
     let side = w.max(h) * scale;
     Roi { cx, cy, w: side, h: side, rotation }
 }

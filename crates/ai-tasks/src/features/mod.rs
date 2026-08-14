@@ -2,4 +2,6 @@
 //! vb(가상배경) · face(얼굴) · (예정) hand · gaze · audio
 
 pub mod face;
+pub mod gaze;
+pub mod hand;
 pub mod vb;

@@ -119,6 +119,12 @@ pub(crate) enum PlanKind {
         input: ViewRef,
         px: usize,
     },
+    /// (h=1) W↔C 2D 전치 — in(1,w,c) → out(1,c,w)
+    Transpose {
+        input: ViewRef,
+        w: usize,
+        c: usize,
+    },
     Act {
         input: ViewRef,
         px: usize,
@@ -145,6 +151,10 @@ pub(crate) enum Operand {
     CvecConst(usize),
     /// [1,1,C] 런타임 텐서 (SE 게이트 출력 등)
     CvecTensor(ViewRef),
+    /// [px] 픽셀 벡터 — 픽셀별 스칼라 전 채널 브로드캐스트 (LayerNorm)
+    PvecTensor(ViewRef),
+    /// [L] 타일 벡터 (L | 4) — 채널 % L 브로드캐스트
+    TiledTensor(ViewRef),
 }
 
 /// 실행 한 스텝 — 커널 종류 + 출력 슬롯
@@ -167,6 +177,8 @@ pub(crate) struct Plan {
     pub outputs: Vec<(String, ViewRef, usize, usize)>,
     /// 프레임 시작 시 swap할 슬롯 쌍 (state ping-pong)
     pub states: Vec<(usize, usize)>,
+    /// 로드 시 채우는 상수 (슬롯, 밀집 f32)
+    pub consts: Vec<(usize, Vec<f32>)>,
 }
 
 /// op가 읽는 tid 전부 (liveness 해제용)
@@ -186,7 +198,10 @@ fn op_reads(op: &SwOp) -> Vec<u32> {
         SwOp::Binary { a, b, .. } => {
             let mut v = vec![*a];
             match b {
-                SwOperand::Tensor { tid } | SwOperand::CvecTensor { tid } => v.push(*tid),
+                SwOperand::Tensor { tid }
+                | SwOperand::CvecTensor { tid }
+                | SwOperand::PvecTensor { tid }
+                | SwOperand::TiledTensor { tid } => v.push(*tid),
                 _ => {}
             }
             v
@@ -196,6 +211,8 @@ fn op_reads(op: &SwOp) -> Vec<u32> {
         | SwOp::Maxpool { input, .. }
         | SwOp::Chcopy { input, .. }
         | SwOp::Act { input, .. }
+        | SwOp::Transpose { input, .. }
+        | SwOp::Relayout { input, .. }
         | SwOp::SeGate { input, .. } => vec![*input],
         SwOp::Resize { input, srcs, .. } => {
             if srcs.is_empty() {
@@ -220,6 +237,8 @@ fn op_out(op: &SwOp) -> u32 {
         | SwOp::Concat { out, .. }
         | SwOp::Chcopy { out, .. }
         | SwOp::Act { out, .. }
+        | SwOp::Transpose { out, .. }
+        | SwOp::Relayout { out, .. }
         | SwOp::Mix { out, .. }
         | SwOp::SeGate { out, .. } => *out,
     }
@@ -330,7 +349,7 @@ pub(crate) fn build(sw: &SwModel, blob: &[u8]) -> Result<Plan, CpuError> {
         fcs: vec![],
     };
 
-    // 영속 텐서: 그래프 입출력 + 상태 쌍 (백킹 기준)
+    // 영속 텐서: 그래프 입출력 + 상태 쌍 + 프리로드 상수 (백킹 기준)
     for &t in sw.inputs.iter().chain(&sw.outputs) {
         b.persistent.insert(sw.resolve_alias(t).0);
     }
@@ -338,12 +357,29 @@ pub(crate) fn build(sw: &SwModel, blob: &[u8]) -> Result<Plan, CpuError> {
         b.persistent.insert(sw.resolve_alias(s.input).0);
         b.persistent.insert(sw.resolve_alias(s.output).0);
     }
+    for c in &sw.consts {
+        b.persistent.insert(sw.resolve_alias(c.tid).0);
+    }
     // 입력·상태 입력은 op 이전에 존재해야 한다 → 선할당
     for &t in &sw.inputs {
         let (backing, _) = sw.resolve_alias(t);
         if b.slot_of[backing as usize].is_none() {
             b.alloc(backing);
         }
+    }
+    // 프리로드 상수: 선할당 + 데이터 준비 (Model::load가 슬롯에 채운다)
+    let mut consts = Vec::new();
+    for cst in &sw.consts {
+        let (backing, _) = sw.resolve_alias(cst.tid);
+        if b.slot_of[backing as usize].is_none() {
+            b.alloc(backing);
+        }
+        let bytes = b.wref(cst.w);
+        let data: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|x| f32::from_le_bytes([x[0], x[1], x[2], x[3]]))
+            .collect();
+        consts.push((b.slot_of[backing as usize].unwrap(), data));
     }
 
     let mut steps = Vec::with_capacity(sw.ops.len());
@@ -417,6 +453,7 @@ pub(crate) fn build(sw: &SwModel, blob: &[u8]) -> Result<Plan, CpuError> {
         inputs,
         outputs,
         states,
+        consts,
     })
 }
 
@@ -588,6 +625,8 @@ fn lower(b: &mut Builder, op: &SwOp, dt: DType, wdt: DType) -> Result<PlanKind, 
                     Operand::CvecConst(b.push_weights(vals))
                 }
                 SwOperand::CvecTensor { tid } => Operand::CvecTensor(b.view_of(*tid)?),
+                SwOperand::PvecTensor { tid } => Operand::PvecTensor(b.view_of(*tid)?),
+                SwOperand::TiledTensor { tid } => Operand::TiledTensor(b.view_of(*tid)?),
             };
             PlanKind::Binary {
                 bop: *bop,
@@ -658,6 +697,23 @@ fn lower(b: &mut Builder, op: &SwOp, dt: DType, wdt: DType) -> Result<PlanKind, 
             px: b.px(*out),
             act: *act,
         },
+        SwOp::Transpose { input, out } => {
+            let it = &b.sw.tensors[*input as usize];
+            if it.h != 1 {
+                return Err(CpuError::Unsupported(format!("transpose h={} (h=1 전용)", it.h)));
+            }
+            let _ = out;
+            PlanKind::Transpose {
+                input: b.view_of(*input)?,
+                w: it.w as usize,
+                c: it.c as usize,
+            }
+        }
+        // 논리 순서 보존 재배치 — 밀집 NHWC에선 바이트 동일 복사 (Chcopy 재사용)
+        SwOp::Relayout { input, out } => {
+            let _ = out;
+            PlanKind::Chcopy { input: b.view_of(*input)?, px: b.px(*input) }
+        }
         SwOp::Mix { z, a, b: bb, out } => PlanKind::Mix {
             z: b.view_of(*z)?,
             a: b.view_of(*a)?,

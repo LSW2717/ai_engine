@@ -55,6 +55,40 @@ impl GateHarness {
         mask_h: u32,
         ema: bool,
     ) -> Result<Vec<u8>, TaskError> {
+        self.upload(ctx, seg, frame_rgba, fw, fh)?;
+        let t = self.tgt.as_ref().unwrap();
+        self.pipeline
+            .process_gpu_mask(ctx, seg, mask, ch, mask_w, mask_h, ema, fw, fh, &t.view)?;
+        self.readback(ctx, fw, fh).await
+    }
+
+    /// **실추론** 프레임 1장 → 이펙트 스택 → 최종 RGBA — ai-ffi(모바일)의
+    /// 오프스크린 렌더 경로. frame()과 타깃·리드백을 공유하고 마스크 주입 대신
+    /// 세그 추론(process_gpu)을 돈다.
+    pub async fn frame_infer(
+        &mut self,
+        ctx: &GpuContext,
+        seg: &mut GpuSession,
+        frame_rgba: &[u8],
+        fw: u32,
+        fh: u32,
+    ) -> Result<Vec<u8>, TaskError> {
+        self.upload(ctx, seg, frame_rgba, fw, fh)?;
+        let t = self.tgt.as_ref().unwrap();
+        let view = t.view.clone();
+        self.pipeline.process_gpu(ctx, seg, fw, fh, &view).await?;
+        self.readback(ctx, fw, fh).await
+    }
+
+    /// 타깃 확보 + 프레임 텍스처 업로드 (frame/frame_infer 공용)
+    fn upload(
+        &mut self,
+        ctx: &GpuContext,
+        seg: &GpuSession,
+        frame_rgba: &[u8],
+        fw: u32,
+        fh: u32,
+    ) -> Result<(), TaskError> {
         if frame_rgba.len() != (fw * fh * 4) as usize {
             return Err(TaskError::Other(format!(
                 "프레임 크기 불일치: {} ≠ {fw}×{fh}×4",
@@ -99,9 +133,12 @@ impl GateHarness {
                 wgpu::Extent3d { width: fw, height: fh, depth_or_array_layers: 1 },
             );
         })?;
+        Ok(())
+    }
+
+    /// 타깃 텍스처 → RGBA 리드백 (행 패딩 제거)
+    async fn readback(&self, ctx: &GpuContext, fw: u32, fh: u32) -> Result<Vec<u8>, TaskError> {
         let t = self.tgt.as_ref().unwrap();
-        self.pipeline
-            .process_gpu_mask(ctx, seg, mask, ch, mask_w, mask_h, ema, fw, fh, &t.view)?;
         let mut enc = ctx
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("vb-gate") });

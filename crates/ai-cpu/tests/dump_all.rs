@@ -34,11 +34,19 @@ fn dump_all_tensors() {
 
     for (tid, t) in sw.tensors.iter().enumerate() {
         let Ok(v) = ex.read(tid as u32) else { continue };
-        let safe: String = t
+        let mut safe: String = t
             .name
             .chars()
             .map(|c| if c.is_alphanumeric() || c == '_' || c == '.' || c == '-' { c } else { '_' })
             .collect();
+        if safe.len() > 100 {
+            // 파일명 한계 — ort_dump.py와 동일 규칙 (FNV-1a 64)
+            let mut h: u64 = 14695981039346656037;
+            for b in safe.bytes() {
+                h = (h ^ b as u64).wrapping_mul(1099511628211);
+            }
+            safe = format!("{}~{h:016x}", &safe[..100]);
+        }
         let bytes: Vec<u8> = v.iter().flat_map(|f| f.to_le_bytes()).collect();
         std::fs::write(dump.join(format!("{tid:04}__{safe}.f32")), bytes).unwrap();
     }

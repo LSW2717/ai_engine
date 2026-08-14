@@ -3,6 +3,7 @@
 
 use ai_gpu::wgpu;
 use ai_gpu::GpuContext;
+use ai_tasks::features::face::items3d::ItemsOverlay;
 use ai_tasks::features::vb::VideoPipeline;
 use ai_tasks::GpuSession;
 
@@ -10,6 +11,18 @@ pub struct Studio {
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
     pub pipeline: VideoPipeline,
+    /// 3D 아이템 오버레이 (wgpu — three.js 대체, 웹·모바일 렌더러 통일).
+    /// studio_items가 첫 사용 시 생성. ⚠ 프레이밍 크롭 좌표 보정은 P3 이월.
+    pub items: Option<ItemsOverlay>,
+}
+
+impl Studio {
+    /// 파이프라인 출력 위에 아이템 오버레이 (그릴 게 없으면 no-op)
+    fn overlay(&mut self, ctx: &GpuContext, view: &wgpu::TextureView) {
+        if let Some(items) = &mut self.items {
+            items.draw(ctx, view, self.config.format, self.config.width, self.config.height);
+        }
+    }
 }
 
 impl Studio {
@@ -33,7 +46,7 @@ impl Studio {
             desired_maximum_frame_latency: 2,
         };
         surface.configure(&ctx.device, &config);
-        Ok(Studio { surface, config, pipeline: VideoPipeline::new(ctx, format) })
+        Ok(Studio { surface, config, pipeline: VideoPipeline::new(ctx, format), items: None })
     }
 
     /// 프레임 1장: 소스 캔버스 → GPU 텍스처(무복사 임포트) → 파이프라인 → 서피스
@@ -79,6 +92,7 @@ impl Studio {
             .process_gpu(ctx, seg, fw, fh, &view)
             .await
             .map_err(|e| e.to_string())?;
+        self.overlay(ctx, &view);
         drop(frame); // present
         Ok(())
     }
@@ -131,6 +145,7 @@ impl Studio {
         self.pipeline
             .process_gpu_mask(ctx, seg, mask, ch, mask_w, mask_h, true, fw, fh, &view)
             .map_err(|e| e.to_string())?;
+        self.overlay(ctx, &view);
         drop(frame); // present
         Ok(())
     }

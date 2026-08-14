@@ -148,6 +148,10 @@ impl Model {
             persistent.push(map(s.input));
             persistent.push(map(s.output));
         }
+        // 프리로드 상수 — 로드 시 1회 채우고 영원히 산다 (재사용 금지)
+        for c in &sw.consts {
+            persistent.push(map(c.tid));
+        }
         let live_ops: Vec<plan::LiveOp> = lowered
             .iter()
             .map(|lo| plan::LiveOp { reads: lo.reads.clone(), writes: lo.writes.clone() })
@@ -333,6 +337,20 @@ impl Model {
                 load_ms: 0.0,
             },
         };
+
+        // 프리로드 상수 (학습된 토큰 등 — face_blendshapes AddExtraTokens):
+        // 블롭의 밀집 f32 → NHWC-C4 팩 → 텐서 버퍼 (로드 1회)
+        for cst in &model.sw.consts {
+            let (root, _) = model.sw.resolve_alias(cst.tid);
+            let desc = desc_of(&model.sw, root);
+            let bytes = &blob[cst.w.off as usize..(cst.w.off + cst.w.len) as usize];
+            let data: Vec<f32> = bytes
+                .chunks_exact(4)
+                .map(|x| f32::from_le_bytes([x[0], x[1], x[2], x[3]]))
+                .collect();
+            let slot = model.slot_of[&root];
+            ctx.queue.write_buffer(&model.buffers[slot], 0, &pack::pack_nhwc(&data, &desc));
+        }
 
         // 워밍업 — 백엔드 컴파일 강제 + 그래프 전체 유효성 확인
         model.infer(ctx).await?;

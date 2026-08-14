@@ -3,6 +3,8 @@
 
 pub mod avgpool;
 pub mod flatten;
+pub mod transpose;
+pub mod relayout;
 pub mod maxpool;
 pub mod channel_gather;
 pub mod common;

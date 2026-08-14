@@ -9,6 +9,7 @@ members = [
     "crates/ai-convert",
     "crates/ai-bench",
     "crates/ai-wasm",
+    "crates/ai-ffi",
 ]
 
 [workspace.package]
@@ -27,6 +28,8 @@ ai-tasks = { path = "crates/ai-tasks" }
 # GPU
 wgpu = { version = "30", default-features = false }
 naga = "30"
+# GLB 텍스처 디코드 (items3d) — 순수 Rust 디코더라 wasm 동작
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 
 # 공통
 bytemuck = { version = "1", features = ["derive"] }

@@ -209,7 +209,22 @@ pub fn lower_op(
                     (EwOperand::ChannelVector, 0.0, Some(RtBinding::Weights(*w)))
                 }
                 SwOperand::CvecTensor { tid } => {
-                    (EwOperand::ChannelVector, 0.0, Some(RtBinding::Tensor(map(*tid))))
+                    if tdesc(sw, *tid).2 == 1 {
+                        // 런타임 스칼라 (recip 등) — ChannelVector의 B[i%cg]는
+                        // B가 cg개일 때만 유효. l=1 타일(스플랫)로 정확히 표현
+                        (EwOperand::Tiled { l: 1 }, 0.0, Some(RtBinding::Tensor(map(*tid))))
+                    } else {
+                        (EwOperand::ChannelVector, 0.0, Some(RtBinding::Tensor(map(*tid))))
+                    }
+                }
+                SwOperand::PvecTensor { tid } => {
+                    let (bh, bw, _) = tdesc(sw, *tid);
+                    let grid = bh * bw > 1; // (px,1,1) 픽셀그리드 vs (1,1,px) 채널벡터
+                    (EwOperand::PixelVector { grid }, 0.0, Some(RtBinding::Tensor(map(*tid))))
+                }
+                SwOperand::TiledTensor { tid } => {
+                    let l = tdesc(sw, *tid).2;
+                    (EwOperand::Tiled { l }, 0.0, Some(RtBinding::Tensor(map(*tid))))
                 }
             };
             let spec = ElementwiseSpec {
@@ -398,6 +413,38 @@ pub fn lower_op(
             };
             LoweredOp {
                 label: format!("chcopy {src_c}+{n}"),
+                spec: Box::new(spec),
+                bindings: vec![RtBinding::Tensor(map(*input)), RtBinding::Tensor(map(*out))],
+                params: [0; 16],
+                reads: vec![map(*input)],
+                writes: vec![map(*out)],
+            }
+        }
+        SwOp::Transpose { input, out } => {
+            let (h, w, c) = tdesc(sw, *input);
+            debug_assert_eq!(h, 1, "transpose는 h=1 전용");
+            let spec = ai_gpu::kernels::transpose::TransposeSpec { w, c, dt };
+            LoweredOp {
+                label: format!("transpose {w}x{c}"),
+                spec: Box::new(spec),
+                bindings: vec![RtBinding::Tensor(map(*input)), RtBinding::Tensor(map(*out))],
+                params: [0; 16],
+                reads: vec![map(*input)],
+                writes: vec![map(*out)],
+            }
+        }
+        SwOp::Relayout { input, out } => {
+            let (hi, wi, ci) = tdesc(sw, *input);
+            let (ho, wo, co) = tdesc(sw, *out);
+            let spec = ai_gpu::kernels::relayout::RelayoutSpec {
+                px_in: hi * wi,
+                c_in: ci,
+                px_out: ho * wo,
+                c_out: co,
+                dt,
+            };
+            LoweredOp {
+                label: format!("relayout {}x{}->{}x{}", hi * wi, ci, ho * wo, co),
                 spec: Box::new(spec),
                 bindings: vec![RtBinding::Tensor(map(*input)), RtBinding::Tensor(map(*out))],
                 params: [0; 16],

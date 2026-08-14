@@ -26,6 +26,9 @@ fn parse_act(s: Option<&str>) -> Result<Activation, ConvertError> {
         Some("hsigmoid") => Activation::Hardsigmoid,
         Some("clamp01") => Activation::Clamp01,
         Some("relu6") => Activation::Relu6,
+        Some("sqrt") => Activation::Sqrt,
+        Some("neg") => Activation::Neg,
+        Some("recip") => Activation::Recip,
         Some(other) => return Err(ConvertError::Malformed(format!("알 수 없는 act: {other}"))),
     })
 }
@@ -38,6 +41,9 @@ fn unary_act(op: &str) -> Option<Activation> {
         "Tanh" => Activation::Tanh,
         "hswish" => Activation::Hardswish,
         "HardSigmoid" => Activation::Hardsigmoid,
+        "Sqrt" => Activation::Sqrt,
+        "Neg" => Activation::Neg,
+        "Reciprocal" => Activation::Recip,
         _ => return None,
     })
 }
@@ -51,6 +57,8 @@ struct Lowerer<'a> {
     tids: HashMap<String, u32>,
     tensors: Vec<SwTensor>,
     blob: BlobBuilder,
+    /// 상수인데 op이 **텐서로** 소비하는 이름들 (학습된 토큰 등) — SwConst로 프리로드
+    const_names: Vec<String>,
 }
 
 impl<'a> Lowerer<'a> {
@@ -69,7 +77,8 @@ impl<'a> Lowerer<'a> {
             // [1,a,b] — tf2onnx 디텍터 헤드의 flatten 산물 ([1,앵커,16] 등).
             // 평탄 버퍼로 취급한다 — a×b 구조는 호스트가 해석 (reshape canon 참조)
             3 if s[0] == 1 => Ok((1, 1, (s[1] * s[2]) as u32)),
-            2 => Ok((1, 1, s[1] as u32)),
+            // [M,K] — M>1이면 M픽셀×K채널 (Mixer 토큰 dense). M=1은 종전과 동일
+            2 => Ok((1, s[0] as u32, s[1] as u32)),
             1 => Ok((1, 1, s[0] as u32)),
             _ => Err(ConvertError::Malformed(format!("텐서 rank {} 미지원: {name}", s.len()))),
         }
@@ -78,6 +87,9 @@ impl<'a> Lowerer<'a> {
     fn tid(&mut self, name: &str) -> Result<u32, ConvertError> {
         if let Some(t) = self.tids.get(name) {
             return Ok(*t);
+        }
+        if self.g.info(name).map(|t| t.is_const()).unwrap_or(false) {
+            self.const_names.push(name.to_string());
         }
         let (h, w, c) = self.desc_of(name)?;
         let t = self.tensors.len() as u32;
@@ -189,7 +201,20 @@ impl<'a> Lowerer<'a> {
             other => return Err(ConvertError::Malformed(format!("binary 아님: {other}"))),
         };
         let act = parse_act(node.attr_s("act"))?;
-        let a_name = node.inputs[0].clone();
+        let mut a_name = node.inputs[0].clone();
+        let mut b_input = node.inputs.get(1).cloned();
+        // 가환 op에서 브로드캐스트 피연산자가 a 자리에 오면 스왑 (a = 전체 텐서 규약)
+        if matches!(op, BinaryOp::Mul | BinaryOp::Add) && node.attr_f("scalar").is_none() {
+            if let Some(bn) = &b_input {
+                let (ah, aw, ac) = self.desc_of(&a_name)?;
+                let (bh, bw, bc) = self.desc_of(bn)?;
+                if ah * aw * ac < bh * bw * bc {
+                    let t = a_name.clone();
+                    a_name = bn.clone();
+                    b_input = Some(t);
+                }
+            }
+        }
         let a = self.tid(&a_name)?;
 
         let b = if let Some(v) = node.attr_f("scalar") {
@@ -205,8 +230,27 @@ impl<'a> Lowerer<'a> {
                 SwOperand::CvecTensor { tid: self.tid(&bn)? }
             }
         } else {
-            let bn = node.inputs[1].clone();
-            SwOperand::Tensor { tid: self.tid(&bn)? }
+            let bn = b_input
+                .clone()
+                .ok_or_else(|| ConvertError::Malformed(format!("binary b 없음: {}", node.name)))?;
+            let (ah, aw, ac) = self.desc_of(&a_name)?;
+            let (bh, bw, bc) = self.desc_of(&bn)?;
+            let (a_len, b_len) = (ah * aw * ac, bh * bw * bc);
+            if b_len == a_len {
+                SwOperand::Tensor { tid: self.tid(&bn)? }
+            } else if b_len == ah * aw {
+                // 픽셀별 스칼라 브로드캐스트 ([1,1,H,W] — LayerNorm 평균·분산 경로)
+                SwOperand::PvecTensor { tid: self.tid(&bn)? }
+            } else if ah * aw == 1 && b_len > 0 && ac % b_len == 0 && 4 % b_len == 0 {
+                // 평탄 텐서의 타일 브로드캐스트 (좌표쌍 − 평균점 등, L ∈ 1,2,4)
+                SwOperand::TiledTensor { tid: self.tid(&bn)? }
+            } else {
+                // 길이 불일치를 Tensor로 흘리면 런타임 OOB — 명시적으로 거절
+                return Err(ConvertError::Unsupported(vec![format!(
+                    "binary 브로드캐스트 미지원: a {a_len} vs b {b_len} ({})",
+                    node.name
+                )]));
+            }
         };
 
         Ok(SwOp::Binary { a, b, out: self.tid(&node.outputs[0])?, op, act })
@@ -219,7 +263,15 @@ pub fn lower(g: &Graph, ctx: &Ctx, name: &str) -> Result<(SwModel, Vec<u8>), Con
     // 가중치만 f16: 활성화 f32를 유지하면서 std conv 가중치 트래픽만 절반으로
     let wdt = if ctx.fp16 || ctx.fp16_weights { DType::F16 } else { DType::F32 };
     let mut lw =
-        Lowerer { g, dt, wdt, tids: HashMap::new(), tensors: Vec::new(), blob: BlobBuilder::new() };
+        Lowerer {
+            g,
+            dt,
+            wdt,
+            tids: HashMap::new(),
+            tensors: Vec::new(),
+            blob: BlobBuilder::new(),
+            const_names: Vec::new(),
+        };
 
     // 그래프 입력 먼저 등록 (tid 안정성)
     for i in &g.inputs {
@@ -362,6 +414,14 @@ pub fn lower(g: &Graph, ctx: &Ctx, name: &str) -> Result<(SwModel, Vec<u8>), Con
                 out: lw.tid(&node.outputs[0])?,
                 act: parse_act(node.attr_s("act"))?,
             }),
+            "transpose" => ops.push(SwOp::Transpose {
+                input: lw.tid(&node.inputs[0])?,
+                out: lw.tid(&node.outputs[0])?,
+            }),
+            "relayout" => ops.push(SwOp::Relayout {
+                input: lw.tid(&node.inputs[0])?,
+                out: lw.tid(&node.outputs[0])?,
+            }),
             other => {
                 if let Some(act) = unary_act(other) {
                     ops.push(SwOp::Act {
@@ -417,6 +477,15 @@ pub fn lower(g: &Graph, ctx: &Ctx, name: &str) -> Result<(SwModel, Vec<u8>), Con
         .collect();
 
     // last_use 계산
+    // 상수를 텐서로 소비하는 op들의 프리로드 엔트리 (밀집 f32 LE) —
+    // lw 부분 이동(tensors) 전에 처리해야 한다
+    let mut consts = Vec::new();
+    for name_c in std::mem::take(&mut lw.const_names) {
+        let data = lw.const_f32s(&name_c)?;
+        let w = lw.blob.push(bytemuck::cast_slice(&data));
+        consts.push(ai_core::format::SwConst { tid: lw.tids[name_c.as_str()], w });
+    }
+
     let mut tensors = lw.tensors;
     let op_inputs = |op: &SwOp| -> Vec<u32> {
         match op {
@@ -434,7 +503,10 @@ pub fn lower(g: &Graph, ctx: &Ctx, name: &str) -> Result<(SwModel, Vec<u8>), Con
             SwOp::Binary { a, b, .. } => {
                 let mut v = vec![*a];
                 match b {
-                    SwOperand::Tensor { tid } | SwOperand::CvecTensor { tid } => v.push(*tid),
+                    SwOperand::Tensor { tid }
+                    | SwOperand::CvecTensor { tid }
+                    | SwOperand::PvecTensor { tid }
+                    | SwOperand::TiledTensor { tid } => v.push(*tid),
                     _ => {}
                 }
                 v
@@ -450,7 +522,9 @@ pub fn lower(g: &Graph, ctx: &Ctx, name: &str) -> Result<(SwModel, Vec<u8>), Con
             | SwOp::Avgpool { input, .. }
             | SwOp::Maxpool { input, .. }
             | SwOp::Chcopy { input, .. }
-            | SwOp::Act { input, .. } => vec![*input],
+            | SwOp::Act { input, .. }
+            | SwOp::Transpose { input, .. }
+            | SwOp::Relayout { input, .. } => vec![*input],
             SwOp::Concat { parts, .. } => parts.iter().map(|p| p.input).collect(),
             SwOp::SeGate { input, .. } => vec![*input],
             SwOp::Mix { z, a, b, .. } => vec![*z, *a, *b],
@@ -498,6 +572,7 @@ pub fn lower(g: &Graph, ctx: &Ctx, name: &str) -> Result<(SwModel, Vec<u8>), Con
         inputs,
         outputs,
         states,
+        consts,
         ops,
     };
     Ok((model, lw.blob.finish()))

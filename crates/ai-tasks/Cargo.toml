@@ -18,11 +18,12 @@ bytemuck.workspace = true
 thiserror.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
+image.workspace = true
 log.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 web-time.workspace = true
 
 [dev-dependencies]
-naga.workspace = true
+naga = { workspace = true, features = ["wgsl-in", "msl-out", "spv-out"] }
 pollster.workspace = true

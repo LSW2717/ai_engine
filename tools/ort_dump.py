@@ -48,6 +48,11 @@ xe.tofile(os.path.join(outdir, "input_nhwc.f32"))
 
 for o, v in zip(sess.get_outputs(), res):
     safe = re.sub(r"[^A-Za-z0-9_.-]", "_", o.name)
+    if len(safe) > 100:  # 파일명 한계 — dump_all.rs와 동일 규칙 (FNV-1a 64)
+        h = 14695981039346656037
+        for b in safe.encode():
+            h = ((h ^ b) * 1099511628211) % (1 << 64)
+        safe = safe[:100] + "~" + format(h, "016x")
     v.astype(np.float32).tofile(os.path.join(outdir, f"out__{safe}.f32"))
     print(f"{o.name} -> out__{safe}.f32 {list(v.shape)}")
 print(f"input {shape} -> input_nhwc.f32 {list(xe.shape)}")

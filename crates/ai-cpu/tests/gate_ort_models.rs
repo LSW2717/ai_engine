@@ -46,9 +46,18 @@ fn cpu_outputs_match_ort() {
             continue;
         };
         let want = read_f32s(&path);
+        // ort_dump가 파일명에서 ':' '/' 를 '_'로 치환한다 — 원명 복원 매칭
+        let sanitize = |s: &str| s.replace([':', '/'], "_");
+        let real_name = m
+            .sw()
+            .outputs
+            .iter()
+            .map(|&t| m.sw().tensors[t as usize].name.clone())
+            .find(|n| sanitize(n) == name)
+            .unwrap_or_else(|| name.to_string());
         let got = m
-            .read_output(name)
-            .unwrap_or_else(|e| panic!("출력 {name} 읽기 실패: {e:?}"));
+            .read_output(&real_name)
+            .unwrap_or_else(|e| panic!("출력 {real_name} 읽기 실패: {e:?}"));
         assert_eq!(want.len(), got.len(), "{name} 길이");
         let mut max_err = 0f32;
         for (a, g) in want.iter().zip(&got) {

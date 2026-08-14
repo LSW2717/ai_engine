@@ -11,5 +11,5 @@ pub mod model;
 pub use header::{parse_container, write_container, FormatError, BLOB_ALIGN, MAGIC, VERSION};
 pub use model::{
     SeFc,
-    SwAlias, SwConcatPart, SwModel, SwOp, SwOperand, SwSize, SwState, SwTensor, WRef,
+    SwAlias, SwConcatPart, SwConst, SwModel, SwOp, SwOperand, SwSize, SwState, SwTensor, WRef,
 };

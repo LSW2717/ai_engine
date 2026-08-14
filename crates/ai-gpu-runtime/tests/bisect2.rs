@@ -62,7 +62,9 @@ fn bisect_rvm_frame2() {
             | ai_core::format::SwOp::Chcopy { out, .. }
             | ai_core::format::SwOp::SeGate { out, .. }
             | ai_core::format::SwOp::Act { out, .. }
-            | ai_core::format::SwOp::Mix { out, .. } => *out,
+            | ai_core::format::SwOp::Mix { out, .. }
+            | ai_core::format::SwOp::Transpose { out, .. }
+            | ai_core::format::SwOp::Relayout { out, .. } => *out,
         };
         // 상태 텐서의 debug_read는 parity 무시라 짝수 프레임 후 stale — 건너뜀
         if sw.states.iter().any(|s| s.output == out_tid || s.input == out_tid) {

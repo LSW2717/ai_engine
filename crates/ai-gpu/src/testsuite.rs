@@ -188,6 +188,14 @@ pub async fn run_elementwise(ctx: &GpuContext) -> Result<Vec<CaseResult>, String
     );
     // GRU mix (a + z·(b-a)) — 홀수/큰 텐서 양쪽
     results.push(ew_case(ctx, BinaryOp::Add, EwOperand::Mix, Activation::None, &small, 1004).await?);
+    results.push(
+        ew_case(ctx, BinaryOp::Sub, EwOperand::PixelVector { grid: false }, Activation::None, &small, 1005)
+            .await?,
+    );
+    results.push(
+        ew_case(ctx, BinaryOp::Sub, EwOperand::Tiled { l: 2 }, Activation::None, &small, 1006)
+            .await?,
+    );
     results.push(ew_case(ctx, BinaryOp::Add, EwOperand::Mix, Activation::None, &large, 1005).await?);
     Ok(results)
 }
@@ -247,6 +255,40 @@ async fn ew_case(
                 }
             }
             let bdesc = TensorDesc::new(1, 1, desc.c, desc.dt);
+            let b_buf = storage_in(ctx, &pack::pack_nhwc(&bvec, &bdesc));
+            let bytes =
+                run_single(ctx, &spec, &params, &[&a_buf, &b_buf, &out], desc.size_bytes()).await?;
+            (want, bytes)
+        }
+        EwOperand::PixelVector { grid: _ } => {
+            // B = [px] 픽셀 벡터 — 픽셀별 스칼라 전 채널 브로드캐스트
+            let px_n = (desc.h * desc.w) as usize;
+            let bvec = rng.vec_f32(px_n);
+            let mut want = vec![0f32; desc.elems()];
+            for px in 0..px_n {
+                for ch in 0..desc.c as usize {
+                    let v = op.apply(a[px * desc.c as usize + ch], bvec[px]);
+                    want[px * desc.c as usize + ch] = act.apply(v);
+                }
+            }
+            let bdesc = TensorDesc::new(1, 1, px_n as u32, desc.dt);
+            let b_buf = storage_in(ctx, &pack::pack_nhwc(&bvec, &bdesc));
+            let bytes =
+                run_single(ctx, &spec, &params, &[&a_buf, &b_buf, &out], desc.size_bytes()).await?;
+            (want, bytes)
+        }
+        EwOperand::Tiled { l } => {
+            // B = [L] 타일 벡터 (L | 4) — 채널 인덱스 % L
+            let lv = l as usize;
+            let bvec = rng.vec_f32(lv);
+            let mut want = vec![0f32; desc.elems()];
+            for px in 0..(desc.h * desc.w) as usize {
+                for ch in 0..desc.c as usize {
+                    let v = op.apply(a[px * desc.c as usize + ch], bvec[ch % lv]);
+                    want[px * desc.c as usize + ch] = act.apply(v);
+                }
+            }
+            let bdesc = TensorDesc::new(1, 1, l, desc.dt);
             let b_buf = storage_in(ctx, &pack::pack_nhwc(&bvec, &bdesc));
             let bytes =
                 run_single(ctx, &spec, &params, &[&a_buf, &b_buf, &out], desc.size_bytes()).await?;

@@ -48,7 +48,9 @@ fn bisect_segm() {
             | ai_core::format::SwOp::Chcopy { out, .. }
             | ai_core::format::SwOp::SeGate { out, .. }
             | ai_core::format::SwOp::Act { out, .. }
-            | ai_core::format::SwOp::Mix { out, .. } => *out,
+            | ai_core::format::SwOp::Mix { out, .. }
+            | ai_core::format::SwOp::Transpose { out, .. }
+            | ai_core::format::SwOp::Relayout { out, .. } => *out,
         };
         let got = pollster::block_on(model.debug_read_tensor(&ctx, out_tid)).unwrap();
         let want = cpu.read(out_tid).unwrap();

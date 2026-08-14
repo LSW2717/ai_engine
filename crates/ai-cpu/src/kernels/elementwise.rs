@@ -54,6 +54,57 @@ pub fn binary_tensor(op: BinaryOp, a: View, b: View, px: usize, act: Activation,
     }
 }
 
+/// out = act(a ∘ pvec[p]) — 픽셀별 스칼라를 전 채널에 브로드캐스트 (LayerNorm)
+pub fn binary_pvec(
+    op: BinaryOp,
+    a: View,
+    pv: &[f32],
+    px: usize,
+    f: Activation,
+    out: &mut [f32],
+) {
+    let c = a.c;
+    let cv = c / 4 * 4;
+    for p in 0..px {
+        let ab = a.base(p);
+        let s = F32x4::splat(pv[p]);
+        let mut cc = 0usize;
+        while cc < cv {
+            apply4(f, bin4(op, F32x4::load(a.data, ab + cc), s)).store(out, p * c + cc);
+            cc += 4;
+        }
+        for ch in cv..c {
+            out[p * c + ch] = f.apply(op.apply(a.data[ab + ch], pv[p]));
+        }
+    }
+}
+
+/// out = act(a ∘ tile[ch % L]) — 타일 브로드캐스트 (L | 4, 평탄 텐서 전용)
+pub fn binary_tiled(
+    op: BinaryOp,
+    a: View,
+    tv: &[f32],
+    px: usize,
+    f: Activation,
+    out: &mut [f32],
+) {
+    let l = tv.len().max(1);
+    let pat = F32x4::from_array([tv[0], tv[1 % l], tv[2 % l], tv[3 % l]]);
+    let c = a.c;
+    let cv = c / 4 * 4;
+    for p in 0..px {
+        let ab = a.base(p);
+        let mut cc = 0usize;
+        while cc < cv {
+            apply4(f, bin4(op, F32x4::load(a.data, ab + cc), pat)).store(out, p * c + cc);
+            cc += 4;
+        }
+        for ch in cv..c {
+            out[p * c + ch] = f.apply(op.apply(a.data[ab + ch], tv[ch % l]));
+        }
+    }
+}
+
 /// out = act(a ∘ scalar) (first면 scalar ∘ a)
 pub fn binary_scalar(
     op: BinaryOp,

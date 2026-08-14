@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ffi-diff — 네이티브(모바일 경로) 스택 vs 웹 스택</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: ui-sans-serif, system-ui, -apple-system, "Apple SD Gothic Neo", sans-serif;
+    max-width: 1000px; margin: 1.2rem auto; padding: 0 1rem; line-height: 1.5; }
+  h1 { font-size: 1.2rem; margin: 0 0 .25rem; }
+  .note { font-size: .85rem; opacity: .75; margin: 0 0 .9rem; }
+  #status { padding: .5rem .8rem; border-radius: 8px; background: rgba(88,166,255,.12);
+    margin-bottom: .8rem; font-size: .9rem; }
+  canvas { border: 1px solid #8886; max-width: 100%; margin-top: .5rem; }
+  pre { font-size: .85rem; }
+</style>
+</head>
+<body>
+<h1>ffi-diff — 네이티브 스택 = 웹 스택 교차 증명</h1>
+<p class="note">ai-ffi 네이티브 테스트(cargo test -p ai-ffi)가 같은 결정적
+픽스처(vb-diff makeFrame/makeMask)를 Metal(naga-MSL)로 렌더해 덤프한 RGBA를,
+브라우저(Chrome Tint-MSL)가 같은 픽스처를 렌더한 결과와 채널 diff한다.
+같은 WGSL·같은 입력 — 차이는 셰이더 컴파일러 반올림뿐이어야 한다.</p>
+<div id="status">준비 중…</div>
+<pre id="log"></pre>
+<canvas id="ours" width="640" height="360"></canvas>
+<script type="module" src="ffi-diff.js"></script>
+</body>
+</html>

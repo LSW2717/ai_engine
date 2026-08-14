@@ -30,11 +30,10 @@
 <button id="start">시작</button>
 <div class="row" style="margin-top:.8rem">
   <!-- 백킹 1280×720, CSS 표시 640×360 — 레티나(dpr 2)에서 디바이스 픽셀 1:1.
-       백킹=표시 크기로 두면 브라우저가 2배 업스케일해 화질이 뭉개진다 -->
+       백킹=표시 크기로 두면 브라우저가 2배 업스케일해 화질이 뭉개진다.
+       3D 아이템은 엔진 wgpu 오버레이가 out 서피스에 직접 그린다 (three.js 제거) -->
   <div style="position:relative; width:640px; height:360px">
     <canvas id="out" width="1280" height="720" style="width:640px; height:360px"></canvas>
-    <canvas id="fx" width="1280" height="720"
-      style="position:absolute; left:0; top:0; width:640px; height:360px; pointer-events:none; border:none"></canvas>
   </div>
   <div class="panel">
     <label>배경</label>
@@ -68,6 +67,7 @@
       <option value="b">B — CPU 추론+GPU 합성</option>
     </select><span id="tierv"></span>
     <label>조명</label><input type="checkbox" id="light" /><span></span>
+    <label>집중도</label><input type="checkbox" id="focus" /><span></span>
     <label>프레이밍</label><input type="checkbox" id="framing" /><span id="framingv"></span>
     <label>미러</label><input type="checkbox" id="mirror" /><span></span>
     <label>회전</label>
@@ -82,13 +82,8 @@
     <label>흑백(배경)</label><input type="range" id="gray" min="0" max="100" value="0" /><span id="grayv">0</span>
   </div>
 </div>
-<script type="importmap">
-{ "imports": {
-  "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
-  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
-} }
-</script>
 <div id="hud"></div>
+<div id="focushud" style="font-variant-numeric: tabular-nums; font-size: .85rem; opacity: .8;"></div>
 <canvas id="src" width="640" height="360" style="display:none"></canvas>
 <script type="module" src="studio.js"></script>
 </body>

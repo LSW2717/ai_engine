@@ -37,7 +37,12 @@ impl Model {
         let plan = plan::build(&sw, blob)?;
         // +4 패딩: 커널의 4레인 로드가 텐서 마지막 픽셀에서 최대 3개를 초과
         // 읽어도 (K패딩 conv, 값은 가중치 0으로 소거) 슬라이스 안에 있게 한다.
-        let slots = plan.slot_len.iter().map(|&l| vec![0f32; l + 4]).collect();
+        let mut slots: Vec<Vec<f32>> =
+            plan.slot_len.iter().map(|&l| vec![0f32; l + 4]).collect();
+        // 프리로드 상수 (학습된 토큰 등 — face_blendshapes AddExtraTokens)
+        for (slot, data) in &plan.consts {
+            slots[*slot][..data.len()].copy_from_slice(data);
+        }
         let im_len = plan
             .steps
             .iter()
@@ -286,6 +291,8 @@ fn prof_meta(plan: &Plan, kind: &PlanKind, out_len: usize) -> (String, f64, f64)
             let in2 = match operand {
                 Operand::Tensor(t) => (*px * t.c) as f64,
                 Operand::CvecTensor(t) => t.c as f64,
+                Operand::PvecTensor(t) => t.c as f64,
+                Operand::TiledTensor(t) => t.c as f64,
                 Operand::CvecConst(i) => plan.weights[*i].len() as f64,
                 Operand::Scalar { .. } => 0.0,
             };
@@ -350,6 +357,11 @@ fn prof_meta(plan: &Plan, kind: &PlanKind, out_len: usize) -> (String, f64, f64)
         ),
         PlanKind::Chcopy { input, px } => (
             format!("chcopy c{} px{px}", input.c),
+            0.0,
+            2.0 * out_len as f64 * f32b,
+        ),
+        PlanKind::Transpose { w, c, .. } => (
+            format!("transpose {w}x{c}"),
             0.0,
             2.0 * out_len as f64 * f32b,
         ),
@@ -470,8 +482,26 @@ fn dispatch(
                 }
                 Operand::CvecTensor(t) => {
                     let tv = view(slots, *t);
+                    if tv.c == 1 {
+                        // 런타임 스칼라 (recip 등) — cvec 커널은 len==a.c 가정이라 OOB
+                        let v = tv.data[tv.c_off];
+                        elementwise::binary_scalar(*bop, av, v, false, *px, *act, out)
+                    } else {
+                        let vec = &tv.data[tv.c_off..tv.c_off + tv.c];
+                        elementwise::binary_cvec(*bop, av, vec, *px, *act, out)
+                    }
+                }
+                Operand::PvecTensor(t) => {
+                    // pvec 값 = px개: 채널벡터(1,1,px)든 픽셀그리드(px,1,1)든
+                    // 밀집 슬롯에선 연속 px개다 (c로 자르면 그리드형에서 OOB — 실제로 당함)
+                    let tv = view(slots, *t);
+                    let vec = &tv.data[tv.c_off..tv.c_off + *px];
+                    elementwise::binary_pvec(*bop, av, vec, *px, *act, out)
+                }
+                Operand::TiledTensor(t) => {
+                    let tv = view(slots, *t);
                     let vec = &tv.data[tv.c_off..tv.c_off + tv.c];
-                    elementwise::binary_cvec(*bop, av, vec, *px, *act, out)
+                    elementwise::binary_tiled(*bop, av, vec, *px, *act, out)
                 }
             }
         }
@@ -539,6 +569,9 @@ fn dispatch(
         PlanKind::Chcopy { input, px } => {
             let v = view(slots, *input);
             shape::copy_view_into(v, *px, out, v.c, 0);
+        }
+        PlanKind::Transpose { input, w, c } => {
+            shape::transpose_wc(view(slots, *input), *w, *c, out);
         }
         PlanKind::Act { input, px, act } => {
             elementwise::act(view(slots, *input), *px, *act, out)

@@ -18,7 +18,25 @@ pub fn run(g: &mut Graph, _ctx: &Ctx) -> Result<PassReport, ConvertError> {
         let src = node.inputs[0].clone();
         let out = node.outputs[0].clone();
 
-        if perm == [0, 3, 1, 2] && g.inputs.iter().any(|i| *i == src) {
+        let in_shape = g.info(&src).and_then(|t| t.static_shape().map(|s| s.to_vec()));
+        let dim = |i: usize| in_shape.as_ref().and_then(|s| s.get(i).copied()).unwrap_or(0);
+        let rank4 = in_shape.as_ref().map(|s| s.len() == 4).unwrap_or(false);
+        let boundary_in = g.inputs.iter().any(|i| *i == src);
+        if perm == [0, 3, 2, 1] && rank4 && dim(2) == 1 {
+            // 내부 W↔C 전치 (h==1) — MLP-Mixer 토큰↔채널 (face_blendshapes).
+            // 레인 재배치가 필요한 실복사 → transpose 커널 op로 강등
+            g.nodes[idx].op = "transpose".into();
+            report.rewrites += 1;
+        } else if !boundary_in
+            && ((perm == [0, 2, 3, 1] && rank4 && dim(2) == 1)
+                || (perm == [0, 3, 1, 2] && rank4 && dim(1) == 1))
+        {
+            // 논리 row-major 순서 보존 재배치 (tf2onnx 언팩/팩) — 데이터 전치 아님.
+            // [0,2,3,1] in [1,C,1,W]→[1,1,W,C] / [0,3,1,2] in [1,1,H,W]→[1,W,1,H]
+            // 둘 다 desc의 논리 스트림이 동일 → relayout(레인 재패킹)으로 강등
+            g.nodes[idx].op = "relayout".into();
+            report.rewrites += 1;
+        } else if perm == [0, 3, 1, 2] && boundary_in {
             // NHWC 입력 → 내부 NCHW: 입력 텐서의 IR shape을 NCHW로 재기록
             let nchw = g.info(&out).unwrap().static_shape().unwrap().to_vec();
             g.info_mut(&src).shape = Some(nchw);

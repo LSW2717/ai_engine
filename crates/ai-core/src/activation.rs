@@ -15,6 +15,12 @@ pub enum Activation {
     Clamp01,
     /// clamp(x, 0, 6) — MobileNetV2 계열 (MediaPipe hand_landmarks)
     Relu6,
+    /// sqrt(max(x, 0)) — L2 norm·layernorm 분산 경로 (face_blendshapes)
+    Sqrt,
+    /// -x (blendshapes layernorm의 tf 분해 산물)
+    Neg,
+    /// 1/x — Div는 canon이 Recip+Mul로 분해한다
+    Recip,
 }
 
 impl Activation {
@@ -29,6 +35,9 @@ impl Activation {
             Activation::Hardsigmoid => (x / 6.0 + 0.5).clamp(0.0, 1.0),
             Activation::Clamp01 => x.clamp(0.0, 1.0),
             Activation::Relu6 => x.clamp(0.0, 6.0),
+            Activation::Sqrt => x.max(0.0).sqrt(),
+            Activation::Neg => -x,
+            Activation::Recip => 1.0 / x,
         }
     }
 
@@ -43,6 +52,9 @@ impl Activation {
             Activation::Hardsigmoid => "hsigmoid",
             Activation::Clamp01 => "clamp01",
             Activation::Relu6 => "relu6",
+            Activation::Sqrt => "sqrt",
+            Activation::Neg => "neg",
+            Activation::Recip => "recip",
         }
     }
 }

@@ -69,6 +69,17 @@ impl<'a> CpuExec<'a> {
                 self.vals[s.input as usize] = Some(vec![0f32; (t.h * t.w * t.c) as usize]);
             }
         }
+        // 프리로드 상수 (밀집 f32 LE — 학습된 토큰 등)
+        for cst in &self.model.consts {
+            if self.vals[cst.tid as usize].is_none() {
+                let data: Vec<f32> = self
+                    .wref(cst.w)
+                    .chunks_exact(4)
+                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .collect();
+                self.vals[cst.tid as usize] = Some(data);
+            }
+        }
 
         let dt = self.model.dt_default;
         assert_eq!(dt, DType::F32, "verify는 f32 모델 전용");
@@ -156,6 +167,14 @@ impl<'a> CpuExec<'a> {
                     groups: *groups,
                     act: *act,
                 };
+                if x.len() != (ih * iw * *cin) as usize {
+                    return Err(ConvertError::Other(format!(
+                        "conv 입력 불일치: len {} ≠ {ih}×{iw}×{cin} ('{}' → '{}')",
+                        x.len(),
+                        self.model.tensors[*input as usize].name,
+                        self.model.tensors[*out as usize].name,
+                    )));
+                }
                 let y = reference::conv::conv2d(
                     &conv,
                     ih,
@@ -186,7 +205,47 @@ impl<'a> CpuExec<'a> {
                     }
                     SwOperand::CvecTensor { tid } => {
                         let vals = self.read(*tid)?;
-                        cvec_apply(*bop, &x, &vals, h, w, c, *act)
+                        if vals.len() == 1 {
+                            // 런타임 스칼라 (recip 등) — cvec은 len==c 가정
+                            reference::elementwise::binary_scalar(*bop, &x, vals[0], false, *act)
+                        } else {
+                            cvec_apply(*bop, &x, &vals, h, w, c, *act)
+                        }
+                    }
+                    SwOperand::TiledTensor { tid } => {
+                        let vals = self.read(*tid)?;
+                        let l = vals.len().max(1);
+                        let mut y = vec![0f32; x.len()];
+                        let cc = c as usize;
+                        for p in 0..(h * w) as usize {
+                            for ch in 0..cc {
+                                y[p * cc + ch] =
+                                    act.apply(bop.apply(x[p * cc + ch], vals[ch % l]));
+                            }
+                        }
+                        y
+                    }
+                    SwOperand::PvecTensor { tid } => {
+                        // 픽셀별 스칼라 전 채널 브로드캐스트 (LayerNorm)
+                        let vals = self.read(*tid)?;
+                        let (px, cc) = ((h * w) as usize, c as usize);
+                        if vals.len() < px {
+                            return Err(ConvertError::Other(format!(
+                                "pvec 길이 {} < px {px} (a={} b={} '{}'×'{}')",
+                                vals.len(),
+                                a,
+                                tid,
+                                self.model.tensors[*a as usize].name,
+                                self.model.tensors[*tid as usize].name,
+                            )));
+                        }
+                        let mut y = vec![0f32; x.len()];
+                        for p in 0..px {
+                            for ch in 0..cc {
+                                y[p * cc + ch] = act.apply(bop.apply(x[p * cc + ch], vals[p]));
+                            }
+                        }
+                        y
                     }
                 };
                 (*out, y)
@@ -261,6 +320,24 @@ impl<'a> CpuExec<'a> {
                 let mut y = vec![0f32; px * nn];
                 for p in 0..px {
                     y[p * nn..(p + 1) * nn].copy_from_slice(&x[p * c + s..p * c + s + nn]);
+                }
+                (*out, y)
+            }
+            // 논리 순서 보존 재배치 — 레퍼런스(밀집 NHWC)에선 항등 복사
+            SwOp::Relayout { input, out } => (*out, self.read(*input)?),
+            SwOp::Transpose { input, out } => {
+                // (h=1) W↔C 2D 전치 — in(1,w,c) NHWC 밀집 → out(1,c,w)
+                let (h, w, c) = self.hw(*input);
+                if h != 1 {
+                    return Err(ConvertError::Malformed(format!("transpose h={h} (h=1 전용)")));
+                }
+                let x = self.read(*input)?;
+                let (w, c) = (w as usize, c as usize);
+                let mut y = vec![0f32; w * c];
+                for p in 0..w {
+                    for j in 0..c {
+                        y[j * w + p] = x[p * c + j];
+                    }
                 }
                 (*out, y)
             }

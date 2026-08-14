@@ -26,11 +26,15 @@ pub fn act_expr(act: Activation, var: &str) -> String {
         }
         Activation::Clamp01 => format!("clamp({var}, vec4f(0.0), vec4f(1.0))"),
         Activation::Relu6 => format!("clamp({var}, vec4f(0.0), vec4f(6.0))"),
+        // CPU 레퍼런스와 동일: 음수는 0으로 (레인 패딩의 쓰레기값 sqrt(NaN) 방지 겸)
+        Activation::Sqrt => format!("sqrt(max({var}, vec4f(0.0)))"),
+        Activation::Neg => format!("(-{var})"),
+        Activation::Recip => format!("(vec4f(1.0) / {var})"),
     }
 }
 
 /// 캐시 키·테스트 그리드용 전체 활성화 목록
-pub const ALL: [Activation; 8] = [
+pub const ALL: [Activation; 11] = [
     Activation::None,
     Activation::Relu,
     Activation::Sigmoid,
@@ -39,4 +43,7 @@ pub const ALL: [Activation; 8] = [
     Activation::Hardsigmoid,
     Activation::Clamp01,
     Activation::Relu6,
+    Activation::Sqrt,
+    Activation::Neg,
+    Activation::Recip,
 ];
