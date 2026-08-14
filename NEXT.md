@@ -219,9 +219,10 @@ v-ai 연결 보류 중) 또는 E(아바타 에셋 대기 / mnv4-RVM 교체).
     (MediaPipe 원본 확정값 + 좌표계 수리).
 
 **D. P4 웹 연결**
-11. **VbEngine 3함수** (config/destroy/processWorkerFrame) ai-wasm 구현 —
-    v-ai 4번째 티어로 A/B. 계약: 1프레임 직렬화 · passthrough=입력 비트맵
-    제로카피 반환 · **destroy는 모델 유지**(웜 워커). 착수 전 사용자 확인(v-ai 연결 보류 중).
+11. ~~VbEngine 3함수 ai-wasm 구현~~ **엔진 쪽 완료 (2026-08-15)** — §"배선 국면"
+    참조 (Director + vb_* + web/vb-engine.js 심 + 워커 게이트 PASS).
+    남은 것은 **v-ai 리포 쪽 연결만**: pipeline.worker.ts 티어 사다리에
+    ai_engine 추가 (엔진 스왑/강등 래치) — v-ai 연결은 보류 중, 착수 전 확인.
 
 **E. 이후 순서**: P5 아바타 replace 합성 모드 → hand/gaze 태스크(웹 크롭 규약
 주의 — 게이즈는 비회전 bbox+종횡비 무시) → ai-ffi(vcxrust_ai 표면 재현, ncnn 제거
@@ -420,6 +421,75 @@ pipe.uses_fgr() 게이트 단언 포함. ⚠ 한계+수리 (2026-08-14, 사용�
 - 잔여: HandTask·게이즈 CNN 크롭의 GPU화(커널은 범용 — lo/hi 인자화 완료, 게이즈는
   비회전 bbox+ImageNet 정규화라 **별도 커널 필요**), items 광원 프로브 GPU화
   (마지막 getImageData 소비자 — 16×16 샘플이면 다운스케일 리드백로도 충분).
+
+**배선 국면 완료 (2026-08-15) — ai-ffi(모바일)·ai-wasm(웹) 양쪽, 사용자 지시
+"동일 재현이 아니라 우리 구현을 편하게 쓰는 표면"**. 정찰 2건(vcxrust_ai C
+ABI/JNI 전체 표면·v-ai VbEngine 티어 계약 — 파일:라인 대조) 후 3층 구현:
+- **`ai_tasks::Director` 신설 (src/director.rs)** — studio.js에서 검증한
+  오케스트레이션의 Rust화: 세그 파이프라인 + FaceTask(process_tex) + 터치업/
+  메이크업 fx + 3D 아이템(크롭 동행·프로브 8틱) + 손 제스처(detectFps 페이싱·
+  FIFO 16 큐) + 집중도(비전 틱·num_faces=2) + **지연 로드**(모델 바이트 주입 →
+  켜질 때 세션 생성). 단일 JSON = EffectsPatch + 태스크 키(faceItems/
+  handDetection/focusDetection — vcxrust effects JSON과 같은 필드명). 판정 3종
+  `needs_render/tasks_active/passthrough` + `wants_pixels(t)`(호스트 픽셀 추출
+  최소화). 결과는 우리 타입 JSON(`focus_json` 7상태 전체·`poll_gesture_json`).
+  A티어 `frame`/B티어 `frame_mask`(process_mask_nogpu — 세그 모델 불필요)/
+  analyzer-only(target 없이 태스크만 — vcxrust 고속경로 등가). `detach`=웜(세션
+  유지)/`reset`=세션 드랍(모델 바이트 유지). **바인딩에 분기 없음 규칙의 이행** —
+  ffi/wasm은 접착만. 게이트 tests/director.rs: 실모델 e2e — FOCUSED 도달·합성
+  검증·웜 재가동.
+- **ai-ffi 완성**: 표면 = set_video_stream_info(seg .sw) + set_face/hand/gaze_
+  model_info(gaze는 bs nullable) + set_item_model_dir(GLB fs 지연 로더) +
+  update_effects_config(단일 JSON — VideoOptionsC 이원 채널은 **재현 안 함**) +
+  set_background_image(RGBA 바이너리 — base64 왕복 제거) + set_focus_layout +
+  render_mask(음수 치수 허용·passthrough면 변환도 안 함·analyzer-only 무수정) +
+  get_focus_state/poll_hand_gesture(vcx_string_free) + destroy=리셋(모델 유지) +
+  오디오 fe_* 5종(16k/48k `{dir}/fe16|fe48/graph.json+weights.bin`, 미지원
+  레이트는 480 passthrough). **VbResult Failure=-1**(vcxrust와 동일 값 — 호스트
+  `==-1` 검사 보호). **JNI 레이어**(java_api.rs, cfg android — C 표면을 그대로
+  감싸는 무로직 래퍼, Kotlin 시그니처는 파일 헤더): 안드로이드는 C ABI 대신 JNI
+  심볼 소비(vcxrust와 같은 분리), aarch64-linux-android 타입체크 통과. **cbindgen
+  헤더** `make ffi-header` → crates/ai-ffi/include/ai_engine_ffi.h. 게이트:
+  tests/ffi.rs extended_surface_smoke — C 표면으로 집중도 FOCUSED 실추론·음수
+  치수·오디오·웜 destroy 재가동 (표면 테스트는 SURFACE_LOCK 직렬화 — 전역
+  STATE 공유).
+- **ai-wasm vb 모듈 + 심**: `vb.rs`(OffscreenCanvas 서피스 + ImageBitmap 무복사
+  임포트 — web-sys 기능 추가) exports: vb_attach/config/model/glb/bg_image/
+  layout/frame/frame_mask(B티어)/analyze(무합성)/focus_state/poll_gesture/
+  detach(웜)/passthrough·needs_render·wants_pixels. **`web/vb-engine.js`** =
+  VbEngine 3함수 심(v-ai pipeline.worker 계약 그대로): passthrough 제로카피,
+  **출력 확보 후에만 입력 close**(먼저 닫고 throw하면 워커 복구 경로가 detach
+  비트맵 전송 — 원본 대조로 확정한 함정), 모델 로드는 config에서
+  fire-and-forget·로드 중 passthrough, VBOptions 번역(blur/brightness/grayscale
+  ÷100·degree 360→0·base64 배경→vb_bg_image·faceEffects→faceItems+GLB fetch·
+  메이크업 룩 프리셋→기본 룩 매핑 — v-ai MAKEUP_LOOKS 주입 자리 표시).
+  **게이트 web/demo/vb-engine.html + vb-worker.js — 진짜 Worker 경계에서 4검사
+  전부 PASS**: passthrough 입력 동일 객체(제로카피 증명)·render(배경 합성+크기
+  보존)·focus FOCUSED(얼굴 y4m)·warm destroy→재합성.
+- 정찰 확정 사실(실연결 때 필요): v-ai "티어"는 2층 — 세그 모델 사다리(gl-rvm…
+  — 우리 심과 무관)와 **VbEngine 엔진 모듈**(우리가 붙는 자리, lite가 최소
+  선례). 입력은 항상 ImageBitmap(VideoFrame 소유는 워커), 반환 비트맵은 즉시
+  transfer라 재사용 금지. destroy는 엔진 스왑 때도 불림·웜 재사용 전제.
+  v-ai 쪽 유일 수정 지점 = pipeline.worker.ts 사다리(엔진 셀렉션에 avatar/3D
+  강제 webgl2 조건 추가). 이건 v-ai 연결(보류) 때.
+- **모바일 아티팩트 빌드 개통 (2026-08-15)**: `make build-android`(cargo-ndk,
+  arm64-v8a/armeabi-v7a/x86_64 → target/jniLibs) + `make build-ios`(3타깃 →
+  lipo 심 유니버설 → AiEngineFFI.xcframework, cbindgen 헤더 동봉) —
+  vcxrust_ai README 레시피의 ai-ffi판. **실측 (vs vcxrust_ai 출하본)**:
+  Android .so = arm64 **8.4 vs 21.2MB**, v7a 5.7 vs 14.1, x86_64 9.1 vs 25.8
+  (**ABI당 ~2.5배 작음** — ncnn C++ 스택 부재). iOS는 .a(링크 전 아카이브)가
+  68.4 vs 66.0MB로 동급으로 **보이지만 착시** — 링크 실험으로 실증: 같은 조건
+  (-Os -dead_strip, 동일 수출 심볼 5개 사용, 미니 바이너리)으로 디바이스 .a를
+  링크하면 **ai_engine 6.8MB vs vcxrust 15.6MB(+MoltenVK 별도) = 2.3배 작음**
+  (Android와 일치). .a가 안 준 이유: 아카이브는 링커가 버릴 데드코드까지 전부
+  담고, Rust 모노모피제이션이 링크 전 오브젝트 볼륨을 부풀린다 — 실배포 크기는
+  링크 후 증가분이 기준. 모델은 라이브러리에 **미포함**(호스트 조달 규약 —
+  전 기능 .sw 합계 ~36MB, VB만이면 RVM 7.6MB; vcxrust resources는 16MB).
+  추가 다이어트 여지: 모바일 프로필 lto/opt-level=z 미적용 (wasm 다이어트
+  카드와 한 묶음).
+- 잔여 카드: YUV↔RGB CPU 왕복(ffi)의 GPU 상주화, HandTask/게이즈 크롭 GPU화,
+  워커별 feature 빌드(wasm 다이어트 — P4 실연결 때), JNI 클래스명은 앱에 맞춰
+  리네임, 모바일 릴리스 프로필(lto/opt-z) 튜닝.
 
 **잔잔한 마감 6종 — 완료 (2026-08-14)**:
 - **OneEuro VIDEO 확정** (smoothing.rs): MediaPipe face_landmarks_detector_graph

@@ -1,5 +1,5 @@
 # ai_engine 태스크 러너 — 절대경로 금지, 모든 경로는 저장소 루트 기준
-.PHONY: build-native test bench build-wasm build-wasm-dev serve-web web clean setup-wasm ffi-header convert-rvm-web convert-r11-web convert-fastenhancer
+.PHONY: build-native test bench build-wasm build-wasm-dev serve-web web clean setup-wasm ffi-header build-android build-ios convert-rvm-web convert-r11-web convert-fastenhancer
 
 build-native:
 	cargo build --release -p ai-gpu
@@ -9,6 +9,33 @@ ffi-header:
 	cbindgen --config crates/ai-ffi/cbindgen.toml --crate ai-ffi \
 	  --output crates/ai-ffi/include/ai_engine_ffi.h crates/ai-ffi
 	@echo "→ crates/ai-ffi/include/ai_engine_ffi.h"
+
+# ── 모바일 아티팩트 (vcxrust_ai README 레시피의 ai-ffi판) ──
+# Android .so 3종 (arm64-v8a/armeabi-v7a/x86_64) — cargo install cargo-ndk +
+# ANDROID_NDK_HOME 필요. 출력: target/jniLibs/<abi>/libai_ffi.so
+# (앱 배치 시 -o ./android/app/src/main/jniLibs 로 교체)
+build-android:
+	cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 \
+	  -o target/jniLibs build --release -p ai-ffi
+
+# iOS xcframework: 디바이스(arm64) + 시뮬레이터 유니버설(arm64+x86_64, lipo)
+# → target/xcframework/AiEngineFFI.xcframework (헤더 = cbindgen 생성물 동봉)
+build-ios: ffi-header
+	cargo build --release --target aarch64-apple-ios -p ai-ffi
+	cargo build --release --target aarch64-apple-ios-sim -p ai-ffi
+	cargo build --release --target x86_64-apple-ios -p ai-ffi
+	mkdir -p target/ios-sim-universal target/xcframework
+	lipo -create -output target/ios-sim-universal/libai_ffi.a \
+	  target/aarch64-apple-ios-sim/release/libai_ffi.a \
+	  target/x86_64-apple-ios/release/libai_ffi.a
+	lipo -info target/ios-sim-universal/libai_ffi.a
+	rm -rf target/xcframework/AiEngineFFI.xcframework
+	xcodebuild -create-xcframework \
+	  -library target/aarch64-apple-ios/release/libai_ffi.a \
+	  -headers crates/ai-ffi/include \
+	  -library target/ios-sim-universal/libai_ffi.a \
+	  -headers crates/ai-ffi/include \
+	  -output target/xcframework/AiEngineFFI.xcframework
 
 test:
 	cargo test --workspace
