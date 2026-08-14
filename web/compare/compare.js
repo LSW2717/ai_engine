@@ -134,10 +134,15 @@ async function benchWebgl2() {
   for (let i = 0; i < WARMUP; i++) step();
   gl.finish();
   const load = performance.now() - t0;
-  const t1 = performance.now();
-  for (let i = 0; i < FRAMES; i++) step();
-  gl.finish();
-  const ms = (performance.now() - t1) / FRAMES;
+  // 경합-강건 측정: 10프레임 배치 ×8회의 min — 단일 배치 평균은 다른 앱의 GPU
+  // 점유가 섞이면 부푼다 (측정 규율: 절대값은 min 계열로).
+  let ms = Infinity;
+  for (let b = 0; b < 8; b++) {
+    const t1 = performance.now();
+    for (let i = 0; i < 10; i++) step();
+    gl.finish();
+    ms = Math.min(ms, (performance.now() - t1) / 10);
+  }
   return { ms, load, draws: engine.stats.draws };
 }
 
@@ -202,7 +207,12 @@ async function benchOurs(url = '../models/rvm_256x144.sw') {
   const tFetch = performance.now() - t0;
   const report = await load_model(bytes);
   const load = performance.now() - t0;
-  const bench = await model_bench(FRAMES); // 내부: 시드 입력, 워밍업 3, 상태 ping-pong
+  // 경합-강건 측정: 10프레임 배치 ×8회의 min (webgl2 행과 동일 프로토콜)
+  let bench = null;
+  for (let b = 0; b < 8; b++) {
+    const r = await model_bench(10); // 내부: 시드 입력, 워밍업 3, 상태 ping-pong
+    if (!bench || r.ms_per_frame < bench.ms_per_frame) bench = r;
+  }
   // 콜드 첫 로드가 웹 체감을 지배한다 — fetch와 파이프라인 컴파일을 나눠서 본다
   console.log(
     `AI_ENGINE_RESULT: loadbreak ${url} fetch ${tFetch.toFixed(0)}ms ` +
@@ -216,7 +226,10 @@ async function main() {
   if (!navigator.gpu) {
     say('WebGPU 미지원 — ORT/ours 측정 불가');
   }
+  // ?duo=1: webgl2 vs ai_engine 2행만 (추격 이터레이션용 — ORT/TF.js 로드 ~80s 생략)
+  const duo = new URLSearchParams(location.search).has('duo');
   // 서멀 편향을 우리 쪽에 불리하게: 우리 엔진을 마지막에
+  if (!duo) {
   try {
     say('1/4 ORT-web WebGPU (fp32) 실행 중…');
     const r = await benchOrt('../models/rvm_fp32_ortfix.onnx', 'fp32', false);
@@ -245,6 +258,7 @@ async function main() {
   } catch (e) {
     addRow('TF.js (webgpu)', 'ERR', '-', String(e).slice(0, 300));
   }
+  } // !duo
   try {
     say('5/6 webgl2-engine-span 실행 중…');
     const r = await benchWebgl2();
@@ -253,25 +267,11 @@ async function main() {
     addRow('webgl2-engine-span.js', 'ERR', '-', String(e).slice(0, 300));
   }
   try {
-    say('6/7 ai_engine (.sw, fp32) 실행 중…');
-    const r = await benchOurs();
-    addRow('ai_engine (wgpu, fp32)', r.ms, r.load, `${r.report.ops} ops`);
+    say('6/6 ai_engine (.sw fp16) 실행 중…');
+    const r = await benchOurs(); // 출하본 rvm_256x144.sw = --fp16 (라벨 정정)
+    addRow('ai_engine (wgpu, fp16)', r.ms, r.load, `${r.report.ops} ops`);
   } catch (e) {
-    addRow('ai_engine (wgpu, fp32)', 'ERR', '-', String(e).slice(0, 300));
-  }
-  try {
-    say('8/8 ai_engine (고정 export, 가중치 fp16) 실행 중…');
-    const r = await benchOurs('../models/rvm_fixed_fp16w.sw');
-    addRow('ai_engine (고정 export, 가중치 fp16)', r.ms, r.load, `${r.report.ops} ops`);
-  } catch (e) {
-    addRow('ai_engine (고정 export)', 'ERR', '-', String(e).slice(0, 200));
-  }
-  try {
-    say('7/8 ai_engine (.sw, 가중치 fp16) 실행 중…');
-    const r = await benchOurs('../models/rvm_256x144_fp16w.sw');
-    addRow('ai_engine (wgpu, 가중치 fp16)', r.ms, r.load, `${r.report.ops} ops, 블롭 절반`);
-  } catch (e) {
-    addRow('ai_engine (wgpu, 가중치 fp16)', 'ERR', '-', String(e).slice(0, 300));
+    addRow('ai_engine (wgpu, fp16)', 'ERR', '-', String(e).slice(0, 300));
   }
   say('완료');
   console.log('AI_ENGINE_RESULT: compare-done');

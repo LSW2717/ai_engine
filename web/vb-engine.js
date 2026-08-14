@@ -26,6 +26,8 @@ let segReady = false;
 const url = (p) => new URL(p, import.meta.url).href;
 const MODEL = {
   seg: url('models/rvm_256x144.sw'),
+  // B티어 폴백 — R11 CPU 세그 (지연 로드: 강등 확정 때만)
+  seg_cpu: url('models/segm_r11_160x288.sw'),
   face_det: url('models/mediapipe/face_detector.sw'),
   face_lm: url('models/mediapipe/face_landmarks.sw'),
   gaze: url('models/mediapipe/gaze.sw'),
@@ -42,6 +44,38 @@ const DEFAULT_LOOK = {
   blush: { color: '#edaab2', alpha: 0.18, size: 0.23 },
   shadow: { color: '#b98d84', alpha: 0.16 },
 };
+
+// ── mirror/degree 호스트 전처리 (webgl2 _prepareSourceElement 파리티) ──
+// 엔진 계약: mirror/degree 프레임 변환은 **호스트 몫** (엔진은 이미지 배경 좌표
+// 보정에만 쓴다 — any_active 에도 안 들어간다). 추론 전 적용 = 좌표계가 화면
+// 좌표계가 되는 계약(face-effects lm)도 이걸로 지켜진다.
+let cfgMirror = false;
+let cfgDegree = 0;
+let txCanvas = null;
+
+function hostTransformActive() {
+  return cfgMirror || ((cfgDegree % 360) + 360) % 360 !== 0;
+}
+
+/** 원본 비트맵 → mirror/degree 적용본 (같은 크기 캔버스 — mirror 먼저, rotate 다음) */
+async function hostTransform(bitmap) {
+  const w = bitmap.width;
+  const h = bitmap.height;
+  if (!txCanvas || txCanvas.width !== w || txCanvas.height !== h) {
+    txCanvas = new OffscreenCanvas(w, h);
+  }
+  const cx = txCanvas.getContext('2d');
+  cx.save();
+  cx.setTransform(1, 0, 0, 1, 0, 0);
+  cx.clearRect(0, 0, w, h);
+  cx.translate(w / 2, h / 2);
+  if (cfgMirror) cx.scale(-1, 1);
+  const d = ((cfgDegree % 360) + 360) % 360;
+  if (d !== 0) cx.rotate((d * Math.PI) / 180);
+  cx.drawImage(bitmap, -w / 2, -h / 2, w, h);
+  cx.restore();
+  return createImageBitmap(txCanvas);
+}
 
 async function ensureInit() {
   if (initPromise) return initPromise;
@@ -111,8 +145,14 @@ function translate(cfg) {
   if ('blur' in cfg) out.blur = (cfg.blur ?? 0) / 100;
   if ('brightness' in cfg) out.brightness = (cfg.brightness ?? 100) / 100;
   if ('grayscale' in cfg) out.grayscale = (cfg.grayscale ?? 0) / 100;
-  if ('mirror' in cfg) out.mirror = !!cfg.mirror;
-  if ('degree' in cfg) out.degree = cfg.degree === 360 ? 0 : cfg.degree ?? 0;
+  if ('mirror' in cfg) {
+    out.mirror = !!cfg.mirror;
+    cfgMirror = !!cfg.mirror; // 호스트 전처리용
+  }
+  if ('degree' in cfg) {
+    out.degree = cfg.degree === 360 ? 0 : cfg.degree ?? 0;
+    cfgDegree = out.degree; // 호스트 전처리용
+  }
   if ('background' in cfg) {
     const bg = cfg.background;
     if (bg == null || bg === '') out.background = null;
@@ -153,6 +193,27 @@ function translate(cfg) {
   return out;
 }
 
+// 번역된 우리 키 기준 누적 config — **fetch 판정 전용**. 엔진 판정(vb_needs_render)은
+// 프레임 비행 중 캐시(stale)일 수 있어 모델 fetch 결정에 쓰면 로드가 누락된다.
+const applied = {};
+function noteApplied(j) {
+  for (const k of Object.keys(j)) applied[k] = j[k];
+}
+// Director.needs_render 등가 (any_active + faceItems)
+function needsRenderLocal() {
+  return (
+    applied.background != null ||
+    (applied.blur ?? 0) > 0 ||
+    Math.abs((applied.brightness ?? 1) - 1) > 1e-3 ||
+    (applied.grayscale ?? 0) > 0 ||
+    !!applied.studioLight?.enabled ||
+    !!applied.framing?.enabled ||
+    !!(applied.touchUp?.enabled && (applied.touchUp.strength ?? 0) > 0) ||
+    !!applied.makeup?.enabled ||
+    !!applied.faceItems
+  );
+}
+
 function applyConfig(cfg) {
   const j = translate(cfg);
   try {
@@ -161,23 +222,99 @@ function applyConfig(cfg) {
     console.warn('[vb-engine] config:', e);
     return;
   }
+  noteApplied(j);
   // 필요한 모델 fire-and-forget (v-ai _loadTFLiteModel 규약)
-  if (ai.vb_needs_render()) fetchModel('seg');
+  if (needsRenderLocal()) fetchModel('seg');
   const faceNeeded =
-    j.faceItems || j.touchUp?.enabled || j.makeup?.enabled || j.focusDetection?.enabled;
+    applied.faceItems ||
+    applied.touchUp?.enabled ||
+    applied.makeup?.enabled ||
+    applied.focusDetection?.enabled;
   if (faceNeeded) {
     fetchModel('face_det');
     fetchModel('face_lm');
   }
-  if (j.focusDetection?.enabled) {
+  if (applied.focusDetection?.enabled) {
     fetchModel('gaze');
     fetchModel('gaze_bs');
   }
-  if (j.handDetection?.enabled) {
+  if (applied.handDetection?.enabled) {
     fetchModel('hand_det');
     fetchModel('hand_lm');
   }
-  if (j.faceItems) for (const k of [j.faceItems.hat, j.faceItems.eyewear, j.faceItems.beard]) fetchGlb(k);
+  if (applied.faceItems) {
+    for (const k of [applied.faceItems.hat, applied.faceItems.eyewear, applied.faceItems.beard]) {
+      fetchGlb(k);
+    }
+  }
+}
+
+// ── B티어: CPU 추론(R11, ai-cpu) + GPU 합성(vb_frame_mask) — studio.js 검증
+// 로직 이식. 강등 판정 = 1s 페이싱 샘플(gpu_sync 배수 → 한 프레임 실비용) 10개
+// 창 p90>66ms 2연속 (첫 창 웜업 폐기, 승격 없음 — v-ai 규약).
+let cpuSeg = null; // { io, canvas, ctx2d, rgb }
+let cpuSegLoading = null;
+let demoted = false;
+let gpuWin = [];
+let winCount = 0;
+let badWindows = 0;
+let lastGpuSample = 0;
+
+function ensureCpuSeg() {
+  if (cpuSeg) return Promise.resolve();
+  if (!cpuSegLoading) {
+    cpuSegLoading = (async () => {
+      const r = await fetch(MODEL.seg_cpu);
+      if (!r.ok) throw new Error(`${MODEL.seg_cpu}: ${r.status}`);
+      ai.load_model_cpu(new Uint8Array(await r.arrayBuffer()));
+      const io = ai.model_io_cpu();
+      const canvas = new OffscreenCanvas(io.w, io.h);
+      cpuSeg = {
+        io,
+        canvas,
+        ctx2d: canvas.getContext('2d', { willReadFrequently: true }),
+        rgb: new Float32Array(io.w * io.h * 3),
+      };
+      console.info(`[vb-engine] B티어 준비 (R11 ${io.w}x${io.h} CPU)`);
+    })().catch((e) => {
+      cpuSegLoading = null;
+      console.warn('[vb-engine] B티어 로드 실패:', e);
+    });
+  }
+  return cpuSegLoading;
+}
+
+/** B티어 한 프레임: R11 CPU 로짓 → 엔진 주입 → GPU 합성 (효과 전부 생존) */
+function cpuInferMask(src) {
+  const { io, ctx2d, rgb: crgb } = cpuSeg;
+  ctx2d.drawImage(src, 0, 0, io.w, io.h);
+  const d = ctx2d.getImageData(0, 0, io.w, io.h).data;
+  for (let p = 0, q = 0; p < d.length; p += 4, q += 3) {
+    crgb[q] = d[p] / 255;
+    crgb[q + 1] = d[p + 1] / 255;
+    crgb[q + 2] = d[p + 2] / 255;
+  }
+  return ai.infer_frame_cpu(crgb, io.outputs[0]); // view 아닌 복사 (규약 함정 회피)
+}
+
+function recordGpuSample(ms) {
+  gpuWin.push(ms);
+  if (gpuWin.length < 10) return;
+  const s = gpuWin.slice().sort((a, b) => a - b);
+  const p90 = s[Math.floor(s.length * 0.9)];
+  gpuWin.length = 0;
+  winCount++;
+  if (winCount <= 1) return; // 웜업 창 폐기
+  if (p90 > 66) {
+    badWindows++;
+    if (badWindows >= 2 && !demoted) {
+      demoted = true;
+      console.warn(`[vb-engine] B티어 강등 (실비용 창 p90 ${p90.toFixed(1)}ms × ${badWindows})`);
+      void ensureCpuSeg();
+    }
+  } else {
+    badWindows = 0;
+  }
 }
 
 /** u8 RGB 추출 (손/집중도 CNN·광원 프로브 소비 틱에만 — vb_wants_pixels) */
@@ -225,33 +362,63 @@ export async function processWorkerFrame(bitmap, timeSec) {
     void ensureInit().catch(() => {});
     return { bitmap, passthrough: true };
   }
-  if (ai.vb_passthrough()) return { bitmap, passthrough: true };
+  const tx = hostTransformActive();
+  if (ai.vb_passthrough()) {
+    if (!tx) return { bitmap, passthrough: true };
+    // mirror/degree만 켠 조합 — 프레임 변환은 호스트 몫 (엔진 any_active 미포함).
+    // 세그/GPU 없이 2D 캔버스만으로 동작한다.
+    const out = await hostTransform(bitmap);
+    bitmap.close();
+    return { bitmap: out, passthrough: false };
+  }
+  // 추론 전 변환 적용 = 좌표계가 화면 좌표계가 되는 계약 (webgl2 파리티)
+  const src = tx ? await hostTransform(bitmap) : bitmap;
   let rgb;
   try {
-    if (ai.vb_wants_pixels(t)) rgb = extractRgb(bitmap);
+    if (ai.vb_wants_pixels(t)) rgb = extractRgb(src);
   } catch (e) {
     console.warn('[vb-engine] rgb 추출:', e);
   }
-  if (ai.vb_needs_render()) {
-    if (!segReady && !hasRenderWithoutSeg()) {
-      // 모델 로드 중 — 원본 그대로 (검은 화면 방지, v-ai 규약)
-      return { bitmap, passthrough: true };
+  try {
+    if (ai.vb_needs_render()) {
+      const useCpu = demoted && !!cpuSeg; // 강등 확정 + R11 준비된 뒤에만 B
+      if (!segReady && !useCpu) {
+        // 세그 로드 중 — (변환본) 그대로 (검은 화면 방지, v-ai 규약)
+        if (src !== bitmap) bitmap.close();
+        return { bitmap: src, passthrough: src === bitmap };
+      }
+      if (useCpu) {
+        // B티어: R11 CPU 추론 → GPU 합성
+        const logits = cpuInferMask(src);
+        await ai.vb_frame_mask(src, logits, 2, cpuSeg.io.w, cpuSeg.io.h, rgb, t);
+      } else if (performance.now() - lastGpuSample > 1000) {
+        // A티어 페이싱 샘플 — 큐 배수 후 이 프레임만 완료 대기 (실비용)
+        lastGpuSample = performance.now();
+        await ai.gpu_sync();
+        const t0 = performance.now();
+        await ai.vb_frame(src, rgb, t);
+        await ai.gpu_sync();
+        recordGpuSample(performance.now() - t0);
+      } else {
+        await ai.vb_frame(src, rgb, t);
+      }
+      const out = surfaceCanvas.transferToImageBitmap();
+      if (src !== bitmap) src.close();
+      bitmap.close(); // 출력 확보 후에만 (복구 경로 함정)
+      return { bitmap: out, passthrough: false };
     }
-    await ai.vb_frame(bitmap, rgb, t);
-    const out = surfaceCanvas.transferToImageBitmap();
-    bitmap.close(); // 출력 확보 후에만 (복구 경로 함정)
-    return { bitmap: out, passthrough: false };
+    // analyzer-only — 태스크만 돌고 (변환본) 반환
+    await ai.vb_analyze(src, rgb, t);
+    if (src !== bitmap) {
+      bitmap.close();
+      return { bitmap: src, passthrough: false };
+    }
+    return { bitmap, passthrough: true };
+  } catch (e) {
+    // 원본 bitmap 은 워커 복구 경로가 전송한다 — 변환본만 정리하고 재throw
+    if (src !== bitmap) src.close();
+    throw e;
   }
-  // analyzer-only — 태스크만 돌고 원본 그대로
-  await ai.vb_analyze(bitmap, rgb, t);
-  return { bitmap, passthrough: true };
-}
-
-// 아이템만 켜진 경우(비디오 효과 없음)는 seg 없이도 렌더 가능 여부 — 현재
-// Director는 렌더 경로에 seg를 요구하지 않는 조합이 없어 false 고정 (아이템도
-// 파이프라인 위 오버레이라 seg 필요). 조합이 생기면 여기서 판별.
-function hasRenderWithoutSeg() {
-  return false;
 }
 
 // ───────── 진단/게이트 보조 ─────────

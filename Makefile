@@ -65,6 +65,13 @@ serve-web:
 
 web: build-wasm serve-web
 
+# 고정 export 재생성 (ORT 상수접기 + 원본 A/B 게이트 내장) — prof_isolated/diag_*
+# 테스트가 참조하는 models/rvm_fixed_144x256.onnx. ⚠ 성능은 공식 export와 동일
+# (2026-08-15 연속 A/B: 3.70 vs 3.76ms — 변환기 정적 해석이 갭을 이미 흡수,
+# 둘 다 141 op. prof_isolated 헤더의 "116 op" 주석은 변환기 개선 전 기록).
+fixed-rvm:
+	/usr/bin/python3 tools/make_fixed_rvm.py
+
 convert-rvm-web:
 	cargo run --release -p ai-convert -- models/rvm_fp32.onnx -o web/models/rvm_256x144.sw \
 	  --size 256x144 --set-input downsample_ratio=1.0 \

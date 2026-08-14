@@ -35,8 +35,9 @@ fn report(tag: &str, n: u32, r: &ai_gpu::bench::BenchResult) {
 #[ignore]
 fn bench_rvm_hot() {
     let ctx = GpuContext::new_blocking().unwrap();
-    let dt = DType::F32;
-    println!("adapter: {}\n", ctx.caps.info.name);
+    // 출하 구성은 f16 — AI_BENCH_F16=1로 f16 실측 (f32 기본은 기존 기록과의 대조용)
+    let dt = if std::env::var("AI_BENCH_F16").is_ok() { DType::F16 } else { DType::F32 };
+    println!("adapter: {} (dt={dt:?})\n", ctx.caps.info.name);
     let mut sum = 0.0;
 
     // ---- 일반 conv k3 (igemm) — (개수, ih, iw, cin, cout, k, s) ----

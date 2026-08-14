@@ -11,7 +11,7 @@
 //! transferToImageBitmap) ③아니고 태스크만 켜져 있으면 `vb_analyze`(무합성).
 //! `vb_wants_pixels(t)`가 참인 틱에만 u8 RGB를 뽑아 넘긴다 (getImageData 절약).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use ai_gpu::wgpu;
 use ai_gpu::GpuContext;
@@ -31,16 +31,95 @@ struct Vb {
     surface: VbSurface,
 }
 
-thread_local! {
-    static VB: RefCell<Option<Vb>> = const { RefCell::new(None) };
+/// 프레임 비행 중(vb_frame/analyze/frame_mask가 VB를 take한 동안) 도착한 조작.
+/// ⚠ 실사고(2026-08-15): 큐 없이는 fetch 콜백/config가 비행 창에 떨어지면
+/// "vb_attach 먼저"로 조용히 튕기고, 호스트 fetched-가드 때문에 재시도도 없어
+/// 모델/GLB 미주입·설정 유실("클릭이 안 먹힘")이 됐다.
+enum Pending {
+    Config(String),
+    Model(String, Vec<u8>),
+    Glb(String, Vec<u8>),
+    BgImage(Vec<u8>, u32, u32),
+    Layout(String),
+    Detach,
 }
 
-fn with_vb<R>(f: impl FnOnce(&mut Vb) -> Result<R, JsValue>) -> Result<R, JsValue> {
+thread_local! {
+    static VB: RefCell<Option<Vb>> = const { RefCell::new(None) };
+    static PENDING: RefCell<Vec<Pending>> = const { RefCell::new(Vec::new()) };
+    static ATTACHED: Cell<bool> = const { Cell::new(false) };
+    // (passthrough, needs_render) 캐시 — 비행 중 판정 질의는 이 값으로 답한다
+    static JUDGE: Cell<(bool, bool)> = const { Cell::new((true, false)) };
+    static LAST_FOCUS: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+fn apply_op(ctx: &GpuContext, vb: &mut Vb, op: Pending) -> Result<(), JsValue> {
+    match op {
+        Pending::Config(json) => vb.director.apply_json(&json).map_err(js_err),
+        Pending::Model(kind, bytes) => vb.director.set_model(&kind, bytes).map_err(js_err),
+        Pending::Glb(kind, bytes) => vb.director.set_item_glb(ctx, &kind, &bytes).map_err(js_err),
+        Pending::BgImage(rgba, w, h) => {
+            vb.director.set_background_image(ctx, &rgba, w, h);
+            Ok(())
+        }
+        Pending::Layout(json) => vb.director.set_focus_layout_json(&json).map_err(js_err),
+        Pending::Detach => {
+            vb.director.detach();
+            Ok(())
+        }
+    }
+}
+
+/// 조작 제출 — VB가 자리에 있으면 즉시 적용, 프레임 비행 중이면 큐잉(반납 직후
+/// drain_pending이 적용). 미attach만 에러.
+fn submit(op: Pending) -> Result<(), JsValue> {
+    let ctx = engine()?;
+    let r = VB.with(|c| {
+        let mut b = c.borrow_mut();
+        match b.as_mut() {
+            Some(vb) => apply_op(&ctx, vb, op).map(|_| true),
+            None if ATTACHED.with(|a| a.get()) => {
+                PENDING.with(|p| p.borrow_mut().push(op));
+                Ok(false)
+            }
+            None => Err(JsValue::from_str("vb_attach 먼저")),
+        }
+    });
+    if let Ok(true) = r {
+        refresh_judge();
+    }
+    r.map(|_| ())
+}
+
+/// 비행 중 쌓인 조작 적용 — 프레임 함수가 VB를 반납한 직후 호출한다.
+/// 개별 실패는 로그만 (한 건 실패가 다음 조작·프레임을 못 막게).
+fn drain_pending(ctx: &GpuContext) {
+    let ops = PENDING.with(|p| std::mem::take(&mut *p.borrow_mut()));
+    if ops.is_empty() {
+        refresh_judge();
+        return;
+    }
     VB.with(|c| {
         let mut b = c.borrow_mut();
-        let vb = b.as_mut().ok_or_else(|| JsValue::from_str("vb_attach 먼저"))?;
-        f(vb)
-    })
+        if let Some(vb) = b.as_mut() {
+            for op in ops {
+                if let Err(e) = apply_op(&ctx, vb, op) {
+                    log::warn!("[vb] 지연 적용 실패: {e:?}");
+                }
+            }
+        }
+    });
+    refresh_judge();
+}
+
+/// 판정·집중도 캐시 갱신 (VB가 자리에 있을 때만 — 비행 중엔 no-op)
+fn refresh_judge() {
+    VB.with(|c| {
+        if let Some(vb) = c.borrow_mut().as_mut() {
+            JUDGE.with(|j| j.set((vb.director.passthrough(), vb.director.needs_render())));
+            LAST_FOCUS.with(|f| *f.borrow_mut() = vb.director.focus_json());
+        }
+    });
 }
 
 /// 워커 서피스 연결 — OffscreenCanvas(워커 로컬)에 WebGPU 서피스 + Director 생성.
@@ -79,59 +158,69 @@ pub fn vb_attach(canvas: web_sys::OffscreenCanvas) -> Result<(), JsValue> {
             }
         }
     });
+    ATTACHED.with(|a| a.set(true));
+    refresh_judge();
     Ok(())
 }
 
 /// 단일 JSON 설정 (EffectsPatch + faceItems/handDetection/focusDetection —
-/// 없음=유지/null=해제/값=설정)
+/// 없음=유지/null=해제/값=설정). 프레임 비행 중이면 큐잉 후 반납 직후 적용.
 #[wasm_bindgen]
 pub fn vb_config(json: String) -> Result<(), JsValue> {
-    with_vb(|vb| vb.director.apply_json(&json).map_err(js_err))
+    submit(Pending::Config(json))
 }
 
 /// 모델 바이트 주입 — kind: "seg"|"face_det"|"face_lm"|"gaze"|"gaze_bs"|
-/// "hand_det"|"hand_lm" (조달은 호스트 fetch)
+/// "hand_det"|"hand_lm" (조달은 호스트 fetch). 비행 중 큐잉.
 #[wasm_bindgen]
 pub fn vb_model(kind: String, bytes: Vec<u8>) -> Result<(), JsValue> {
-    with_vb(|vb| vb.director.set_model(&kind, bytes).map_err(js_err))
+    submit(Pending::Model(kind, bytes))
 }
 
-/// GLB 바이트 주입 (종류당 1회)
+/// GLB 바이트 주입 (종류당 1회). 비행 중 큐잉.
 #[wasm_bindgen]
 pub fn vb_glb(kind: String, bytes: Vec<u8>) -> Result<(), JsValue> {
-    let ctx = engine()?;
-    with_vb(|vb| vb.director.set_item_glb(&ctx, &kind, &bytes).map_err(js_err))
+    submit(Pending::Glb(kind, bytes))
 }
 
-/// 배경 이미지 (RGBA8) — background:"image"가 소비
+/// 배경 이미지 (RGBA8) — background:"image"가 소비. 비행 중 큐잉.
 #[wasm_bindgen]
 pub fn vb_bg_image(rgba: &[u8], w: u32, h: u32) -> Result<(), JsValue> {
-    let ctx = engine()?;
-    with_vb(|vb| {
-        vb.director.set_background_image(&ctx, rgba, w, h);
-        Ok(())
-    })
+    submit(Pending::BgImage(rgba.to_vec(), w, h))
 }
 
-/// 다중 모니터 레이아웃 JSON (focusDetection 켠 뒤)
+/// 다중 모니터 레이아웃 JSON (focusDetection 켠 뒤). 비행 중 큐잉.
 #[wasm_bindgen]
 pub fn vb_layout(json: String) -> Result<(), JsValue> {
-    with_vb(|vb| vb.director.set_focus_layout_json(&json).map_err(js_err))
+    submit(Pending::Layout(json))
 }
 
 #[wasm_bindgen]
 pub fn vb_passthrough() -> Result<bool, JsValue> {
-    with_vb(|vb| Ok(vb.director.passthrough()))
+    VB.with(|c| match c.borrow_mut().as_mut() {
+        Some(vb) => Ok(vb.director.passthrough()),
+        None if ATTACHED.with(|a| a.get()) => Ok(JUDGE.with(|j| j.get()).0),
+        None => Err(JsValue::from_str("vb_attach 먼저")),
+    })
 }
 
 #[wasm_bindgen]
 pub fn vb_needs_render() -> Result<bool, JsValue> {
-    with_vb(|vb| Ok(vb.director.needs_render()))
+    VB.with(|c| match c.borrow_mut().as_mut() {
+        Some(vb) => Ok(vb.director.needs_render()),
+        None if ATTACHED.with(|a| a.get()) => Ok(JUDGE.with(|j| j.get()).1),
+        None => Err(JsValue::from_str("vb_attach 먼저")),
+    })
 }
 
 #[wasm_bindgen]
 pub fn vb_wants_pixels(t_ms: f64) -> Result<bool, JsValue> {
-    with_vb(|vb| Ok(vb.director.wants_pixels(t_ms)))
+    VB.with(|c| match c.borrow_mut().as_mut() {
+        Some(vb) => Ok(vb.director.wants_pixels(t_ms)),
+        // 비행 중 — 이번 틱은 픽셀 생략 (다음 프레임에 재판정)
+        None if ATTACHED.with(|a| a.get()) => Ok(false),
+        None => Err(JsValue::from_str("vb_attach 먼저")),
+    })
 }
 
 /// ImageBitmap → 파이프라인 프레임 텍스처 (무복사 임포트)
@@ -171,6 +260,7 @@ pub async fn vb_frame(
     };
     let result = vb_frame_inner(&ctx, v, &source, rgb.as_deref(), t_ms).await;
     VB.with(|c| *c.borrow_mut() = vb);
+    drain_pending(&ctx); // 비행 중 큐잉된 config/모델/GLB/배경 적용
     result
 }
 
@@ -237,6 +327,7 @@ pub async fn vb_analyze(
     }
     .await;
     VB.with(|c| *c.borrow_mut() = vb);
+    drain_pending(&ctx);
     result
 }
 
@@ -290,27 +381,34 @@ pub async fn vb_frame_mask(
     }
     .await;
     VB.with(|c| *c.borrow_mut() = vb);
+    drain_pending(&ctx);
     result
 }
 
-/// 마지막 집중도 JSON (FocusResult 7상태 전체)
+/// 마지막 집중도 JSON (FocusResult 7상태 전체) — 비행 중엔 캐시 반환
 #[wasm_bindgen]
 pub fn vb_focus_state() -> Result<String, JsValue> {
-    with_vb(|vb| Ok(vb.director.focus_json()))
+    VB.with(|c| match c.borrow_mut().as_mut() {
+        Some(vb) => Ok(vb.director.focus_json()),
+        None if ATTACHED.with(|a| a.get()) => Ok(LAST_FOCUS.with(|f| f.borrow().clone())),
+        None => Err(JsValue::from_str("vb_attach 먼저")),
+    })
 }
 
-/// 제스처 이벤트 하나 (FIFO 16) — 없으면 null
+/// 제스처 이벤트 하나 (FIFO 16) — 없으면 null. 비행 중엔 null (다음 폴에 잡힌다 —
+/// 이벤트는 엔진 큐에 남아 유실 없음)
 #[wasm_bindgen]
 pub fn vb_poll_gesture() -> Result<Option<String>, JsValue> {
-    with_vb(|vb| Ok(vb.director.poll_gesture_json()))
+    VB.with(|c| match c.borrow_mut().as_mut() {
+        Some(vb) => Ok(vb.director.poll_gesture_json()),
+        None if ATTACHED.with(|a| a.get()) => Ok(None),
+        None => Err(JsValue::from_str("vb_attach 먼저")),
+    })
 }
 
 /// destroy 대응 — **웜 리셋**: 스트림 리소스·시간 상태만 버리고 세션·모델·
-/// 컴파일 결과는 유지 (v-ai destroy 규약 — 재활성화가 즉시 뜬다)
+/// 컴파일 결과는 유지 (v-ai destroy 규약 — 재활성화가 즉시 뜬다). 비행 중 큐잉.
 #[wasm_bindgen]
 pub fn vb_detach() -> Result<(), JsValue> {
-    with_vb(|vb| {
-        vb.director.detach();
-        Ok(())
-    })
+    submit(Pending::Detach)
 }

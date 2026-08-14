@@ -124,6 +124,203 @@ vcxreact 연결 제외)**:
 bs 체감. 다음 엔진 작업 후보는 "다음 작업" D(P4 웹 연결 — **사용자 확인 필수**,
 v-ai 연결 보류 중) 또는 E(아바타 에셋 대기 / mnv4-RVM 교체).
 
+## P4 vcxreact 실연결 — 완료 (2026-08-15, 사용자 지시로 보류 해제)
+
+웹(v-ai)·Android·iOS 3면 전부 배선. vcxreact 리포에서 작업 (git 미커밋 상태로
+남김 — 사용자 리뷰 후 커밋).
+
+**웹 (packages/v-ai)**: ①`src/virtual-background/video-worker-wasm.js` 신설 =
+web/vb-engine.js 의 벤더링 적응판 — 에셋을 Vite 리터럴 `new URL` 로(모델은
+`assets/ai-engine/models/` seg+face 3종만 벤더링, GLB 는 v-ai 기존
+assets/models/*.glb 재사용), 메이크업 룩은 `resolveMakeupLook` import(원본의
+DEFAULT_LOOK 자리), **enabled:false → 전 효과 해제 패치 정규화**(pipeline.worker
+가 누적 전체 config 를 재전송하므로 stateless 번역 안전), `isSupported()`
+(navigator.gpu) + `preloadSegmentation()` export. wasm glue+바이너리는 TS
+rootDir 제약으로 `src/virtual-background/ai-engine/pkg{,-relaxed}/` 에 배치
+(relaxed 우선 + CompileError 폴백). ②pipeline.worker.ts 사다리 2진→**3티어**:
+lite(저사양+VB만) / **wasm(신규 기본 — WebGPU 가용 && 아바타 off)** /
+webgl2(WebGPU 없음·init 실패·아바타). 구 needsWebgl2 판정은 needsComposer 로
+리네임(lite 제외 조건), 새 needsWebgl2 = 아바타만. loadWasmEngine 은 init
+성공까지 확인 후 채택, 실패는 null 캐시(세션 고정 webgl2 폴백). preload 는
+실제 쓸 티어를 데움(wasm 이면 스왑 블립 없이 engine 직접 교체). 검증: v-ai
+typecheck 클린 + apps/v-class/web `vite build` 성공(.sw 3종+wasm 2벌+워커 번들
+확인). 미실행: 실브라우저 룸 e2e.
+
+**Android (packages/react-native-webrtc)**: ①`com.cloudwebrtc.webrtc.AiEngine`
+신설(우리 .so 가 이미 이 클래스명으로 JNI export — **Rust 재빌드 0**),
+VcxrustAi.java 삭제. ②jniLibs 3 ABI = libai_ffi.so(8.4/5.7/9.1MB — vcxrust 의
+~2.5배 작음). ③VirtualBackgroundProcessor: .sw 모델 로딩(seg/face/hand/**gaze
+신규**), setItemModelDir, **applyConfigToNative = 스칼라→EffectsPatch JSON**
+(÷100 정규화, 배경은 BitmapFactory 디코드→RGBA direct ByteBuffer→
+setBackgroundImage + "image" 마커, lastUploadedBackground 캐시, base64 폴백).
+④WebRTCModule: 폴링 2곳만 AiEngine 으로, eager-init 유지(omp 제약은 소멸 —
+주석 갱신). ⑤ANS: fe16/fe48 서브디렉터리 복사(graph.json+weights.bin),
+feCreate 는 null 대신 ""(JNI null 불가 — passthrough 핸들 규약),
+feProcessFrame null 가드. ⑥models/ = ncnn 18파일 삭제, .sw 7종+fe16/fe48 추가
+(GLB 13종 유지). 미실행: 실기기 검증 (gradle compileDebugJavaWithJavac 는 돌림).
+
+**iOS (packages/react-native-webrtc)**: ①podspec vendored_frameworks =
+AiEngineFFI.xcframework 단독(**MoltenVK 삭제** — wgpu 는 Metal 직결).
+②vcxrust_ai.h → ai_engine_ffi.h (RCTWebRTC 에 복사). ③VirtualBackgroundProcessor:
+VideoOptionsC → 호스트 자체 `struct VbVideoOptions`(브리지 시그니처 유지),
+loadDefaultModel 은 rvm_256x144.sw 단일 후보 탐색, findModelBase→findModelFile
+(.sw 풀 경로), 로드 체인 face→hand→**gaze(신규)**→items, set_item_model_dir,
+applyConfigToNative(JSON 번역 — Android 와 동일 규약, 배경은 **ImageIO** 디코드
+— UIKit 무의존이라 podspec osx 타깃 호환, CGImage 소유권 전 경로 release),
+Success→VB_RESULT_SUCCESS. ④ANS: FastEnhancerHandle→FeHandle, 프로브
+fe48/graph.json(디렉터리 도출 2단계 상향), dir NULL→"". get_focus_state/
+poll_hand_gesture/vcx_string_free/render_mask/fe_* 는 이름 동일이라 무수정.
+미실행: pod install + 실기기 빌드.
+
+**v-ai native JS**: focus-tracker/index.native.ts 폴링을 우리 FocusResult
+({status 7상태, attentive, score, monitorIndex}) 직소비로 교체 — vcxrust
+{state,durationMs} 매핑 삭제. hand 폴링은 superset({gesture,confidence,+α})이라
+무수정. toNativeOptions/브리지 payload 는 그대로 (스칼라 번역은 네이티브 몫).
+
+**남은 카드**: 실기기/실브라우저 e2e(모델 로드→합성→폴링),
+Android 기기 차단 목록(mt6789/SM-A245)의 wgpu 재검증, mnv4-RVM 교체 시 모델
+재배포 3곳(v-ai assets/ai-engine + RN models/ + ai_engine web/models).
+
+## 웹 전면 배선 2차 + 실사고 3건 수리 (2026-08-15, 사용자 지시 "워커 포함 전부
+배선부터")
+
+**웹 잔여 배선 완료 — v-ai 4개 워커 전부 ai_engine**: ①audio.worker.ts Engine
+(ORT wav2wav) → `enhancer_*` 스왑 (fe16/fe48 벤더링, GPU 무관 — enhancer는
+init_engine 불필요 계약, delay=block 유지) ②focus vision.worker 전면 재작성 —
+face_task(num_faces=2)→gaze_task(엔진 OneEuro/상태머신 내장, CNN 페이싱 내부)→
+bs(146 서브셋, eyeBlink 9/10) 체인. **출력 계약(FrameAnalysis) 유지**로 메인
+tracker/RoomAi 무수정, gaze는 엔진 필터 출력 직결(이중 필터 없음), headPose/
+headGaze는 null(matrix 미제공 — 비차단 결정) ③hand vision.worker 재작성 —
+hand_task(2손), handedness 원시값 P(Right)→Left/Right 변환, 제스처 판정 TS
+유지(계약 = 21pt+handedness). 검증: typecheck + vite build (모델 7종+fe에셋+워커
+3개 번들 확인).
+
+**실사고 3건 (사용자 발견 — 배선 직후 실사용)**:
+1. **vb.rs 비행 중 조작 유실 (진범 — "클릭이 안 먹힌다/한 번에 안 바뀐다")**:
+   vb_frame/analyze/frame_mask가 VB를 thread_local에서 **take한 채 await**하는
+   동안 도착하는 vb_config/vb_model/vb_glb/vb_bg_image가 전부 "vb_attach 먼저"로
+   튕김 — fetch 콜백은 호스트 fetched-가드 때문에 **재시도도 없어 영구 미주입**
+   (3D 아이템 무렌더의 원인 — 게이트 E로 재현 확정: 렌더 활성 중 GLB 주입은
+   100% 이 창에 떨어진다). 수리: `Pending` 큐 + `submit`(자리에 있으면 즉시,
+   비행 중이면 큐잉) + 프레임 반납 직후 `drain_pending`, 판정(vb_passthrough/
+   needs_render)은 캐시로 응답, focus/gesture 폴링은 캐시/None (제스처는 엔진
+   큐라 유실 없음). **교훈: wasm 바인딩에서 상태를 take하고 await하면, 그 창에
+   떨어지는 모든 sync 호출의 실패 경로를 설계해야 한다.**
+2. **최상위 enabled 오역 ("가상배경 없을 때 미러가 안 먹힌다"의 절반)**: 벤더링
+   심이 enabled:false를 전 효과 해제로 번역했으나 **webgl2 워커 계약은 최상위
+   enabled를 아예 안 본다**(_shouldActivatePipeline — 개별 효과 값만). VB off +
+   mirror on 조합이 전부 리셋되던 것 — enabled 무시로 수리.
+3. **mirror/degree 호스트 전처리 누락 (나머지 절반)**: 엔진 계약상 mirror/degree
+   프레임 변환은 호스트 몫(any_active 미포함 — 엔진은 이미지 배경 좌표 보정만)
+   인데 심이 config만 넘기고 변환을 안 했다 → 미러 무동작. 심 2벌(원본+벤더링)에
+   webgl2 _prepareSourceElement 파리티 전처리(2D 캔버스, mirror 먼저→rotate,
+   같은 크기) 추가 — **mirror-only는 세그/GPU 없이 동작**(passthrough여도 변환본
+   반환). 추론 전 적용 = 좌표계 계약(face-effects lm) 유지. 부수: 심의 모델
+   fetch 판정을 엔진 질의 대신 로컬 누적 config(needsRenderLocal)로 — 비행 중
+   stale 판정에 의한 fetch 누락 차단.
+
+게이트 확장: vb-engine-gate에 E(3D 아이템 동시 적용 hat+glasses 픽셀 증명 +
+해제 복귀)·F(mirror-only — 세그 없이 flip/복귀) 추가, web/assets/glb 신설
+(원본 심 GLB 경로가 실재하지 않던 것 — 아이템 경로는 이 게이트 전까지 무검증).
+
+**티어 사다리 실배선 (2026-08-15 심야, 사용자 지시 "새로 만들지 말고 기존 것
+배선")**: 전부 기존 표면 조립 — Rust 변경 0.
+- **video B티어**: 심 2벌(vb-engine.js + v-ai video-worker-wasm.js)에 studio.js
+  검증 로직 이식 — A(RVM GPU) → 강등 시 B(R11 CPU `infer_frame_cpu` +
+  `vb_frame_mask` GPU 합성, 효과 전부 생존). 강등 = 1s 페이싱 샘플(gpu_sync
+  배수→한 프레임 실비용) 10개 창 p90>66ms 2연속, 웜업 창 폐기, 승격 없음.
+  R11은 강등 확정 때만 지연 로드. segm_r11_160x288.sw v-ai 벤더링.
+- **vision 워커 CPU 백엔드**: focus/hand 워커 init에서 WebGPU 실패 →
+  `load_model_cpu_h` + `face_task_cpu`/`hand_task_cpu`. 게이즈 CPU는
+  gaze_task_cpu가 없어(엔진 미구현 — 새로 안 만듦) granular 체인 조립:
+  `gaze_crop_box/pixels/normalize/decode_bins` + `infer_frame_cpu_h`(yaw/pitch
+  2회 추론) + v-ai OneEuro2, CNN 페이싱 250ms("강등 시 N프레임에 1회" 규약).
+- 잔여 카드: ①세그 p90 크로스워커 릴레이(video 워커 신호로 vision을 CPU 강등 —
+  v-ai 메인 배관 필요, 지금은 init 실패 시에만 CPU) ②vision 워커 런타임 p90
+  강등 ③device_lost() 폴링을 강등 트리거에 연결 ④gaze CPU 2회 추론(출력 2헤드
+  1회 실행 export 없음 — 만들면 절반).
+
+**성능 스프린트 1차 실측 (2026-08-15 심야, 사용자 지시 "3ms였는데 왜 7ms")**:
+- **커널 무회귀 확정**: bench_rvm_hot 마이크로벤치가 기록과 일치 (pw 9x16
+  960→160 = 70.4µs vs 기록 71µs, 핫 shape 합계 2.414ms). 튜닝 자산 그대로.
+- **Chrome A/B (같은 부하에서 상대 비교)**: webgl2-span 2.14~2.46ms vs
+  ai_engine **4.78~5.07ms = 2.1~2.2배 열세**. 브라우저 f16 정상 협상 확인
+  (adapter 로그 f16=true — compare 행 라벨 "fp32"는 낡은 표기, 로드 파일은
+  fp16 .sw). 구 "고정 export/가중치 fp16" 행 2개는 파일 부재로 ERROR — 정리 대상.
+- 네이티브 프레임타임은 측정 창 오염(load 4~7, 사용자 Chrome 경합)으로 5.4~6.2ms
+  — 기록 3.78과의 차이가 회귀인지 환경인지 **미확정** (커널이 무회귀라 환경 유력).
+  절대값 재확정은 load<5 조용한 창에서. per-op 프로파일은 소형 op 5~10배 부풀림
+  재확인 — 절대값 금지, 순위만.
+- **남은 공략 지점** (view/concat 백로그는 이미 흡수돼 있었음 — view 1·concat 4·
+  chcopy 2 합 ~90µs(부풀린 값)로 병목 아님): ①심층 splitk f16 재튜닝(중해상
+  pw 체인) ②SE/GRU 소형 직렬 op 구간의 디스패치 지연(단, SE 융합은 반증 완료 —
+  다중 디스패치 유지 원칙 아래에서) ③gpool ×9 ④Chrome 전용 재실측.
+
+**성능 스프린트 2차 — 측정 프로토콜 수리로 진짜 격차 확정 (2026-08-15 새벽)**:
+- **compare를 min-of-batches로 교체** (10프레임 배치 ×8 min, webgl2·ai 동일
+  프로토콜 + `?duo=1` 2행 모드 — ORT/TF.js ~80s 생략). 배치 평균은 다른 앱 GPU
+  점유가 섞이면 부푼다 — 이전 4.8~5.1ms는 그 허수였다. **min 실측: webgl2-span
+  1.610ms vs ai_engine(fp16) 3.080ms = 1.91배** (로드 175ms). 죽은 행 2개
+  (rvm_fixed_fp16w/rvm_256x144_fp16w — 파일 부재) 삭제, "fp32" 라벨 정정.
+- **bench_rvm_hot에 AI_BENCH_F16=1 스위치 추가** — f16 핫 합계 1.916ms
+  (f32 2.414, 1.26x). f16 재튜닝 표적: igemm 72x128 32->16(f16 92.6 > f32
+  87.2µs 역전 — W가 L1 상주라 f16 변환비용만 추가되는 소형 KG 패턴),
+  대형 M pw 2종(이득 0 — 로드바운드 아님 ~700GF/s, "다른 데를 봐라" 각주 유효).
+- **프레임 구성 분해**: 핫 커널 ~1.9ms(실용 한계 부근, 무회귀) + 소형 op/디스패치
+  구간 ~1.1ms. 하한 공식의 6µs/op 바닥 × 141 op ≈ 0.85ms — **남은 최대 지렛대는
+  op 수**. ⚠ **웹 출하 .sw가 공식 export(141 op)로 빌드 중** (Makefile
+  convert-rvm-web ← models/rvm_fp32.onnx) — 배포 그래프로 문서화된 **고정
+  export(116 op, models/rvm_fixed_144x256.onnx)는 로컬 부재** (prof_isolated/
+  diag_* 테스트들이 참조; gitignore 모델류 — M2 머신 또는 사용자 재export 필요).
+  **복원되면 −25 op ≈ −150~200µs 무상 이득 + prof_isolated 계기 부활.**
+  onnxsim 없는 자체 재생성은 레시피 불명이라 안 함 (재발명 금지).
+- webgl2가 빠른 구조적 이유 재확인 (잘못 만든 게 아니라 측정·문서화된 지형):
+  이 워크로드(극소 공간해상도 × 141 소형 op)는 TBDR 프래그먼트 파이프라인
+  (텍스처 캐시·드로우 저오버헤드·SPAN=4)이 유리, 컴퓨트의 대항마인 subgroup은
+  naga 에뮬레이션으로 20배 퇴행(기각 기록). 격차 해소 경로는 커널 미시가 아니라
+  **op 수 감축(잔여 융합) + mnv4-RVM(절대비용 축소 — segm급 1.05ms
+  실측은 이미 ORT 제침)**이라는 기존 결론이 수치로 재확인됨.
+
+**성능 스프린트 3차 — 최종 결론: 회귀 없음 (2026-08-15 새벽, 조용해진 머신)**:
+- **고정 export 복원 완료** (`make fixed-rvm` → tools/make_fixed_rvm.py — ORT
+  BASIC 상수접기 + 비표준 opset 선언 제거 + 입력 리네임(input_1/r1~r4) + 원본
+  ORT A/B 게이트 max|diff| 3.4e-6 내장; 353→282 노드). prof_isolated/diag_*
+  테스트 계기 부활. profile_rvm 5곳에 AI_ONNX 오버라이드 추가.
+- **그러나 연속 A/B로 성능 동일 증명**: 공식 3.701 vs 고정 3.758ms — **변환기
+  정적 해석이 canon 갭을 이미 흡수** (둘 다 141 op, .sw 바이트 크기 동일).
+  prof_isolated 헤더의 "고정=116 op" 주석은 변환기 개선 전 기록 — 문서 부패.
+- **최종 진실**: 네이티브 fp16 3.70~3.76ms = **기록 3.78 그대로, 회귀 0**.
+  세션 중의 5.4~6.2/11.4ms는 전부 사용자 Chrome 부하 오염 (측정 규율 재확인 —
+  절대값은 load<5 + min 계열만). Chrome min 3.06ms / webgl2-span 1.61~1.73ms
+  = **격차 1.8~1.9배가 현 위치** (4자 실측 시절 3~4.5배에서 추격해 온 결과이며
+  메모리의 "1.28배" 표기는 근거 재확인 불가 — 실측 기준으로 갱신).
+- 출하 .sw는 고정 export 소스로 재빌드했으나 성능·op 동일이라 v-ai/RN 재벤더링
+  불필요 (기존 벤더링본과 등가).
+
+**성능 스프린트 4차 — fuse_input_gate(SE apply 융합) 구현→실측 반증→보존 기각
+(2026-08-15 새벽, 사용자 "만들어보고 별 차이 없으면 원상복구")**:
+- 구현 전모(6층, 전부 남김 — 기본 off): SwOp::Conv `gate: Option<u32>`(serde
+  하위호환) / fuse_input_gate 패스(`--fuse-gate` 옵트인, Mul(x, 동적CV)→단독
+  소비 1×1 conv 입력 게이트, dce gate-attr 생존 규칙) / verify 레퍼런스 게이트
+  평가 / gemm_pw 4변형 lda() 슬롯+GATE 바인딩(항상 마지막)+캐시키 / 런타임
+  바인딩+비pw 게이트 조기 거부 / ai-cpu는 명시 Unsupported(v1 — CPU 소비 모델
+  변환엔 플래그 금지). naga 게이트 변형 포함 그린.
+- 게이트: **verify_oracle 2/2**(비융합·융합 모두 ORT 대조 통과 — 수치 등가 증명,
+  RVM 141→**132 op**).
+- **실측 반증**: 프레임타임 min 3.49(비융합) vs 3.76ms(융합) — 퇴행. 기각 각주
+  "9×16 심층 pw는 로드 처리량 병목이 아니다"가 세 번째로 적중 (fuse_se, Splitk
+  픽셀블로킹에 이어). pha max_err 0.0112→0.0146 부수 악화.
+- **사용자 지시로 코드 전면 원복** (fuse_se 때와 달리 보존 없이 git checkout —
+  포맷/패스/커널/런타임/CPU 전부, 출하 .sw도 원본 비트 복원). 이 기록이 유일한
+  잔존물 — **같은 아이디어 재시도 금지** (재구현 비용 ~300줄, 결과는 위 수치).
+  유지한 것: 측정 인프라(AI_ONNX/AI_BENCH_F16 스위치, compare min-of-batches +
+  ?duo=1, make fixed-rvm)와 vb.rs 큐 수리·심 수리(별건 버그픽스).
+- 교훈 확정: **SE 존(M소형 심층)은 어떤 형태의 융합도 이기지 못한다** — 남은
+  디스패치 갭의 해소는 op를 "합치는" 게 아니라 op가 "적은 모델"(mnv4-RVM)이다.
+- 부수 확인: "116 op"의 출처는 사용자 증언으로 webgl2-engine-span 제작 과정의
+  산물(다른 머신) — 이 리포의 변환 경로와 무관. plan.json(172 엔트리, alias/
+  split 포함)은 로컬에 있으나 그 .sw 변환 레시피는 이 머신에 없음.
+
 ## 다음 작업 (우선순위 — 2026-08-14 정리)
 
 **A. P1 마무리 — VideoPipeline 완성** (지금 여기)

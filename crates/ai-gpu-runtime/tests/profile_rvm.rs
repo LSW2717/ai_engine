@@ -26,7 +26,7 @@ fn rvm_ctx(g: &Graph, size: (u32, u32), fp16: bool) -> (Ctx, &'static str) {
 #[test]
 #[ignore]
 fn profile_rvm() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/rvm_fp32.onnx");
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join(std::env::var("AI_ONNX").unwrap_or_else(|_| "models/rvm_fp32.onnx".into()));
     let ctx = GpuContext::new_blocking().unwrap();
     let mut g = import(&std::fs::read(&path).unwrap()).unwrap().graph;
     // 추격 구성 = fp16 (AI_PROFILE_FP32=1로 fp32 프로파일)
@@ -78,7 +78,7 @@ fn profile_rvm() {
 #[test]
 #[ignore]
 fn rvm_256x144_frametime() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/rvm_fp32.onnx");
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join(std::env::var("AI_ONNX").unwrap_or_else(|_| "models/rvm_fp32.onnx".into()));
     let ctx = GpuContext::new_blocking().unwrap();
     let mut g = import(&std::fs::read(&path).unwrap()).unwrap().graph;
     let (cctx, in_name) = rvm_ctx(&g, (256, 144), false);
@@ -108,7 +108,7 @@ fn rvm_256x144_frametime() {
 #[test]
 #[ignore]
 fn rvm_256x144_fp16() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/rvm_fp32.onnx");
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join(std::env::var("AI_ONNX").unwrap_or_else(|_| "models/rvm_fp32.onnx".into()));
     let ctx = GpuContext::new_blocking().unwrap();
     if !ctx.caps.f16 {
         eprintln!("skip: f16 미지원 기기");
@@ -165,7 +165,7 @@ fn rvm_256x144_fp16() {
 #[test]
 #[ignore]
 fn rvm_load_times() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/rvm_fp32.onnx");
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join(std::env::var("AI_ONNX").unwrap_or_else(|_| "models/rvm_fp32.onnx".into()));
     let ctx = GpuContext::new_blocking().unwrap();
     let mut g = import(&std::fs::read(&path).unwrap()).unwrap().graph;
     let (cctx, _) = rvm_ctx(&g, (256, 144), ctx.caps.f16);
@@ -188,7 +188,7 @@ fn rvm_load_times() {
 #[test]
 #[ignore]
 fn rvm_512x288_frametime() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/rvm_fp32.onnx");
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join(std::env::var("AI_ONNX").unwrap_or_else(|_| "models/rvm_fp32.onnx".into()));
     let ctx = GpuContext::new_blocking().unwrap();
     let mut g = import(&std::fs::read(&path).unwrap()).unwrap().graph;
     let cctx = Ctx {
