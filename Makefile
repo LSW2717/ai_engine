@@ -4,6 +4,12 @@
 build-native:
 	cargo build --release -p ai-gpu
 
+# ai-ffi C 헤더 (모바일 브리지 소비) — cargo install cbindgen 필요
+ffi-header:
+	cbindgen --config crates/ai-ffi/cbindgen.toml --crate ai-ffi \
+	  --output crates/ai-ffi/include/ai_engine_ffi.h crates/ai-ffi
+	@echo "→ crates/ai-ffi/include/ai_engine_ffi.h"
+
 test:
 	cargo test --workspace
 

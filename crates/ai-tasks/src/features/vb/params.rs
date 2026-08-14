@@ -179,6 +179,21 @@ impl EffectsState {
         parse_hex(s).unwrap_or([1.0, 1.0, 1.0])
     }
 
+    /// 켜진 비디오 효과가 하나라도 있는가 — passthrough 판정의 절반
+    /// (v-ai _isDefaultConfig 등가 + **framing 포함** — INTEGRATION.md §2 계약:
+    /// 프레이밍은 가상배경 없이도 독립 동작). mirror/degree는 프레임 변환이
+    /// 호스트 몫이라 여기 안 들어간다 (엔진 몫은 이미지 배경 좌표 보정뿐).
+    pub fn any_active(&self) -> bool {
+        !matches!(self.background, Background::None)
+            || self.blur > 0.0
+            || (self.brightness - 1.0).abs() > 1e-3
+            || self.grayscale > 0.0
+            || self.studio_light.is_some()
+            || self.framing.is_some()
+            || self.touch_up.is_some()
+            || self.makeup.is_some()
+    }
+
     pub fn apply_json(&mut self, json: &str) -> Result<(), String> {
         let patch: EffectsPatch =
             serde_json::from_str(json).map_err(|e| format!("EffectsPatch 파싱: {e}"))?;

@@ -1,0 +1,16 @@
+# ai-ffi C 헤더 생성 — `make ffi-header` (iOS xcframework/Android NDK 소비용)
+language = "C"
+include_guard = "AI_ENGINE_FFI_H"
+autogen_warning = "/* 자동 생성 — make ffi-header. 손으로 고치지 말 것. */"
+documentation = true
+documentation_style = "doxy"
+
+[export]
+include = ["VbResult", "FeHandle"]
+
+[enum]
+rename_variants = "ScreamingSnakeCase"
+prefix_with_name = true
+
+[parse]
+parse_deps = false

@@ -17,7 +17,7 @@ web-time.workspace = true
 wasm-bindgen.workspace = true
 wasm-bindgen-futures.workspace = true
 js-sys.workspace = true
-web-sys = { version = "0.3", features = ["HtmlCanvasElement"] }
+web-sys = { version = "0.3", features = ["HtmlCanvasElement", "OffscreenCanvas", "ImageBitmap"] }
 serde.workspace = true
 serde-wasm-bindgen.workspace = true
 console_error_panic_hook.workspace = true

@@ -72,6 +72,22 @@ pub enum FocusStatus {
     MultipleFaces,
 }
 
+impl FocusStatus {
+    /// 웹 focus-tracker 문자열 (types.ts FocusStatus 1:1) — 바인딩 공용
+    pub fn as_str(self) -> &'static str {
+        use FocusStatus::*;
+        match self {
+            Initializing => "INITIALIZING",
+            Focused => "FOCUSED",
+            OtherMonitor => "OTHER_MONITOR",
+            LookingAway => "LOOKING_AWAY",
+            EyesClosed => "EYES_CLOSED",
+            NoFace => "NO_FACE",
+            MultipleFaces => "MULTIPLE_FACES",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Gaze {
     pub yaw: f32,

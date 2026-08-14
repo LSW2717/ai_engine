@@ -16,6 +16,7 @@
 //   features/face/ 얼굴(랜드마크 소비: 화장·터치업·3D·아바타 예정)
 //   (예정) hand/ gaze/ audio/
 pub mod detect;
+pub mod director;
 pub mod error;
 pub mod features;
 pub mod session;
@@ -23,6 +24,7 @@ pub mod session;
 // 공개 표면은 재수출로 고정 — 내부 재배치가 바인딩·테스트를 깨지 않는다
 pub use detect::gpu::GpuPre;
 pub use detect::{Detection, DetectorPost};
+pub use director::Director;
 pub use error::TaskError;
 pub use features::face::{FaceResult, FaceTask};
 pub use features::gaze::{FocusResult, FocusStatus, GazeTask};

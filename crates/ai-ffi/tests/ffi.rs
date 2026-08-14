@@ -9,12 +9,17 @@
 //!
 //! 모델(web/models/rvm_256x144.sw)이 없으면 스킵.
 
+use std::sync::Mutex;
+
 use ai_ffi::VbResult;
 
 const FW: usize = 640;
 const FH: usize = 360;
 const MW: usize = 256;
 const MH: usize = 144;
+
+/// C 표면은 전역 STATE 하나 — 표면 테스트끼리 직렬화
+static SURFACE_LOCK: Mutex<()> = Mutex::new(());
 
 fn model_path() -> Option<String> {
     let p = concat!(env!("CARGO_MANIFEST_DIR"), "/../../web/models/rvm_256x144.sw");
@@ -72,6 +77,7 @@ fn make_mask(cx: f64) -> Vec<f32> {
 
 #[test]
 fn c_surface_smoke() {
+    let _lock = SURFACE_LOCK.lock().unwrap();
     let Some(path) = model_path() else {
         eprintln!("모델 없음 — 스킵 (make convert-rvm-web)");
         return;
@@ -107,6 +113,108 @@ fn c_surface_smoke() {
         );
 
         assert_eq!(ai_ffi::destroy_custom_video_stream(), VbResult::Success);
+    }
+}
+
+/// 신규 표면 스모크 — 단일 JSON 설정으로 집중도(실추론) + 결과 폴링 + 오디오 +
+/// destroy=리셋(웜 재가동)까지. 모델 없으면 스킵.
+#[test]
+fn extended_surface_smoke() {
+    let _lock = SURFACE_LOCK.lock().unwrap();
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
+    let seg = format!("{root}/web/models/rvm_256x144.sw");
+    let det = format!("{root}/models/mediapipe/face/face_detector.sw");
+    let lm = format!("{root}/models/mediapipe/face/face_landmarks.sw");
+    let gaze = format!("{root}/models/gaze.sw");
+    let bs = format!("{root}/models/mediapipe/face/face_blendshapes.sw");
+    let frame_p = format!("{root}/tests/data/frame_256x144.rgb");
+    for p in [&seg, &det, &lm, &gaze, &frame_p] {
+        if !std::path::Path::new(p).exists() {
+            eprintln!("스킵: {p} 없음");
+            return;
+        }
+    }
+    let rgb = std::fs::read(&frame_p).unwrap();
+    let (w, h) = (256usize, 144usize);
+    // 실얼굴 픽스처 → I420 (엔진 yuv 모듈 재사용 — BT.601 full)
+    let mut rgba = vec![255u8; w * h * 4];
+    for i in 0..w * h {
+        rgba[i * 4..i * 4 + 3].copy_from_slice(&rgb[i * 3..i * 3 + 3]);
+    }
+    let (mut y, mut u, mut v) =
+        (vec![0u8; w * h], vec![0u8; w * h / 4], vec![0u8; w * h / 4]);
+    ai_ffi::yuv::rgba_to_i420(&rgba, w, h, &mut y, &mut u, &mut v, w, w / 2, w / 2);
+    let y0 = y.clone();
+
+    unsafe {
+        let c = |s: &str| std::ffi::CString::new(s).unwrap();
+        assert_eq!(ai_ffi::set_video_stream_info(seg.as_ptr(), seg.len()), VbResult::Success);
+        assert_eq!(
+            ai_ffi::set_face_model_info(c(&det).as_ptr(), c(&lm).as_ptr()),
+            VbResult::Success
+        );
+        assert_eq!(
+            ai_ffi::set_gaze_model_info(c(&gaze).as_ptr(), c(&bs).as_ptr()),
+            VbResult::Success
+        );
+        let cfg = c(r##"{"background":"#00a05a","focusDetection":{"enabled":true,"detectFps":30}}"##);
+        assert_eq!(ai_ffi::update_effects_config(cfg.as_ptr()), VbResult::Success);
+
+        // 음수 치수 계약: |값| 사용 (모바일 renderMask 규약)
+        let render = |y: &mut [u8], u: &mut [u8], v: &mut [u8], neg: bool| {
+            let s = if neg { -1i32 } else { 1 };
+            ai_ffi::render_mask(
+                y.as_mut_ptr(),
+                u.as_mut_ptr(),
+                v.as_mut_ptr(),
+                w as i32 * s,
+                h as i32 * s,
+                w as i32,
+                (w / 2) as i32,
+                (w / 2) as i32,
+            )
+        };
+        // FOCUSED까지: 온타깃 250ms + baseline — 벽시계 페이싱이라 실시간 대기
+        for i in 0..8 {
+            assert_eq!(render(&mut y, &mut u, &mut v, i == 0), VbResult::Success);
+            std::thread::sleep(std::time::Duration::from_millis(60));
+        }
+        let fs = ai_ffi::get_focus_state();
+        assert!(!fs.is_null());
+        let s = std::ffi::CStr::from_ptr(fs).to_string_lossy().into_owned();
+        ai_ffi::vcx_string_free(fs);
+        assert!(s.contains("\"status\":\"FOCUSED\""), "focus: {s}");
+        assert!(ai_ffi::poll_hand_gesture().is_null(), "hand 미기동 — 이벤트 없음");
+        assert_ne!(y, y0, "배경 합성이 프레임을 바꿔야");
+
+        // destroy = 리셋 (모델 유지) → 바로 재가동
+        assert_eq!(ai_ffi::destroy_custom_video_stream(), VbResult::Success);
+        assert_eq!(render(&mut y, &mut u, &mut v, false), VbResult::Success, "웜 재가동");
+
+        // 오디오 — 48k 실모델 + 미지원 레이트 passthrough
+        let adir = c(&format!("{root}/models/fastenhancer"));
+        let fe = ai_ffi::fe_create_c(48000, adir.as_ptr());
+        if fe.is_null() {
+            eprintln!("오디오 모델 없음 — fe 스킵 (make convert-fastenhancer)");
+        } else {
+            let n = ai_ffi::fe_get_in_frame_len(fe);
+            assert!(n > 0 && ai_ffi::fe_get_sample_rate(fe) == 48000);
+            let inp = vec![0f32; n];
+            let mut out = vec![1f32; n];
+            ai_ffi::fe_process_frame(fe, inp.as_ptr(), out.as_mut_ptr());
+            ai_ffi::fe_free_c(fe);
+        }
+        let pt = ai_ffi::fe_create_c(44100, adir.as_ptr());
+        assert!(!pt.is_null());
+        assert_eq!(ai_ffi::fe_get_in_frame_len(pt), 480);
+        let inp: Vec<f32> = (0..480).map(|i| i as f32 / 480.0).collect();
+        let mut out = vec![0f32; 480];
+        ai_ffi::fe_process_frame(pt, inp.as_ptr(), out.as_mut_ptr());
+        assert_eq!(out, inp, "passthrough는 무가공");
+        ai_ffi::fe_free_c(pt);
+
+        assert_eq!(ai_ffi::destroy_custom_video_stream(), VbResult::Success);
+        println!("extended surface OK — focus={s}");
     }
 }
 

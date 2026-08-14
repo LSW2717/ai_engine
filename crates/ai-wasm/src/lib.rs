@@ -16,6 +16,9 @@ use ai_gpu::GpuContext;
 mod present;
 #[cfg(target_arch = "wasm32")]
 mod studio;
+// VbEngine 심 (v-ai 4번째 티어) — Director + OffscreenCanvas/ImageBitmap
+#[cfg(target_arch = "wasm32")]
+mod vb;
 
 use wasm_bindgen::prelude::*;
 
@@ -52,7 +55,7 @@ fn start() {
     let _ = console_log::init_with_level(log::Level::Info);
 }
 
-fn engine() -> Result<Rc<GpuContext>, JsValue> {
+pub(crate) fn engine() -> Result<Rc<GpuContext>, JsValue> {
     ENGINE
         .with(|e| e.borrow().clone())
         .ok_or_else(|| JsValue::from_str("엔진 미초기화 — init_engine()을 먼저 호출"))
@@ -502,7 +505,7 @@ pub async fn bench_current(frames: u32) -> Result<JsValue, JsValue> {
 // 단일 슬롯 API와 달리 로드가 기존 모델을 밀어내지 않는다. 핸들은 재사용되지
 // 않으며(ai_tasks::Pool), 언로드된 핸들 접근은 구조화된 에러로 실패한다.
 
-fn js_err(e: impl std::fmt::Display) -> JsValue {
+pub(crate) fn js_err(e: impl std::fmt::Display) -> JsValue {
     JsValue::from_str(&e.to_string())
 }
 
