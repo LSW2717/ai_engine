@@ -13,6 +13,15 @@ pub(crate) struct Compose {
     pub params: wgpu::Buffer,
 }
 
+/// 터치업/메이크업 uniform 값 (compose.wgsl tu_map/tu_par/mk_map) — 전부 0 = off.
+/// 프레임 정규화 좌표 → 128² 오버레이 uv 매핑 + 강도/블러 스트라이드.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct FaceFxParams {
+    pub tu_map: [f32; 4],
+    pub tu_par: [f32; 4],
+    pub mk_map: [f32; 4],
+}
+
 impl Compose {
     pub fn new(ctx: &GpuContext, target: wgpu::TextureFormat) -> Self {
         let src = format!("{FULLSCREEN_VS}\n{SRC}");
@@ -21,13 +30,15 @@ impl Compose {
             "video-compose",
             &src,
             target,
-            &[Bind::Tex, Bind::Tex, Bind::Tex, Bind::Tex, Bind::Sampler, Bind::Uniform, Bind::Tex],
+            &[Bind::Tex, Bind::Tex, Bind::Tex, Bind::Tex, Bind::Sampler, Bind::Uniform, Bind::Tex,
+                Bind::Tex, Bind::Tex, Bind::Tex],
         );
-        Compose { fs, params: ubo(ctx, "video-compose", 208) }
+        Compose { fs, params: ubo(ctx, "video-compose", 256) }
     }
 
     /// bg_dims: 업로드된 배경 이미지 크기 (cover 크롭 계산용).
     /// framing: 인물 중앙 프레이밍 (scale, cx, cy — scale 1 = off)
+    #[allow(clippy::too_many_arguments)]
     pub fn write_params(
         &self,
         ctx: &GpuContext,
@@ -36,6 +47,7 @@ impl Compose {
         bg_dims: Option<(u32, u32)>,
         use_fgr: bool,
         framing: (f32, f32, f32),
+        face_fx: &FaceFxParams,
     ) {
         let d = st.derived();
         let (mode, color) = match &st.background {
@@ -136,6 +148,9 @@ impl Compose {
             b.extend_from_slice(&(v as f32).to_le_bytes());
         }
         for v in [aspect_x as f32, aspect_y as f32, 0.0, 0.0] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in face_fx.tu_map.into_iter().chain(face_fx.tu_par).chain(face_fx.mk_map) {
             b.extend_from_slice(&v.to_le_bytes());
         }
         ctx.queue.write_buffer(&self.params, 0, &b);

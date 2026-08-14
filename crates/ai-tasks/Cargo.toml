@@ -19,6 +19,7 @@ thiserror.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
 image.workspace = true
+rustfft.workspace = true
 log.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]

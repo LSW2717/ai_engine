@@ -41,6 +41,9 @@ thread_local! {
         RefCell::new(ai_tasks::Pool::new());
     static GESTURES: RefCell<ai_tasks::Pool<ai_tasks::features::hand::gesture::GestureClassifier>> =
         RefCell::new(ai_tasks::Pool::new());
+    // 오디오 노이즈 제거 (CPU 고정 — AudioWorklet/워커에서 구동)
+    static ENHANCERS: RefCell<ai_tasks::Pool<ai_tasks::features::audio::Enhancer>> =
+        RefCell::new(ai_tasks::Pool::new());
 }
 
 #[wasm_bindgen(start)]
@@ -746,14 +749,17 @@ struct JsRoi {
 }
 
 #[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 struct JsFaceResult {
     presence: f32,
     /// 원본 프레임 정규화 [x,y,z] × 478
     points: Vec<[f32; 3]>,
     roi: JsRoi,
+    /// 최근 프레임 얼굴 수 — num_faces≥2로 감시 중일 때 디텍터 수 (MULTIPLE_FACES 입력)
+    face_count: u32,
 }
 
-fn js_face_result(r: Option<ai_tasks::FaceResult>) -> Result<JsValue, JsValue> {
+fn js_face_result(r: Option<ai_tasks::FaceResult>, face_count: usize) -> Result<JsValue, JsValue> {
     match r {
         None => Ok(JsValue::NULL),
         Some(r) => serde_wasm_bindgen::to_value(&JsFaceResult {
@@ -766,9 +772,20 @@ fn js_face_result(r: Option<ai_tasks::FaceResult>) -> Result<JsValue, JsValue> {
                 h: r.roi.h,
                 rotation: r.roi.rotation,
             },
+            face_count: face_count as u32,
         })
         .map_err(js_err),
     }
+}
+
+/// 얼굴 수 감시 설정 — 집중도(MULTIPLE_FACES) 켤 때 2, 끄면 1 (디텍터 비용 제거)
+#[wasm_bindgen]
+pub fn face_task_num_faces(handle: u32, n: u32) -> Result<(), JsValue> {
+    FACE_TASKS.with(|p| {
+        let mut b = p.borrow_mut();
+        b.get_mut(handle).map_err(js_err)?.set_num_faces(n as usize);
+        Ok(())
+    })
 }
 
 /// FaceTask 생성 → 핸들. smoothing: OneEuroFilter 적용 (파라미터 검증 전 — 기본 false 권장)
@@ -815,19 +832,21 @@ pub fn face_task_cpu(
             return Err(js_err(e));
         }
     };
-    let result = FACE_TASKS.with(|p| {
+    let (result, fc) = FACE_TASKS.with(|p| {
         let mut b = p.borrow_mut();
-        b.get_mut(task)
-            .map_err(js_err)?
-            .process_cpu(&mut det_s, &mut lm_s, frame, img_w, img_h, t_ms)
-            .map_err(js_err)
+        let t = match b.get_mut(task).map_err(js_err) {
+            Ok(t) => t,
+            Err(e) => return (Err(e), 0),
+        };
+        let r = t.process_cpu(&mut det_s, &mut lm_s, frame, img_w, img_h, t_ms).map_err(js_err);
+        (r, t.face_count())
     });
     CPU_MODELS.with(|p| {
         let mut b = p.borrow_mut();
         b.put(det, det_s);
         b.put(lm, lm_s);
     });
-    js_face_result(result?)
+    js_face_result(result?, fc)
 }
 
 /// GPU 한 프레임 — face_task_cpu와 같은 계약, det/lm은 GPU 세션 핸들
@@ -861,13 +880,108 @@ pub async fn face_task_gpu(
     let result = task_s
         .process_gpu(&ctx, &mut det_s, &mut lm_s, &frame, img_w, img_h, t_ms)
         .await;
+    let fc = task_s.face_count();
     FACE_TASKS.with(|p| p.borrow_mut().put(task, task_s));
     GPU_MODELS.with(|p| {
         let mut b = p.borrow_mut();
         b.put(det, det_s);
         b.put(lm, lm_s);
     });
-    js_face_result(result.map_err(js_err)?)
+    js_face_result(result.map_err(js_err)?, fc)
+}
+
+// ── FaceTask GPU 텍스처 입력 (프레임당 CPU 픽셀 0 — getImageData 경로 대체) ──
+
+/// GPU 입력 전처리(레터박스·크롭 커널 + 스탠드얼론 프레임 텍스처) — 지연 생성.
+/// 태스크·세션과 수명이 독립이라 슬롯 하나면 된다 (face·hand 공용 커널).
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static FACE_PRE: RefCell<Option<ai_tasks::GpuPre>> = const { RefCell::new(None) };
+}
+
+/// 소스 캔버스 → FrameTex 무복사 임포트 (studio.rs frame과 같은 규약)
+#[cfg(target_arch = "wasm32")]
+fn import_canvas(
+    ctx: &GpuContext,
+    frame: &mut ai_tasks::detect::gpu::FrameTex,
+    source: &web_sys::HtmlCanvasElement,
+) -> (u32, u32) {
+    use ai_gpu::wgpu;
+    let (fw, fh) = (source.width().max(1), source.height().max(1));
+    let tex = frame.ensure(ctx, fw, fh);
+    ctx.queue.copy_external_image_to_texture(
+        &wgpu::wgt::CopyExternalImageSourceInfo {
+            source: wgpu::wgt::ExternalImageSource::HTMLCanvasElement(source.clone()),
+            origin: wgpu::Origin2d::ZERO,
+            flip_y: false,
+        },
+        wgpu::wgt::CopyExternalImageDestInfo {
+            texture: tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+            color_space: wgpu::wgt::PredefinedColorSpace::Srgb,
+            premultiplied_alpha: false,
+        },
+        wgpu::Extent3d { width: fw, height: fh, depth_or_array_layers: 1 },
+    );
+    (fw, fh)
+}
+
+/// GPU 텍스처 한 프레임 — face_task_gpu와 같은 계약이지만 **JS가 캔버스만 넘긴다**
+/// (getImageData·RGB 재패킹·wasm 복사 제거 — 저사양 필수). 레터박스·크롭은
+/// 컴퓨트 커널이 모델 입력 버퍼에 직결.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub async fn face_task_tex(
+    task: u32,
+    det: u32,
+    lm: u32,
+    source: web_sys::HtmlCanvasElement,
+    t_ms: f64,
+) -> Result<JsValue, JsValue> {
+    let ctx = engine()?;
+    let mut pre = FACE_PRE
+        .with(|p| p.borrow_mut().take())
+        .unwrap_or_else(|| ai_tasks::GpuPre::new(&ctx));
+    let (fw, fh) = import_canvas(&ctx, &mut pre.frame, &source);
+    let view = pre.frame.view().expect("ensure 직후").0.clone();
+    let mut task_s = match FACE_TASKS.with(|p| p.borrow_mut().take(task)) {
+        Ok(s) => s,
+        Err(e) => {
+            FACE_PRE.with(|p| *p.borrow_mut() = Some(pre));
+            return Err(js_err(e));
+        }
+    };
+    let mut det_s = match GPU_MODELS.with(|p| p.borrow_mut().take(det)) {
+        Ok(s) => s,
+        Err(e) => {
+            FACE_PRE.with(|p| *p.borrow_mut() = Some(pre));
+            FACE_TASKS.with(|p| p.borrow_mut().put(task, task_s));
+            return Err(js_err(e));
+        }
+    };
+    let mut lm_s = match GPU_MODELS.with(|p| p.borrow_mut().take(lm)) {
+        Ok(s) => s,
+        Err(e) => {
+            FACE_PRE.with(|p| *p.borrow_mut() = Some(pre));
+            FACE_TASKS.with(|p| p.borrow_mut().put(task, task_s));
+            GPU_MODELS.with(|p| p.borrow_mut().put(det, det_s));
+            return Err(js_err(e));
+        }
+    };
+    let result = task_s
+        .process_tex(&ctx, &pre, &view, &mut det_s, &mut lm_s, fw, fh, t_ms)
+        .await;
+    let fc = task_s.face_count();
+    FACE_PRE.with(|p| *p.borrow_mut() = Some(pre));
+    FACE_TASKS.with(|p| p.borrow_mut().put(task, task_s));
+    GPU_MODELS.with(|p| {
+        let mut b = p.borrow_mut();
+        b.put(det, det_s);
+        b.put(lm, lm_s);
+    });
+    js_face_result(result.map_err(js_err)?, fc)
 }
 
 // ───────── GazeTask (집중도 — FaceTask 랜드마크 소비, CNN 페이싱 내장) ─────────
@@ -923,15 +1037,28 @@ pub fn gaze_task_reset(handle: u32) -> Result<(), JsValue> {
     })
 }
 
+/// 다중 모니터 레이아웃 설정 — JSON {monitors:[{index,left,top,width,height,
+/// yawDeg}], targetIndex} 또는 null(단일 모니터 폴백). 레이아웃은 호스트 몫
+/// (getScreenDetails + 오버라이드). 타깃 모니터가 바뀌면 baseline이 리셋된다.
+#[wasm_bindgen]
+pub fn gaze_layout(task: u32, json: String) -> Result<(), JsValue> {
+    GAZE_TASKS.with(|p| {
+        let mut b = p.borrow_mut();
+        b.get_mut(task).map_err(js_err)?.set_layout_json(&json).map_err(js_err)
+    })
+}
+
 /// 비전 틱 1회 (GPU): u8 RGB 프레임 + FaceTask 랜드마크(정규화 flat [x,y]×N,
 /// **비어 있으면 얼굴 소실 틱**) → {status, attentive, score, monitorIndex,
 /// yaw, pitch, rawYaw, rawPitch}. gaze = GPU 세션 핸들(gaze.sw).
+/// bs = face_blendshapes.sw GPU 세션 핸들 (**0 = 없음** — blink가 EAR 절반만).
 /// CNN은 내부 페이싱(83.3ms 하한)으로만 돈다 — 틱은 ~10fps 권장 (웹 visionFps).
 #[wasm_bindgen]
 #[allow(clippy::too_many_arguments)]
 pub async fn gaze_task_gpu(
     task: u32,
     gaze: u32,
+    bs: u32,
     frame: Vec<u8>,
     img_w: u32,
     img_h: u32,
@@ -948,12 +1075,25 @@ pub async fn gaze_task_gpu(
             return Err(js_err(e));
         }
     };
+    let mut bs_s = if bs == 0 {
+        None
+    } else {
+        match GPU_MODELS.with(|p| p.borrow_mut().take(bs)) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                GAZE_TASKS.with(|p| p.borrow_mut().put(task, task_s));
+                GPU_MODELS.with(|p| p.borrow_mut().put(gaze, gaze_s));
+                return Err(js_err(e));
+            }
+        }
+    };
     let pts: Vec<[f32; 2]> = landmarks.chunks_exact(2).map(|c| [c[0], c[1]]).collect();
     let lm = if pts.is_empty() { None } else { Some(pts.as_slice()) };
     let result = task_s
         .process_gpu(
             &ctx,
             &mut gaze_s,
+            bs_s.as_mut(),
             &frame,
             img_w as usize,
             img_h as usize,
@@ -966,6 +1106,9 @@ pub async fn gaze_task_gpu(
     let raw = task_s.last_cnn();
     GAZE_TASKS.with(|p| p.borrow_mut().put(task, task_s));
     GPU_MODELS.with(|p| p.borrow_mut().put(gaze, gaze_s));
+    if let Some(s) = bs_s {
+        GPU_MODELS.with(|p| p.borrow_mut().put(bs, s));
+    }
     let r = result.map_err(js_err)?;
     serde_wasm_bindgen::to_value(&JsFocusResult {
         status: focus_status_str(r.status),
@@ -1023,6 +1166,15 @@ pub fn gaze_normalize(mut buf: Vec<f32>) -> Vec<f32> {
 #[wasm_bindgen]
 pub fn gaze_decode_bins(logits: &[f32]) -> f32 {
     ai_tasks::features::gaze::preprocess::decode_bins(logits)
+}
+
+/// 정규화 랜드마크 flat [x,y]×478 → face_blendshapes 입력 292 f32
+/// (146 서브셋 × 프레임 px — blendshapes.rs 규약, 게이트용 순수 노출)
+#[wasm_bindgen]
+pub fn bs_input_from_landmarks(landmarks: Vec<f32>, w: f32, h: f32) -> Result<Vec<f32>, JsValue> {
+    let pts: Vec<[f32; 2]> = landmarks.chunks_exact(2).map(|c| [c[0], c[1]]).collect();
+    ai_tasks::features::face::blendshapes::input_from_landmarks(&pts, w, h)
+        .ok_or_else(|| JsValue::from_str("refined 메시(478점) 필요"))
 }
 
 // ───────── HandTask (팜 det→ROI→lm, 2손 트래킹) + 제스처 ─────────
@@ -1242,6 +1394,82 @@ pub fn gesture_classify(
     serde_wasm_bindgen::to_value(&out).map_err(js_err)
 }
 
+// ───────── 오디오 노이즈 제거 (fastenhancer — CPU 고정) ─────────
+
+/// Enhancer 생성 → 핸들. graph.json + weights.bin
+/// (tools/prep_fastenhancer.py --export — web/models/fastenhancer/*).
+/// GPU 엔진과 무관 — init_engine 없이 동작한다 (audio 워커 규약).
+#[wasm_bindgen]
+pub fn enhancer_new(graph_json: Vec<u8>, weights: Vec<u8>) -> Result<u32, JsValue> {
+    let e = ai_tasks::features::audio::Enhancer::new(&graph_json, &weights).map_err(js_err)?;
+    Ok(ENHANCERS.with(|p| p.borrow_mut().insert(e)))
+}
+
+#[wasm_bindgen]
+pub fn enhancer_free(handle: u32) -> Result<(), JsValue> {
+    ENHANCERS.with(|p| p.borrow_mut().remove(handle)).map_err(js_err)?;
+    Ok(())
+}
+
+/// 스트리밍 상태 초기화 (스트림 파기 시)
+#[wasm_bindgen]
+pub fn enhancer_reset(handle: u32) -> Result<(), JsValue> {
+    ENHANCERS.with(|p| {
+        let mut b = p.borrow_mut();
+        b.get_mut(handle).map_err(js_err)?.reset();
+        Ok(())
+    })
+}
+
+/// 호출당 기대 샘플 수 (= hop: 512@48k / 256@16k)
+#[wasm_bindgen]
+pub fn enhancer_frame_len(handle: u32) -> Result<u32, JsValue> {
+    ENHANCERS.with(|p| {
+        let mut b = p.borrow_mut();
+        Ok(b.get_mut(handle).map_err(js_err)?.frame_len() as u32)
+    })
+}
+
+/// hop 샘플 처리 (mono f32 [-1,1]) → hop 샘플 (n_fft−hop 지연)
+#[wasm_bindgen]
+pub fn enhancer_process(handle: u32, input: &[f32]) -> Result<Vec<f32>, JsValue> {
+    ENHANCERS.with(|p| {
+        let mut b = p.borrow_mut();
+        let e = b.get_mut(handle).map_err(js_err)?;
+        let mut out = vec![0f32; e.frame_len()];
+        e.process_frame(input, &mut out).map_err(js_err)?;
+        Ok(out)
+    })
+}
+
+/// 진단: 그래프 op별 누적 ms (reps회 평균) — wasm 병목은 wasm에서 잰다 (측정 규율)
+#[wasm_bindgen]
+pub fn enhancer_profile(
+    graph_json: Vec<u8>,
+    weights: Vec<u8>,
+    reps: u32,
+) -> Result<JsValue, JsValue> {
+    let g = ai_tasks::features::audio::graph::FeGraph::load(&graph_json, &weights)
+        .map_err(js_err)?;
+    let zeros: Vec<ai_tasks::features::audio::ops::Tens> = g
+        .inputs
+        .iter()
+        .map(|(_, s)| ai_tasks::features::audio::ops::Tens::zeros(s.clone()))
+        .collect();
+    let _ = g.run(zeros.clone()).map_err(js_err)?; // 워밍업
+    // run_profiled는 실행마다 정렬 순서가 다를 수 있다 — 이름으로 합산
+    let mut acc: std::collections::HashMap<String, f64> = Default::default();
+    for _ in 0..reps {
+        let (_, prof) = g.run_profiled(zeros.clone()).map_err(js_err)?;
+        for (op, ms) in prof {
+            *acc.entry(op).or_default() += ms;
+        }
+    }
+    let mut v: Vec<(String, f64)> = acc.into_iter().map(|(k, t)| (k, t / reps as f64)).collect();
+    v.sort_by(|a, b| b.1.total_cmp(&a.1));
+    serde_wasm_bindgen::to_value(&v).map_err(js_err)
+}
+
 // ───────── studio — VideoPipeline 데모/게이트 (web/demo/studio.html) ─────────
 
 #[cfg(target_arch = "wasm32")]
@@ -1369,7 +1597,8 @@ pub fn studio_items_pose(points: Vec<f32>) -> Result<(), JsValue> {
     })
 }
 
-/// 씬 광원 프로브 — u8 RGB 프레임 (내부 8틱 스로틀, 웹 probeSceneLight 등가)
+/// 씬 광원 프로브 — u8 RGB 프레임 (웹 probeSceneLight 등가).
+/// 페이싱은 호출자(JS) 몫 — studio.js가 8틱 게이트로 getImageData 자체를 아낀다.
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub fn studio_items_probe(rgb: &[u8], w: u32, h: u32) -> Result<(), JsValue> {
@@ -1377,10 +1606,72 @@ pub fn studio_items_probe(rgb: &[u8], w: u32, h: u32) -> Result<(), JsValue> {
         let mut b = c.borrow_mut();
         let s = b.as_mut().ok_or_else(|| JsValue::from_str("studio_attach 먼저"))?;
         if let Some(items) = s.items.as_mut() {
-            items.renderer.probe_scene_light_rgb(rgb, w as usize, h as usize);
+            items.renderer.probe_scene_light_rgb_now(rgb, w as usize, h as usize);
         }
         Ok(())
     })
+}
+
+/// FaceTask 한 프레임 — **studio 파이프라인의 프레임 텍스처를 공유**한다
+/// (studio_frame/studio_frame_mask가 이번 틱에 임포트한 것 — 재임포트 없음,
+/// getImageData 없음). face_task_tex의 studio판. studio_frame 뒤에 부를 것.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub async fn studio_face(task: u32, det: u32, lm: u32, t_ms: f64) -> Result<JsValue, JsValue> {
+    let ctx = engine()?;
+    let (view, fw, fh) = STUDIO
+        .with(|c| c.borrow().as_ref().and_then(|s| s.pipeline.frame_view()))
+        .ok_or_else(|| JsValue::from_str("studio_frame 먼저 (프레임 텍스처 없음)"))?;
+    let pre = match FACE_PRE.with(|p| p.borrow_mut().take()) {
+        Some(p) => p,
+        None => ai_tasks::GpuPre::new(&ctx),
+    };
+    let mut task_s = match FACE_TASKS.with(|p| p.borrow_mut().take(task)) {
+        Ok(s) => s,
+        Err(e) => {
+            FACE_PRE.with(|p| *p.borrow_mut() = Some(pre));
+            return Err(js_err(e));
+        }
+    };
+    let mut det_s = match GPU_MODELS.with(|p| p.borrow_mut().take(det)) {
+        Ok(s) => s,
+        Err(e) => {
+            FACE_PRE.with(|p| *p.borrow_mut() = Some(pre));
+            FACE_TASKS.with(|p| p.borrow_mut().put(task, task_s));
+            return Err(js_err(e));
+        }
+    };
+    let mut lm_s = match GPU_MODELS.with(|p| p.borrow_mut().take(lm)) {
+        Ok(s) => s,
+        Err(e) => {
+            FACE_PRE.with(|p| *p.borrow_mut() = Some(pre));
+            FACE_TASKS.with(|p| p.borrow_mut().put(task, task_s));
+            GPU_MODELS.with(|p| p.borrow_mut().put(det, det_s));
+            return Err(js_err(e));
+        }
+    };
+    let result = task_s
+        .process_tex(&ctx, &pre, &view, &mut det_s, &mut lm_s, fw, fh, t_ms)
+        .await;
+    let fc = task_s.face_count();
+    // 터치업/메이크업 오버레이 갱신 (이펙트 off·얼굴 소실이면 no-op/해제) —
+    // 다음 프레임 compose에 반영 (1프레임 지연, pipeline.update_face_fx 주석)
+    if let Ok(r) = &result {
+        let pts = r.as_ref().map(|f| f.points.clone());
+        STUDIO.with(|c| {
+            if let Some(s) = c.borrow_mut().as_mut() {
+                s.pipeline.update_face_fx(&ctx, pts.as_deref());
+            }
+        });
+    }
+    FACE_PRE.with(|p| *p.borrow_mut() = Some(pre));
+    FACE_TASKS.with(|p| p.borrow_mut().put(task, task_s));
+    GPU_MODELS.with(|p| {
+        let mut b = p.borrow_mut();
+        b.put(det, det_s);
+        b.put(lm, lm_s);
+    });
+    js_face_result(result.map_err(js_err)?, fc)
 }
 
 // ───────── vb 픽셀 diff 게이트 — v-ai GLSL 파리티 (web/demo/vb-diff.html) ─────────

@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>audio-ab — fastenhancer wasm 게이트</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: ui-sans-serif, system-ui, -apple-system, "Apple SD Gothic Neo", sans-serif;
+    max-width: 900px; margin: 1.2rem auto; padding: 0 1rem; line-height: 1.5; }
+  h1 { font-size: 1.2rem; margin: 0 0 .25rem; }
+  .note { font-size: .85rem; opacity: .75; margin: 0 0 .9rem; }
+  #status { padding: .5rem .8rem; border-radius: 8px; background: rgba(88,166,255,.12);
+    margin-bottom: .8rem; font-size: .9rem; }
+  pre { font-size: .85rem; }
+</style>
+</head>
+<body>
+<h1>audio-ab — fastenhancer (wasm CPU)</h1>
+<p class="note">3초 실오디오 픽스처를 hop(512@48k) 단위로 wasm Enhancer에 흘려
+공개 wav2wav ONNX 출력과 SNR 비교 + hop 벽시계(실시간 예산 10.67ms). 오디오는
+CPU 고정(AudioWorklet에 WebGPU 없음) — GPU 엔진 없이 도는지도 여기서 확인.
+선행: make convert-fastenhancer.</p>
+<div id="status">준비 중…</div>
+<pre id="log"></pre>
+<script type="module" src="audio-ab.js"></script>
+</body>
+</html>

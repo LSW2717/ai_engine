@@ -35,28 +35,14 @@ use super::stages::mask_refine::MaskRefine;
 use super::stages::mask_upsample::MaskUpsample;
 use super::stages::preprocess::Preprocess;
 
-/// 해상도·세션 종속 리소스 — 바인드그룹은 전부 여기서 만들어 프레임 루프에서
-/// 재생성 0 (매 프레임 만들면 분당 수천 개 — Compositor에서 실측한 함정)
-struct Res {
-    fw: u32,
-    fh: u32,
-    frame_tex: wgpu::Texture,
+/// GPU 추론 세션 종속 리소스 — **세션이 있을 때만** 생긴다. 외부 마스크 전용
+/// (B/C 티어 — CPU 추론 + GPU 합성)은 이게 없어도 스택 전체가 돈다:
+/// RVM 로드(7.6MB fetch + 파이프라인 컴파일) 없이 GPU 합성만 쓰는 경로.
+struct GpuLeg {
     staging: wgpu::Texture,
-    mask_lo: Vec<wgpu::TextureView>, // [2] EMA 핑퐁
-    mask_hi: wgpu::TextureView,
-    refine_v: Vec<wgpu::TextureView>, // [3] tmp/blurred/refined — compose는 [2]를 소비
-    blur_v: Vec<wgpu::TextureView>, // [2]
-    bw: u32,
-    bh: u32,
     pre_bind: wgpu::BindGroup,
     ingest_bind: Vec<wgpu::BindGroup>, // [parity]
-    up_bind: Vec<wgpu::BindGroup>,
-    refine_binds: Vec<wgpu::BindGroup>, // [3] h/v/refine
-    blur_binds: Vec<(wgpu::BindGroup, usize)>, // (bind, 타깃 인덱스)
-    comp_bind: wgpu::BindGroup,
     mask_bytes_per_row: u32,
-    mw: u32,
-    mh: u32,
     out_cg: u32,
     out_name: String,
     /// RVM 전경색 출력 (c==3) — 있으면 매팅 합성에 사용
@@ -66,13 +52,38 @@ struct Res {
     in_w: u32,
     in_h: u32,
     in_cg: u32,
+}
+
+/// 해상도 종속 리소스 — 바인드그룹은 전부 여기서 만들어 프레임 루프에서
+/// 재생성 0 (매 프레임 만들면 분당 수천 개 — Compositor에서 실측한 함정)
+struct Res {
+    fw: u32,
+    fh: u32,
+    frame_tex: wgpu::Texture,
+    mask_lo: Vec<wgpu::TextureView>, // [2] EMA 핑퐁
+    mask_hi: wgpu::TextureView,
+    refine_v: Vec<wgpu::TextureView>, // [3] tmp/blurred/refined — compose는 [2]를 소비
+    blur_v: Vec<wgpu::TextureView>, // [2]
+    bw: u32,
+    bh: u32,
+    up_bind: Vec<wgpu::BindGroup>,
+    refine_binds: Vec<wgpu::BindGroup>, // [3] h/v/refine
+    blur_binds: Vec<(wgpu::BindGroup, usize)>, // (bind, 타깃 인덱스)
+    comp_bind: wgpu::BindGroup,
+    /// EMA(mask_lo) 해상도 — 세션 있으면 모델 마스크 해상도, 없으면 외부 마스크
+    mw: u32,
+    mh: u32,
+    /// GPU 추론 경로 리소스 (세션 없는 ensure면 None)
+    gpu: Option<GpuLeg>,
     /// 외부 마스크 주입(픽셀 diff 게이트 · P2 B티어) 스테이징 — (ch, w, h, 텍스처,
     /// 인제스트 바인드 핑퐁). 지연 생성 (주입 경로를 안 쓰면 비용 0).
     /// 치수는 호출자 마스크 기준(CPU 모델 해상도) — ingest가 textureLoad로 자기
-    /// 해상도를 읽어 mask_lo(GPU 모델 해상도)로 리샘플하므로 달라도 된다
+    /// 해상도를 읽어 mask_lo(EMA 해상도)로 리샘플하므로 달라도 된다
     ext_mask: Option<(u32, u32, u32, wgpu::Texture, Vec<wgpu::BindGroup>)>,
     /// bbox 리덕션 바인드 (mask_lo[p] — EMA 이후 마스크 소비) [parity]
     bbox_bind: Vec<wgpu::BindGroup>,
+    /// 터치업(R8)·메이크업 mul/over(RGBA8) 128² 오버레이 — update_face_fx가 굽는다
+    fx_tex: [(wgpu::Texture, wgpu::TextureView); 3],
 }
 
 pub struct VideoPipeline {
@@ -89,6 +100,8 @@ pub struct VideoPipeline {
     last_bbox: Option<BBox>,
     /// 게이트/디버그: 크롭 강제 고정 (스무딩 우회)
     framing_override: Option<(f32, f32, f32)>,
+    /// 터치업/메이크업 uniform 값 — update_face_fx가 갱신 (기본 0 = off)
+    face_fx: super::stages::compose::FaceFxParams,
     epoch: Instant,
     sampler: wgpu::Sampler,
     /// v-ai 파리티: 저해상 마스크(segmentationTexture)·JBF 출력(personMask)은
@@ -115,6 +128,7 @@ impl VideoPipeline {
             framing: Framing::default(),
             last_bbox: None,
             framing_override: None,
+            face_fx: Default::default(),
             epoch: Instant::now(),
             sampler: ctx.device.create_sampler(&wgpu::SamplerDescriptor {
                 label: Some("video"),
@@ -180,13 +194,97 @@ impl VideoPipeline {
         h: u32,
         f: impl FnOnce(&wgpu::Texture) -> R,
     ) -> Result<R, TaskError> {
-        self.ensure(ctx, seg, w, h)?;
+        self.ensure(ctx, Some(seg), w, h, (0, 0))?;
         Ok(f(&self.res.as_ref().unwrap().frame_tex))
+    }
+
+    /// with_frame_texture의 **세션 없는** 판 (process_mask_nogpu 짝) —
+    /// mask_dims = 이후 주입할 외부 마스크 해상도 (EMA 해상도가 이걸 따른다)
+    pub fn with_frame_texture_nogpu<R>(
+        &mut self,
+        ctx: &GpuContext,
+        w: u32,
+        h: u32,
+        mask_dims: (u32, u32),
+        f: impl FnOnce(&wgpu::Texture) -> R,
+    ) -> Result<R, TaskError> {
+        self.ensure(ctx, None, w, h, mask_dims)?;
+        Ok(f(&self.res.as_ref().unwrap().frame_tex))
+    }
+
+    /// 현재 프레임 텍스처 뷰 + 크기 — FaceTask GPU 입력(process_tex)이 이번
+    /// 프레임 임포트를 **공유**하기 위한 접근자 (재임포트 = 저사양에서 업로드
+    /// 대역 2배라 금지). `with_frame_texture`로 프레임이 채워진 뒤에 유효하다.
+    pub fn frame_view(&self) -> Option<(wgpu::TextureView, u32, u32)> {
+        self.res
+            .as_ref()
+            .map(|r| (r.frame_tex.create_view(&Default::default()), r.fw, r.fh))
+    }
+
+    /// 터치업/메이크업 갱신 — FaceTask 결과(원본 프레임 **정규화** 좌표)를 받아
+    /// 128² 오버레이를 CPU 래스터라이즈(수십 µs) 후 업로드하고 compose uniform을
+    /// 채운다. None(얼굴 소실)이나 이펙트 off면 uniform 0 = 셰이더 no-op.
+    /// 호출 시점: 프레임 합성 뒤(studio_face) — 오버레이는 다음 프레임에 반영
+    /// (1프레임 지연, 128² 소프트 마스크라 비가시. 프레이밍 EMA와 같은 급).
+    pub fn update_face_fx(&mut self, ctx: &GpuContext, points_norm: Option<&[[f32; 3]]>) {
+        use crate::features::face::{makeup, touchup};
+        let mut fx = super::stages::compose::FaceFxParams::default();
+        let (Some(r), Some(pts)) = (&self.res, points_norm) else {
+            self.face_fx = fx;
+            return;
+        };
+        let want_tu = self.state.touch_up.is_some();
+        let want_mk = self.state.makeup.is_some();
+        if !want_tu && !want_mk {
+            self.face_fx = fx;
+            return;
+        }
+        let (fw, fh) = (r.fw as f32, r.fh as f32);
+        let px: Vec<[f32; 3]> = pts.iter().map(|p| [p[0] * fw, p[1] * fh, p[2]]).collect();
+        let upload = |tex: &wgpu::Texture, data: &[u8], bpp: u32| {
+            ctx.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                data,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(128 * bpp),
+                    rows_per_image: Some(128),
+                },
+                wgpu::Extent3d { width: 128, height: 128, depth_or_array_layers: 1 },
+            );
+        };
+        if let Some(t) = self.state.touch_up.as_ref() {
+            if let Some(m) = touchup::rasterize(&px) {
+                upload(&r.fx_tex[0].0, &m.data, 1);
+                fx.tu_map = [fw / m.w, fh / m.h, -m.x0 / m.w, -m.y0 / m.h];
+                // alpha 0.62×strength·blur_px = face_w×0.022 clamp[1,8] — vcxrust 동일
+                let blur_px = (m.face_w * 0.022).clamp(1.0, 8.0);
+                fx.tu_par =
+                    [0.62 * t.strength.clamp(0.0, 1.0), 0.0, blur_px / fw, blur_px / fh];
+            }
+        }
+        if let Some(mk) = self.state.makeup.as_ref() {
+            if let Some(m) = makeup::rasterize(&px, mk) {
+                upload(&r.fx_tex[1].0, &m.mul, 4);
+                upload(&r.fx_tex[2].0, &m.over, 4);
+                fx.mk_map = [fw / m.w, fh / m.h, -m.x0 / m.w, -m.y0 / m.h];
+            }
+        }
+        self.face_fx = fx;
     }
 
     /// 매팅 합성(fgr) 사용 중인가 — 진단·게이트용
     pub fn uses_fgr(&self) -> bool {
-        self.res.as_ref().map(|r| r.fgr.is_some()).unwrap_or(false)
+        self.res
+            .as_ref()
+            .and_then(|r| r.gpu.as_ref())
+            .map(|g| g.fgr.is_some())
+            .unwrap_or(false)
     }
 
     /// 세션 교체 시 리소스 폐기 (모델 버퍼가 바인드그룹에 박혀 있다).
@@ -245,35 +343,53 @@ impl VideoPipeline {
         self.framing.update(self.state.framing.as_ref(), self.last_bbox, now);
     }
 
+    /// seg=None이면 **세션 없는 ensure** — GPU 추론 리소스(GpuLeg) 없이 외부
+    /// 마스크 합성 전용으로 만든다 (B/C 티어가 RVM을 로드하지 않는 근거).
+    /// ext_dims = 세션 없을 때의 EMA(mask_lo) 해상도 (외부 마스크 크기).
     fn ensure(
         &mut self,
         ctx: &GpuContext,
-        seg: &GpuSession,
+        seg: Option<&GpuSession>,
         fw: u32,
         fh: u32,
+        ext_dims: (u32, u32),
     ) -> Result<(), TaskError> {
         if !self.bg_dirty {
             if let Some(r) = &self.res {
-                if r.fw == fw && r.fh == fh {
+                let dims_ok = seg.is_some() || (r.mw, r.mh) == ext_dims;
+                if r.fw == fw && r.fh == fh && r.gpu.is_some() == seg.is_some() && dims_ok {
                     return Ok(());
                 }
             }
         }
-        let model = seg.model();
-        let in_name = model.sw.tensors[model.sw.inputs[0] as usize].name.clone();
-        let (out_name, out_desc) = mask_output(model)?;
-        let fgr_out = fgr_output(model, &out_name);
-        let (in_buf, in_desc) = model
-            .input_storage(&in_name)
-            .ok_or_else(|| TaskError::Other("세그 입력 버퍼 없음".into()))?;
-        let (mw, mh, out_cg) = (out_desc.w, out_desc.h, out_desc.cg());
-        // dtype 인지: fp16 모델이면 레인이 8B (rgba16float 스테이징)
-        let texel_bytes = out_desc.dt.vec4_bytes() as u32;
-        let mask_bytes_per_row = mw * out_cg * texel_bytes;
-        if mask_bytes_per_row % 256 != 0 {
-            return Err(TaskError::Other(format!(
-                "마스크 행 {mask_bytes_per_row}B가 256 정렬 아님 (W={mw} cg={out_cg})"
-            )));
+        // 모델 종속 메타 (세션 있을 때만) — mw/mh는 모델 마스크 or 외부 마스크 해상도
+        let model = seg.map(|s| s.model());
+        let mut gpu_meta = None;
+        let (mw, mh);
+        if let Some(model) = model {
+            let in_name = model.sw.tensors[model.sw.inputs[0] as usize].name.clone();
+            let (out_name, out_desc) = mask_output(model)?;
+            let fgr_out = fgr_output(model, &out_name);
+            let (in_buf, in_desc) = model
+                .input_storage(&in_name)
+                .ok_or_else(|| TaskError::Other("세그 입력 버퍼 없음".into()))?;
+            let out_cg = out_desc.cg();
+            (mw, mh) = (out_desc.w, out_desc.h);
+            // dtype 인지: fp16 모델이면 레인이 8B (rgba16float 스테이징)
+            let texel_bytes = out_desc.dt.vec4_bytes() as u32;
+            let mask_bytes_per_row = mw * out_cg * texel_bytes;
+            if mask_bytes_per_row % 256 != 0 {
+                return Err(TaskError::Other(format!(
+                    "마스크 행 {mask_bytes_per_row}B가 256 정렬 아님 (W={mw} cg={out_cg})"
+                )));
+            }
+            gpu_meta =
+                Some((in_buf, in_desc, out_name, out_desc, fgr_out, mask_bytes_per_row));
+        } else {
+            (mw, mh) = ext_dims;
+            if mw == 0 || mh == 0 {
+                return Err(TaskError::Other("세션 없는 ensure엔 외부 마스크 크기 필요".into()));
+            }
         }
         let (frame_tex, frame_view) = tex2d(
             ctx,
@@ -282,18 +398,6 @@ impl VideoPipeline {
             fh,
             wgpu::TextureFormat::Rgba8Unorm,
             wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::RENDER_ATTACHMENT,
-        );
-        let (staging, staging_view) = tex2d(
-            ctx,
-            "video-mask-staging",
-            mw * out_cg,
-            mh,
-            if texel_bytes == 8 {
-                wgpu::TextureFormat::Rgba16Float
-            } else {
-                wgpu::TextureFormat::Rgba32Float
-            },
-            wgpu::TextureUsages::COPY_DST,
         );
         let mask_lo: Vec<wgpu::TextureView> = (0..2)
             .map(|i| {
@@ -354,29 +458,82 @@ impl VideoPipeline {
                 entries,
             })
         };
-        let pre_bind = bind(
-            "video-pre",
-            &self.pre.bgl,
-            &[
-                E { binding: 0, resource: BTex(&frame_view) },
-                E { binding: 1, resource: BSampler(&self.sampler) },
-                E { binding: 2, resource: in_buf.as_entire_binding() },
-                E { binding: 3, resource: self.pre.params.as_entire_binding() },
-            ],
-        );
-        let ingest_bind: Vec<wgpu::BindGroup> = (0..2)
-            .map(|p| {
-                bind(
-                    "video-ingest",
-                    &self.ingest.fs.bgl,
+        // GPU 추론 경로 리소스 — 세션 있을 때만 (스테이징·전처리·인제스트·fgr)
+        let gpu_leg = gpu_meta.map(
+            |(in_buf, in_desc, out_name, out_desc, fgr_out, mask_bytes_per_row)| {
+                let out_cg = out_desc.cg();
+                let texel_bytes = out_desc.dt.vec4_bytes() as u32;
+                let (staging, staging_view) = tex2d(
+                    ctx,
+                    "video-mask-staging",
+                    mw * out_cg,
+                    mh,
+                    if texel_bytes == 8 {
+                        wgpu::TextureFormat::Rgba16Float
+                    } else {
+                        wgpu::TextureFormat::Rgba32Float
+                    },
+                    wgpu::TextureUsages::COPY_DST,
+                );
+                let pre_bind = bind(
+                    "video-pre",
+                    &self.pre.bgl,
                     &[
-                        E { binding: 0, resource: BTex(&staging_view) },
-                        E { binding: 1, resource: BTex(&mask_lo[1 - p]) },
-                        E { binding: 2, resource: self.ingest.params.as_entire_binding() },
+                        E { binding: 0, resource: BTex(&frame_view) },
+                        E { binding: 1, resource: BSampler(&self.sampler) },
+                        E { binding: 2, resource: in_buf.as_entire_binding() },
+                        E { binding: 3, resource: self.pre.params.as_entire_binding() },
                     ],
-                )
-            })
-            .collect();
+                );
+                let ingest_bind: Vec<wgpu::BindGroup> = (0..2)
+                    .map(|p| {
+                        bind(
+                            "video-ingest",
+                            &self.ingest.fs.bgl,
+                            &[
+                                E { binding: 0, resource: BTex(&staging_view) },
+                                E { binding: 1, resource: BTex(&mask_lo[1 - p]) },
+                                E {
+                                    binding: 2,
+                                    resource: self.ingest.params.as_entire_binding(),
+                                },
+                            ],
+                        )
+                    })
+                    .collect();
+                // RVM 전경색 스테이징 (마스크와 같은 dtype 규약)
+                let fgr = fgr_out.map(|(n, d)| {
+                    let tb = d.dt.vec4_bytes() as u32;
+                    let (t, _) = tex2d(
+                        ctx,
+                        "vb-fgr-staging",
+                        d.w * d.cg(),
+                        d.h,
+                        if tb == 8 {
+                            wgpu::TextureFormat::Rgba16Float
+                        } else {
+                            wgpu::TextureFormat::Rgba32Float
+                        },
+                        wgpu::TextureUsages::COPY_DST,
+                    );
+                    (n, t, d.w * d.cg() * tb)
+                });
+                GpuLeg {
+                    staging,
+                    pre_bind,
+                    ingest_bind,
+                    mask_bytes_per_row,
+                    out_cg,
+                    out_name,
+                    fgr,
+                    mask_kind_alpha: out_desc.c == 1,
+                    in_f16: in_desc.dt.vec4_bytes() == 8,
+                    in_w: in_desc.w,
+                    in_h: in_desc.h,
+                    in_cg: in_desc.cg(),
+                }
+            },
+        );
         let up_bind: Vec<wgpu::BindGroup> = (0..2)
             .map(|p| {
                 bind(
@@ -442,23 +599,6 @@ impl VideoPipeline {
                 tgt,
             ));
         }
-        // RVM 전경색 스테이징 (마스크와 같은 dtype 규약)
-        let fgr = fgr_out.map(|(n, d)| {
-            let tb = d.dt.vec4_bytes() as u32;
-            let (t, _) = tex2d(
-                ctx,
-                "vb-fgr-staging",
-                d.w * d.cg(),
-                d.h,
-                if tb == 8 {
-                    wgpu::TextureFormat::Rgba16Float
-                } else {
-                    wgpu::TextureFormat::Rgba32Float
-                },
-                wgpu::TextureUsages::COPY_DST,
-            );
-            (n, t, d.w * d.cg() * tb)
-        });
         let bbox_bind: Vec<wgpu::BindGroup> = (0..2)
             .map(|p| {
                 bind(
@@ -471,7 +611,19 @@ impl VideoPipeline {
                 )
             })
             .collect();
-        let fgr_view = fgr.as_ref().map(|(_, t, _)| t.create_view(&Default::default()));
+        let fgr_view = gpu_leg
+            .as_ref()
+            .and_then(|g| g.fgr.as_ref())
+            .map(|(_, t, _)| t.create_view(&Default::default()));
+        // 터치업/메이크업 128² 오버레이 — uniform이 0(off)이면 셰이더가 안 읽는다
+        let fx_tex = [
+            tex2d(ctx, "vb-fx-touchup", 128, 128, wgpu::TextureFormat::R8Unorm,
+                wgpu::TextureUsages::COPY_DST),
+            tex2d(ctx, "vb-fx-mk-mul", 128, 128, wgpu::TextureFormat::Rgba8Unorm,
+                wgpu::TextureUsages::COPY_DST),
+            tex2d(ctx, "vb-fx-mk-over", 128, 128, wgpu::TextureFormat::Rgba8Unorm,
+                wgpu::TextureUsages::COPY_DST),
+        ];
         // 배경 이미지 없으면 블러 텍스처를 더미로 (해당 분기는 안 읽힌다)
         let bg_view = self.bg_img.as_ref().map(|b| &b.1).unwrap_or(&blur_v[1]);
         let comp_bind = bind(
@@ -488,13 +640,15 @@ impl VideoPipeline {
                     binding: 6,
                     resource: BTex(fgr_view.as_ref().unwrap_or(&frame_view)),
                 },
+                E { binding: 7, resource: BTex(&fx_tex[0].1) },
+                E { binding: 8, resource: BTex(&fx_tex[1].1) },
+                E { binding: 9, resource: BTex(&fx_tex[2].1) },
             ],
         );
         self.res = Some(Res {
             fw,
             fh,
             frame_tex,
-            staging,
             mask_lo,
             mask_hi,
             refine_v,
@@ -502,24 +656,15 @@ impl VideoPipeline {
             blur_v,
             bw,
             bh,
-            pre_bind,
-            ingest_bind,
             up_bind,
             blur_binds,
             comp_bind,
-            mask_bytes_per_row,
             mw,
             mh,
-            out_cg,
-            out_name,
-            fgr,
-            mask_kind_alpha: out_desc.c == 1,
-            in_f16: in_desc.dt.vec4_bytes() == 8,
-            in_w: in_desc.w,
-            in_h: in_desc.h,
-            in_cg: in_desc.cg(),
+            gpu: gpu_leg,
             ext_mask: None,
             bbox_bind,
+            fx_tex,
         });
         self.bg_dirty = false;
         Ok(())
@@ -536,30 +681,32 @@ impl VideoPipeline {
         fh: u32,
         target: &wgpu::TextureView,
     ) -> Result<(), TaskError> {
-        self.ensure(ctx, seg, fw, fh)?;
+        self.ensure(ctx, Some(seg), fw, fh, (0, 0))?;
         let p = self.parity;
         let bbox_slot = self.framing_tick(ctx);
         {
             let r = self.res.as_ref().unwrap();
-            self.pre.write_params(ctx, r.in_w, r.in_h, r.in_cg);
+            let g = r.gpu.as_ref().unwrap();
+            self.pre.write_params(ctx, g.in_w, g.in_h, g.in_cg);
             self.write_stack_params(
                 ctx,
                 r,
-                if r.mask_kind_alpha { MaskKind::Alpha } else { MaskKind::Logits2 },
-                r.fgr.is_some(),
+                if g.mask_kind_alpha { MaskKind::Alpha } else { MaskKind::Logits2 },
+                g.fgr.is_some(),
             );
             let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("video-pre"),
             });
-            self.pre.encode(&mut enc, &r.pre_bind, r.in_w, r.in_h, r.in_f16);
+            self.pre.encode(&mut enc, &g.pre_bind, g.in_w, g.in_h, g.in_f16);
             ctx.queue.submit([enc.finish()]);
         }
         // 추론 — 자체 인코더·제출 (같은 큐 = 순서 보장)
         seg.infer(ctx).await?;
         let r = self.res.as_ref().unwrap();
+        let g = r.gpu.as_ref().unwrap();
         let model = seg.model();
         let (out_buf, _) = model
-            .output_storage(&r.out_name)
+            .output_storage(&g.out_name)
             .ok_or_else(|| TaskError::Other("세그 출력 버퍼 없음".into()))?;
         let mut enc = ctx
             .device
@@ -569,19 +716,19 @@ impl VideoPipeline {
                 buffer: out_buf,
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(r.mask_bytes_per_row),
+                    bytes_per_row: Some(g.mask_bytes_per_row),
                     rows_per_image: Some(r.mh),
                 },
             },
             wgpu::TexelCopyTextureInfo {
-                texture: &r.staging,
+                texture: &g.staging,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            wgpu::Extent3d { width: r.mw * r.out_cg, height: r.mh, depth_or_array_layers: 1 },
+            wgpu::Extent3d { width: r.mw * g.out_cg, height: r.mh, depth_or_array_layers: 1 },
         );
-        if let Some((fgr_name, fgr_tex, fgr_bpr)) = &r.fgr {
+        if let Some((fgr_name, fgr_tex, fgr_bpr)) = &g.fgr {
             let (fgr_buf, fd) = model
                 .output_storage(fgr_name)
                 .ok_or_else(|| TaskError::Other("fgr 버퍼 없음".into()))?;
@@ -607,7 +754,7 @@ impl VideoPipeline {
                 },
             );
         }
-        self.encode_stack(&mut enc, r, p, &r.ingest_bind[p], bbox_slot, target);
+        self.encode_stack(&mut enc, r, p, &g.ingest_bind[p], bbox_slot, target);
         ctx.queue.submit([enc.finish()]);
         if let Some(s) = bbox_slot {
             self.bbox.map(s);
@@ -637,7 +784,41 @@ impl VideoPipeline {
         fh: u32,
         target: &wgpu::TextureView,
     ) -> Result<(), TaskError> {
-        self.ensure(ctx, seg, fw, fh)?;
+        self.ensure(ctx, Some(seg), fw, fh, (0, 0))?;
+        self.process_mask_common(ctx, mask, ch, mask_w, mask_h, ema, target)
+    }
+
+    /// **세션 없는** 외부 마스크 경로 — process_gpu_mask와 동일하되 GPU 세그
+    /// 모델을 전혀 요구하지 않는다 (B/C 티어: RVM 로드·컴파일 생략, EMA 해상도 =
+    /// 외부 마스크 해상도). GPU 추론으로 되돌리려면 invalidate() 후 세션 경로 호출.
+    #[allow(clippy::too_many_arguments)]
+    pub fn process_mask_nogpu(
+        &mut self,
+        ctx: &GpuContext,
+        mask: &[f32],
+        ch: u32,
+        mask_w: u32,
+        mask_h: u32,
+        ema: bool,
+        fw: u32,
+        fh: u32,
+        target: &wgpu::TextureView,
+    ) -> Result<(), TaskError> {
+        self.ensure(ctx, None, fw, fh, (mask_w, mask_h))?;
+        self.process_mask_common(ctx, mask, ch, mask_w, mask_h, ema, target)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn process_mask_common(
+        &mut self,
+        ctx: &GpuContext,
+        mask: &[f32],
+        ch: u32,
+        mask_w: u32,
+        mask_h: u32,
+        ema: bool,
+        target: &wgpu::TextureView,
+    ) -> Result<(), TaskError> {
         let p = self.parity;
         {
             let r = self.res.as_mut().unwrap();
@@ -753,6 +934,7 @@ impl VideoPipeline {
             self.bg_img.as_ref().map(|b| (b.2, b.3)),
             use_fgr,
             self.framing_override.unwrap_or_else(|| self.framing.current()),
+            &self.face_fx,
         );
     }
 

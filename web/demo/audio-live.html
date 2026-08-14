@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>audio-live — fastenhancer 10초 녹음 비교</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: ui-sans-serif, system-ui, -apple-system, "Apple SD Gothic Neo", sans-serif;
+    max-width: 720px; margin: 1.4rem auto; padding: 0 1rem; line-height: 1.7; }
+  h1 { font-size: 1.2rem; margin: 0 0 .25rem; }
+  .note { font-size: .85rem; opacity: .75; margin: 0 0 1rem; }
+  .row1 { display: flex; gap: .8rem; align-items: center; flex-wrap: wrap; }
+  button { padding: .55rem 1.2rem; font-size: 1.05rem; }
+  select { padding: .45rem .6rem; font-size: 1.05rem; }
+  #status { padding: .55rem .8rem; border-radius: 8px; background: rgba(88,166,255,.12);
+    margin-top: .9rem; font-size: .95rem; }
+  #dl { font-size: .9rem; margin-top: .6rem; }
+  #hud { font-variant-numeric: tabular-nums; font-size: .85rem; opacity: .8; margin-top: .5rem; }
+</style>
+</head>
+<body>
+<h1>fastenhancer — 10초 녹음 비교</h1>
+<p class="note">①10초 녹음 → ②모델 선택 → ③출력. 같은 녹음을 모델만 바꿔
+반복해서 들을 수 있다 (처리 결과는 캐시, 새 녹음 시 초기화).</p>
+<div class="row1">
+  <button id="start">● 10초 녹음</button>
+  <select id="engine">
+    <option value="engine">ai_engine (fastenhancer)</option>
+    <option value="ort">onnxruntime (원본 ONNX)</option>
+    <option value="off">원음</option>
+  </select>
+  <button id="play" disabled>▶ 출력</button>
+</div>
+<div id="status">대기 — 녹음을 시작하세요</div>
+<div id="dl"></div>
+<div id="hud"></div>
+<script type="module" src="audio-live.js"></script>
+</body>
+</html>

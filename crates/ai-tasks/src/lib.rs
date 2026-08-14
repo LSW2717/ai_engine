@@ -21,6 +21,7 @@ pub mod features;
 pub mod session;
 
 // 공개 표면은 재수출로 고정 — 내부 재배치가 바인딩·테스트를 깨지 않는다
+pub use detect::gpu::GpuPre;
 pub use detect::{Detection, DetectorPost};
 pub use error::TaskError;
 pub use features::face::{FaceResult, FaceTask};

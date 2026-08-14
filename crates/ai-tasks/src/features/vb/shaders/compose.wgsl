@@ -34,10 +34,20 @@ struct P {
     bg_mat: vec4f,
     // xy = aspect 보정 (v-ai updateAspectComp)
     bg_aspect: vec4f,
+    // 터치업/메이크업 (vcxrust_ai pack 이식, CPU가 128² 오버레이로 굽는다):
+    // tu_map/mk_map = 프레임 정규화 좌표 → 오버레이 uv (xy=scale, zw=offset),
+    // tu_par = x 알파(0.62×strength; 0=off), y 미사용, zw 블러 스트라이드(uv 단위)
+    tu_map: vec4f,
+    tu_par: vec4f,
+    mk_map: vec4f,
 }
 @group(0) @binding(5) var<uniform> p: P;
 // RVM 전경색 (매팅) — use_fgr=0이면 미사용 (프레임 뷰가 더미로 바인딩됨)
 @group(0) @binding(6) var fgr_tex: texture_2d<f32>;
+// 터치업 피부 마스크 (R8 128²) + 메이크업 오버레이 (RGBA8 128² ×2)
+@group(0) @binding(7) var touchup_tex: texture_2d<f32>;
+@group(0) @binding(8) var makeup_mul_tex: texture_2d<f32>;
+@group(0) @binding(9) var makeup_over_tex: texture_2d<f32>;
 
 fn apply_relight(base: vec3f, pm: f32, uv: vec2f) -> vec3f {
     if (p.relight.x < 0.5) { return base; }
@@ -87,6 +97,60 @@ fn blur_bg_image(uv: vec2f) -> vec3f {
     return sum / max(total, 1.0e-4);
 }
 
+// 128² 오버레이 bilinear (스트레이트 알파, clamp) — vcxrust sample_overlay 등가
+fn sample_overlay(tex: texture_2d<f32>, uv: vec2f) -> vec4f {
+    let mpos = uv * 128.0 - 0.5;
+    let x0 = i32(floor(mpos.x));
+    let y0 = i32(floor(mpos.y));
+    let fx = mpos.x - f32(x0);
+    let fy = mpos.y - f32(y0);
+    let xc = clamp(x0, 0, 127);
+    let yc = clamp(y0, 0, 127);
+    let x1 = clamp(x0 + 1, 0, 127);
+    let y1 = clamp(y0 + 1, 0, 127);
+    let a = textureLoad(tex, vec2i(xc, yc), 0);
+    let b = textureLoad(tex, vec2i(x1, yc), 0);
+    let c = textureLoad(tex, vec2i(xc, y1), 0);
+    let d = textureLoad(tex, vec2i(x1, y1), 0);
+    return mix(mix(a, b, fx), mix(c, d, fx), fy);
+}
+
+fn touchup_weight(cuv: vec2f) -> f32 {
+    let uv = cuv * p.tu_map.xy + p.tu_map.zw;
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) { return 0.0; }
+    return sample_overlay(touchup_tex, uv).r * p.tu_par.x;
+}
+
+// 3×3 가우스(1-2-1), 스트라이드 = blur_px(프레임 px → uv 선변환). vcxrust pack은
+// 크롭 줌 시 blur_px/crop_scale 보정을 하지만 여기선 불필요 — 프레임 좌표계(cuv)
+// 샘플이라 크롭 확대가 화면 블러 반경을 자동으로 같이 키운다.
+fn touchup_blur(cuv: vec2f) -> vec3f {
+    var acc = vec3f(0.0);
+    var ws = 0.0;
+    for (var dy = -1; dy <= 1; dy += 1) {
+        for (var dx = -1; dx <= 1; dx += 1) {
+            let w = f32((2 - abs(dx)) * (2 - abs(dy)));
+            let uv = cuv + vec2f(f32(dx), f32(dy)) * p.tu_par.zw;
+            acc += textureSampleLevel(frame, samp, uv, 0.0).rgb * w;
+            ws += w;
+        }
+    }
+    return acc / max(ws, 1e-5);
+}
+
+// 메이크업 2단 합성 — 웹 drawMakeup 등가:
+// multiply 레이어(섀도·립 본체) base×mix(1,color,α) → source-over 레이어 mix
+fn apply_makeup(base: vec3f, cuv: vec2f) -> vec3f {
+    let uv = cuv * p.mk_map.xy + p.mk_map.zw;
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) { return base; }
+    var out = base;
+    let m = sample_overlay(makeup_mul_tex, uv);
+    if (m.a > 0.003) { out = out * mix(vec3f(1.0), m.rgb, m.a); }
+    let o = sample_overlay(makeup_over_tex, uv);
+    if (o.a > 0.003) { out = mix(out, o.rgb, o.a); }
+    return out;
+}
+
 @fragment fn fs(in: VsOut) -> @location(0) vec4f {
     // 인물 중앙 프레이밍 크롭 좌표 — v-ai 규약:
     //  - image/단색(image 스테이지): **인물 레이어만** 크롭, 배경·조명은 화면 고정
@@ -132,6 +196,18 @@ fn blur_bg_image(uv: vec2f) -> vec3f {
         let lwm = 1.0 - max(0.0, raw - p.cov.y) / (1.0 - p.cov.y);
         let lw = p.light_wrap * lwm * bg;
         fg = 1.0 - (1.0 - fg) * (1.0 - lw);
+    }
+    // 터치업 — 피부 마스크 가중 소프트 블러 + 1.02 밝기 리프트 (vcxrust pack
+    // 이식 — 단 luma가 아니라 RGB에 적용: 웹 drawTouchUp이 RGB 블러다)
+    if (p.tu_par.x > 0.0) {
+        let tu = touchup_weight(cuv);
+        if (tu > 0.003) {
+            fg = mix(fg, min(touchup_blur(cuv) * 1.02, vec3f(1.0)), tu);
+        }
+    }
+    // 메이크업 — 립/블러셔/아이섀도 컬러 오버레이 (얼굴 밖은 uv 가드로 무변화)
+    if (p.mk_map.x > 0.0) {
+        fg = apply_makeup(fg, cuv);
     }
 
     let pm = smoothstep(p.cov.x, p.cov.y, raw);

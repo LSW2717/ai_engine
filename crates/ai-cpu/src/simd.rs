@@ -55,6 +55,14 @@ mod imp {
             unsafe { Self(vaddq_f32(self.0, o.0)) }
         }
         #[inline(always)]
+        pub fn sub(self, o: Self) -> Self {
+            unsafe { Self(vsubq_f32(self.0, o.0)) }
+        }
+        #[inline(always)]
+        pub fn div(self, o: Self) -> Self {
+            unsafe { Self(vdivq_f32(self.0, o.0)) }
+        }
+        #[inline(always)]
         pub fn mul(self, o: Self) -> Self {
             unsafe { Self(vmulq_f32(self.0, o.0)) }
         }
@@ -141,6 +149,14 @@ mod imp {
             Self(f32x4_add(self.0, o.0))
         }
         #[inline(always)]
+        pub fn sub(self, o: Self) -> Self {
+            Self(f32x4_sub(self.0, o.0))
+        }
+        #[inline(always)]
+        pub fn div(self, o: Self) -> Self {
+            Self(f32x4_div(self.0, o.0))
+        }
+        #[inline(always)]
         pub fn mul(self, o: Self) -> Self {
             Self(f32x4_mul(self.0, o.0))
         }
@@ -212,6 +228,22 @@ mod imp {
         #[inline(always)]
         pub fn fma_lane<const L: usize>(self, a: Self, w: Self) -> Self {
             self.fma(Self::splat(a.0[L]), w)
+        }
+        #[inline(always)]
+        pub fn sub(self, o: Self) -> Self {
+            let mut r = self.0;
+            for l in 0..4 {
+                r[l] -= o.0[l];
+            }
+            Self(r)
+        }
+        #[inline(always)]
+        pub fn div(self, o: Self) -> Self {
+            let mut r = self.0;
+            for l in 0..4 {
+                r[l] /= o.0[l];
+            }
+            Self(r)
         }
         #[inline(always)]
         pub fn add(self, o: Self) -> Self {

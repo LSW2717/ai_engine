@@ -7,10 +7,11 @@
 use ai_gpu::GpuContext;
 
 use crate::error::TaskError;
+use crate::features::face::blendshapes;
 use crate::session::gpu::GpuSession;
 use super::one_euro::OneEuro2;
 use super::preprocess::{crop_resize_rgb, decode_bins, ears_closed, face_crop_box, imagenet_normalize};
-use super::state::{BaselineCollector, FocusFrame, FocusResult, FocusStateMachine, Gaze};
+use super::state::{BaselineCollector, FocusFrame, FocusResult, FocusStateMachine, Gaze, ScreenLayout};
 
 const CNN_MIN_INTERVAL_MS: f64 = 1000.0 / 12.0;
 const INPUT: usize = 448;
@@ -57,12 +58,37 @@ impl GazeTask {
         self.last_gaze
     }
 
+    /// JSON 레이아웃 설정 — {monitors:[{index,left,top,width,height,yawDeg}],
+    /// targetIndex} 또는 null (바인딩용 — 웹 getScreenDetails 산출물)
+    pub fn set_layout_json(&mut self, json: &str) -> Result<(), String> {
+        let layout: Option<ScreenLayout> =
+            serde_json::from_str(json).map_err(|e| format!("레이아웃 파싱: {e}"))?;
+        self.set_layout(layout);
+        Ok(())
+    }
+
+    /// 다중 모니터 레이아웃 설정 (None = 단일 모니터 폴백).
+    /// 타깃 모니터가 바뀌면 baseline을 리셋한다 (웹 tracker.ts 규약 —
+    /// 시선 원점이 물리적으로 이동했으므로 재수집).
+    pub fn set_layout(&mut self, layout: Option<ScreenLayout>) {
+        let prev = self.machine.layout.as_ref().map(|l| l.target_index);
+        let next = layout.as_ref().map(|l| l.target_index);
+        self.machine.layout = layout;
+        if prev.is_some() && next.is_some() && prev != next {
+            self.machine.baseline = None;
+            self.baseline = BaselineCollector::default();
+        }
+    }
+
     /// 비전 틱 1회. landmarks = 정규화 478점 (없으면 얼굴 소실 프레임).
+    /// bs = face_blendshapes 세션 (Some이면 blink가 EAR ∨ 블렌드셰이프 —
+    /// 웹 규약; None이면 EAR 절반만으로 동작).
     #[allow(clippy::too_many_arguments)]
     pub async fn process_gpu(
         &mut self,
         ctx: &GpuContext,
         gaze: &mut GpuSession,
+        mut bs: Option<&mut GpuSession>,
         rgb: &[u8],
         w: usize,
         h: usize,
@@ -93,6 +119,9 @@ impl GazeTask {
                 // 출력은 이름 매칭 (웹 gazeModel.ts — 순서 무관)
                 let yaw_l = gaze.read_output(ctx, "yaw").await?;
                 let pitch_l = gaze.read_output(ctx, "pitch").await?;
+                // 리드백이 이미 동기화 — finish_frame은 프레임타임·frames 기록용
+                // (안 부르면 stats가 0으로 남아 감사·강등 판정 입력이 죽는다)
+                gaze.finish_frame(ctx).await?;
                 self.last_gaze = Some(Gaze {
                     yaw: decode_bins(&yaw_l),
                     pitch: decode_bins(&pitch_l),
@@ -111,11 +140,25 @@ impl GazeTask {
                 self.machine.baseline = Some(b);
             }
         }
+        // blink 블렌드셰이프 절반 — 웹 blink.ts: (bsL≥0.55 AND bsR≥0.55) OR EAR.
+        // 입력 규약은 blendshapes.rs 헤더 (146 서브셋 × 프레임 px).
+        let mut bs_closed = false;
+        if let Some(s) = bs.as_deref_mut() {
+            if let Some(input) = blendshapes::input_from_landmarks(pts, w as f32, h as f32) {
+                s.upload(ctx, &input)?;
+                s.infer(ctx).await?;
+                let out_name =
+                    s.model().sw.tensors[s.model().sw.outputs[0] as usize].name.clone();
+                let coeffs = s.read_output(ctx, &out_name).await?;
+                s.finish_frame(ctx).await?;
+                bs_closed = blendshapes::blink_closed(&coeffs);
+            }
+        }
         Ok(self.machine.update(FocusFrame {
             ts_ms,
             face_count,
             gaze: gaze_v,
-            eyes_closed: ears_closed(pts),
+            eyes_closed: ears_closed(pts) || bs_closed,
         }))
     }
 }

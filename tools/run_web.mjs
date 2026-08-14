@@ -51,11 +51,11 @@ const browser = useWebkit
     });
 
 if (camera) {
-  await browser.contexts()[0]?.grantPermissions?.(['camera']).catch(() => {});
+  await browser.contexts()[0]?.grantPermissions?.(['camera', 'microphone']).catch(() => {});
 }
 const page = await browser.newPage();
 if (camera) {
-  await page.context().grantPermissions(['camera']).catch(() => {});
+  await page.context().grantPermissions(['camera', 'microphone']).catch(() => {});
 }
 page.setDefaultTimeout(600000);
 

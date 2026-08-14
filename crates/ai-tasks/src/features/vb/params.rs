@@ -86,6 +86,12 @@ pub struct EffectsPatch {
     /// null=프레이밍 해제 (인물 중앙화 — framing.rs)
     #[serde(deserialize_with = "double")]
     pub framing: Option<Option<crate::features::vb::framing::FramingOptions>>,
+    /// null=터치업 해제 (피부 보정 — features/face/touchup.rs, 랜드마크 필요)
+    #[serde(deserialize_with = "double")]
+    pub touch_up: Option<Option<crate::features::face::touchup::TouchUpOptions>>,
+    /// null=메이크업 해제 (features/face/makeup.rs, 랜드마크 필요)
+    #[serde(deserialize_with = "double")]
+    pub makeup: Option<Option<crate::features::face::makeup::MakeupOptions>>,
 }
 
 /// 해석된 현재 상태 — 파이프라인이 프레임마다 읽는 단일 진실
@@ -97,6 +103,8 @@ pub struct EffectsState {
     pub grayscale: f32,
     pub studio_light: Option<StudioLightOptions>,
     pub framing: Option<crate::features::vb::framing::FramingOptions>,
+    pub touch_up: Option<crate::features::face::touchup::TouchUpOptions>,
+    pub makeup: Option<crate::features::face::makeup::MakeupOptions>,
     pub mirror: bool,
     /// 도 단위, %360 정규화 저장
     pub degree: f32,
@@ -111,6 +119,8 @@ impl Default for EffectsState {
             grayscale: 0.0,
             studio_light: None,
             framing: None,
+            touch_up: None,
+            makeup: None,
             mirror: false,
             degree: 0.0,
         }
@@ -149,6 +159,12 @@ impl EffectsState {
         }
         if let Some(f) = &patch.framing {
             self.framing = f.clone().filter(|o| o.enabled);
+        }
+        if let Some(t) = &patch.touch_up {
+            self.touch_up = t.clone().filter(|o| o.enabled && o.strength > 0.0);
+        }
+        if let Some(m) = &patch.makeup {
+            self.makeup = m.clone().filter(|o| o.enabled && o.intensity > 0.0);
         }
         if let Some(m) = patch.mirror {
             self.mirror = m;

@@ -83,3 +83,41 @@ fn face_task_e2e_and_tracking() {
         r5.points[1][0], r5.points[1][1], r5.presence, r5.roi
     );
 }
+
+/// num_faces=2(집중도 MULTIPLE_FACES 감시)면 트래킹 중에도 디텍터가 매 프레임
+/// 돈다 — MediaPipe FaceLandmarker의 tracked<num_faces 검출 지속 규약.
+#[test]
+fn num_faces_2_keeps_detector_running() {
+    let (Ok(det_b), Ok(lm_b), Ok(frame)) =
+        (std::fs::read(DET), std::fs::read(LM), std::fs::read(FRAME))
+    else {
+        eprintln!("skip: 모델/프레임 없음 (make convert-mediapipe)");
+        return;
+    };
+    let mut det = CpuSession::load(&det_b).expect("det 로드");
+    let mut lm = CpuSession::load(&lm_b).expect("lm 로드");
+    let mut task = FaceTask::new(false);
+    task.set_num_faces(2);
+
+    task.process_cpu(&mut det, &mut lm, &frame, 256, 144, 0.0)
+        .expect("process")
+        .expect("얼굴 있음");
+    assert_eq!(det.stats().frames, 1);
+    assert_eq!(task.face_count(), 1, "픽스처는 1명");
+    assert!(task.is_tracking());
+
+    // 프레임 2: 트래킹 중인데도 디텍터 가동 (얼굴 수 감시)
+    task.process_cpu(&mut det, &mut lm, &frame, 256, 144, 33.0)
+        .expect("process")
+        .expect("얼굴 있음");
+    assert_eq!(det.stats().frames, 2, "num_faces=2면 매 프레임 검출이어야");
+    assert_eq!(task.face_count(), 1);
+
+    // 1로 되돌리면 디텍터 생략 복귀 (비용 제거)
+    task.set_num_faces(1);
+    task.process_cpu(&mut det, &mut lm, &frame, 256, 144, 66.0)
+        .expect("process")
+        .expect("얼굴 있음");
+    assert_eq!(det.stats().frames, 2, "num_faces=1 트래킹은 디텍터 생략");
+    assert_eq!(task.face_count(), 1);
+}

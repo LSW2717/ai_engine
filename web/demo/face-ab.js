@@ -235,8 +235,11 @@ async function main() {
       baseOptions: { modelAssetPath: BASE + 'face_landmarker.task', delegate: 'CPU' },
       runningMode: 'IMAGE',
       numFaces: 1,
+      outputFaceBlendshapes: true, // bs 스테이지 비교 상대
     });
-    const mpLm = flm.detect(frame).faceLandmarks[0].map((p) => [p.x * W, p.y * H]);
+    const mpRes = flm.detect(frame);
+    const mpLm = mpRes.faceLandmarks[0].map((p) => [p.x * W, p.y * H]);
+    const mpBs = mpRes.faceBlendshapes?.[0]?.categories ?? null;
     flm.close();
     log(`face-ab lm-mp n=${mpLm.length}`);
     draw(view, [], '#2da44e', []); // no-op — 아래서 점만 찍는다
@@ -269,6 +272,7 @@ async function main() {
       return { max: mx, mean: sum / mpLm.length };
     };
 
+    const results = {};
     for (const [tag, color, run] of [
       ['cpu', '#d1242f', async () => {
         const det = aiMod.load_model_cpu_h(detB).handle;
@@ -291,11 +295,24 @@ async function main() {
         aiMod.unload_model_h(lm);
         return r;
       }],
+      // GPU 텍스처 입력 — 캔버스 직결, 픽셀은 엔진 커널만 만진다 (getImageData 0)
+      ['tex', '#f2a33c', async () => {
+        await aiMod.init_engine();
+        const det = (await aiMod.load_model_h(detB)).handle;
+        const lm = (await aiMod.load_model_h(lmB)).handle;
+        const task = aiMod.face_task_new(false);
+        const r = await aiMod.face_task_tex(task, det, lm, frame, 0.0);
+        aiMod.face_task_free(task);
+        aiMod.unload_model_h(det);
+        aiMod.unload_model_h(lm);
+        return r;
+      }],
     ]) {
       say(`FaceTask ${tag} 실행 중…`);
       try {
         const r = await run();
         if (!r) throw new Error('얼굴 못 찾음 (null)');
+        results[tag] = r.points;
         const d = lmDiff(r.points);
         const ok = r.points.length === mpLm.length && d.max <= TOL_PX;
         pass = pass && ok;
@@ -311,6 +328,57 @@ async function main() {
         verdicts.push(`lm-${tag}=ERR`);
         log(`face-ab lm-${tag} ERR ${String(e).slice(0, 150)}`);
       }
+    }
+    // 엔진 내 교차 대조: GPU 텍스처 경로 vs CPU 경로 — 같은 수학의 두 구현이라
+    // 서브픽셀로 붙어야 한다 (MediaPipe 대비 3px 게이트보다 훨씬 빡빡한 검사)
+    if (results.cpu && results.tex) {
+      let mx = 0;
+      for (let i = 0; i < results.cpu.length; i++) {
+        mx = Math.max(
+          mx,
+          Math.hypot(
+            (results.cpu[i][0] - results.tex[i][0]) * W,
+            (results.cpu[i][1] - results.tex[i][1]) * H
+          )
+        );
+      }
+      const ok = mx <= 1.0;
+      pass = pass && ok;
+      verdicts.push(`lm-tex-vs-cpu=${ok ? 'ok' : 'FAIL'}`);
+      log(`face-ab lm-tex-vs-cpu max=${mx.toFixed(3)}px (tol 1.0)`);
+    }
+    // ── blendshapes 스테이지: 우리 face_blendshapes.sw(146 서브셋 × 프레임 px
+    // 규약 — MediaPipe face_blendshapes_graph 원본 대조)를 우리 랜드마크에 걸어
+    // MediaPipe faceBlendshapes와 52계수 diff. 입력 규약이 틀리면 크게 발산한다.
+    if (mpBs && results.cpu) {
+      say('blendshapes diff…');
+      const flat = new Float32Array(results.cpu.length * 2);
+      for (let i = 0; i < results.cpu.length; i++) {
+        flat[i * 2] = results.cpu[i][0];
+        flat[i * 2 + 1] = results.cpu[i][1];
+      }
+      const input = aiMod.bs_input_from_landmarks(flat, W, H);
+      const bsB = new Uint8Array(
+        await (await fetch(BASE + 'face_blendshapes.sw')).arrayBuffer()
+      );
+      const bsH = (await aiMod.load_model_h(bsB)).handle;
+      const io = aiMod.model_io_h(bsH);
+      const ours = await aiMod.infer_frame_h(bsH, input, io.outputs[0]);
+      aiMod.unload_model_h(bsH);
+      let mx = 0, blink = 0;
+      for (let i = 0; i < mpBs.length && i < ours.length; i++) {
+        const d = Math.abs(mpBs[i].score - ours[i]);
+        mx = Math.max(mx, d);
+        if (mpBs[i].categoryName === 'eyeBlinkLeft' || mpBs[i].categoryName === 'eyeBlinkRight') {
+          blink = Math.max(blink, d);
+        }
+      }
+      const ok = mx <= 0.12;
+      pass = pass && ok;
+      verdicts.push(`bs=${ok ? 'ok' : 'FAIL'}`);
+      log(
+        `face-ab bs 52coef vs MediaPipe max=${mx.toFixed(4)} blink=${blink.toFixed(4)} (tol 0.12)`
+      );
     }
   } catch (e) {
     pass = false;

@@ -31,11 +31,9 @@
    증폭). 웹 경로 자체가 getImageData u8이고 우리 f32가 상위 정밀도, 웹 규약상
    절대각은 baseline 상대 일관성만 필요 (gazeModel.ts 주석). 게이트는 같은
    양자화끼리 비교해 리샘플 차만 격리한다.
-   잔여: 다중 모니터 투영 분류기는 레이아웃 입력이 호스트 몫이라 API만 열면
-   됨(단일 모니터는 현 구현으로 완결).
-   ⚠ blink의 blendshape 절반(eyeBlinkL/R≥0.55 AND)은 face_blendshapes.sw 개통
-   완료로 배선 가능 — EAR와 OR 결합(웹 규약). Horn/Expression Stream(#7)에서
-   blendshape 상시 추론이 생길 때 같이 배선.
+   ~~잔여: 다중 모니터 투영 분류기 API / blink blendshape 절반~~ **전부 배선
+   완료 (2026-08-14)** — §"집중도 마감 3종" 참조 (gaze_layout API + EAR∨bs +
+   MULTIPLE_FACES).
 3. **박수 인식 — 판정 로직 완료**: `features/hand/gesture.rs` —
    ClapDetector **개선판** (웹 실패모드 수리: ①접촉 순간 양손→한손 융합 미발화
    → **융합 브리지 트랙**(FUSE_D 1.0·GRACE 5·접근속도) ②handedness 오판 무발화
@@ -103,6 +101,29 @@
 **야간 지시 1~6 전부 완료 (2026-08-14)** — 남은 사용자 몫: 실카메라 눈검증
 (아이템 착용감·집중도·박수 상수 튜닝).
 
+**다음 세션 계획 (2026-08-14 밤, 사용자 확정 — 아바타(P5)는 에셋 없어 보류,
+vcxreact 연결 제외)**:
+1. ~~FaceTask 입력 GPU화~~ **완료 (2026-08-14)** — §"FaceTask 입력 GPU화" 참조.
+   게이트 전부 그린: 커널 CPU 대조 max 7.9e-6 / process_tex vs process_gpu
+   **0.000px** / face-ab lm-tex 0.30px + lm-tex-vs-cpu **0.000px** / studio·vb-diff
+   무회귀.
+2. ~~터치업/메이크업 이관~~ **완료 (2026-08-14)** — §"터치업/메이크업 이관" 참조.
+   게이트: 래스터라이저 단위 5종 + tests/face_fx.rs(립 틴트 diff 36레벨·얼굴 밖
+   0·해제 시 비트 복원) + vb-diff 무회귀.
+3. ~~집중도 마감 3종~~ **완료 (2026-08-14)** — §"집중도 마감 3종" 참조.
+   게이트: 상태머신 3종+블렌드셰이프 2종+num_faces 계약 네이티브 그린,
+   face-ab bs 스테이지 **52계수 vs MediaPipe max 0.072 / blink 0.018** PASS,
+   gaze-ab·studio 무회귀 (studio 헤드리스 bs=on).
+4. ~~잔잔한 마감~~ **완료 (2026-08-14)** — §"잔잔한 마감 6종" 참조.
+(당초 후보였던 "이미지배경 블러 사전 베이크"는 측정 정정으로 실크기 ~8ms/프레임
+확인 — 카드는 유지하되 급하지 않음, 위 항목 뒤로.)
+
+**→ 4항목 전부 완료 (2026-08-14 심야).** 남은 사용자 몫 (실카메라 눈검증):
+터치업/메이크업 룩(기본값 = vcxrust 테스트 룩 — studio 체크박스), 프레이밍 중
+3D 아이템 줌 동행, 실멀티모니터 gaze_layout, MULTIPLE_FACES(두 사람), blink
+bs 체감. 다음 엔진 작업 후보는 "다음 작업" D(P4 웹 연결 — **사용자 확인 필수**,
+v-ai 연결 보류 중) 또는 E(아바타 에셋 대기 / mnv4-RVM 교체).
+
 ## 다음 작업 (우선순위 — 2026-08-14 정리)
 
 **A. P1 마무리 — VideoPipeline 완성** (지금 여기)
@@ -119,15 +140,17 @@
    (fitBackgroundForCanvas)은 미이관 — 세로 프레임 대응 때 host/엔진 배치 결정.
 4. ~~studio HUD 정직화~~ **완료 (2026-08-14)** — HUD = rAF 간격 p50(체감 스루풋)
    + GPU 실측(5s 논블로킹 `gpu_sync`=onSubmittedWorkDone 샘플 — 루프 무정지)
-   + 제출 벽시계(허수 참고). **정직화가 즉시 드러낸 것 (M1 Pro, 1280×720)**:
-   제출은 내내 0.3ms지만 실측 GPU는 기본 6.6ms / blur60 22.6ms /
-   이미지배경+blur60+조명+프레이밍 **64.3ms** — p90>66ms 강등 문턱 코앞.
-   지배 후보는 **이미지배경 인셰이더 블러**(radius 7 → 225탭 × 720p ≈ 2억 샘플/
-   프레임 — v-ai 파리티 비용이지만 우리 타깃은 저사양). ⚠ P2 최적화 카드:
-   배경 이미지는 정적 — 업로드/블러값 변경 시 **1회 사전 블러 베이크** 텍스처로
-   바꾸면 프레임당 비용이 사라진다 (수학 동일 → 파리티 게이트 유지 가능).
-   측정 주의: gpu 수치는 큐 대기 포함(밀리면 커진다) — 강등 판정엔 오히려 옳은
-   신호 (v-ai p90도 같은 성격).
+   + 제출 벽시계(허수 참고).
+   **⚠ 측정 정정 (2026-08-14 밤, 사용자가 잡음)**: 당초 기록한 "이미지배경+
+   blur60+조명+프레이밍 64.3ms, 강등 코앞"은 **큐 대기가 포함된 HUD 샘플의
+   허수**였다 — rAF가 GPU보다 빨라 큐가 밀린 상태의 수치. **페이싱 재측정**
+   (`studio.html?perf=1` — 프레임 제출→gpu_sync 대기→다음, 스테이지별 30샘플):
+   기본 6.6 / blur60 8.3 / 이미지배경 6.6 / 이미지배경+blur60 14.2 /
+   +조명+프레이밍 **p50 16.1ms** (p90 19.3). 조합 분해: 이미지배경 자체는
+   공짜, **이미지배경×블러 조합에서만 +7.6ms** (인셰이더 배경 블러 225탭).
+   교훈: **HUD gpu 샘플은 강등 판정용(큐 포함이 옳음), 프레임 실비용 주장은
+   반드시 ?perf=1 페이싱으로.** P2 카드(1회 사전 블러 베이크)는 유효하되
+   실크기는 프레임당 ~8ms (64ms가 아님).
 
 **B. P2 티어 — 저사양이 제품 타깃 (사용자 최우선 강조, target-hardware-lowend)**
 5. **B 티어 코어 완료 (2026-08-14)** — 완료 기준 충족: 헤드리스에서 GPU 추론을
@@ -138,11 +161,10 @@
      GPU 모델 해상도(RVM 256×144)와 달라도 ingest가 textureLoad로 리샘플.
    - 강등: auto 티어 = gpu 실측(5s 샘플) 66ms 초과 **2연속 → B, 승격 없음**.
      studio에 티어 셀렉트(auto/A/B) + 현재 티어·강등 표시 + cpu_infer HUD.
-   - ⚠ 잔여: ①ensure()가 아직 GPU 세션을 요구 (B티어도 RVM 세션을 물고 있어야
-     리소스가 생긴다 — GPU 완전 부재(C티어/NoGpu) 경로는 세션 없는 ensure 분리
-     필요) ②강등 판정을 v-ai처럼 창(p90) 기반으로 정밀화 + 엔진 이관 여부는
-     P4 연결 때 ③이미지배경 블러 사전 베이크 카드 ④효과별 최소 티어 게이팅은
-     C 티어(소프트 합성) 생기면.
+   - 잔여 정리 (2026-08-14): ①~~세션 없는 ensure~~ **완료** — GpuLeg 분리 +
+     process_mask_nogpu (§"잔잔한 마감 6종") ②~~강등 창(p90)~~ **완료** —
+     studio.js v-ai 규약 (엔진 이관 여부는 P4 연결 때 재론) ③이미지배경 블러
+     사전 베이크 카드 유지 ④효과별 최소 티어 게이팅은 C 티어(소프트 합성) 생기면.
 
 **C. P3 얼굴 스택 — 아바타(표정 포함 인물 교체)의 전제**
 6. ~~blendshape 모델 개통~~ **완료 (2026-08-15 새벽)** — **CPU max_err 7.5e-7 /
@@ -189,10 +211,12 @@
 7. **Horn 피팅 이관 + Expression Stream API** — FaceResult를 {points 478,
    blendshapes 52, pose(quat·t·scale)}로. 웹 face-3d.ts/모바일 items3d와 같은
    FIT_PTS 15점·파워이터레이션. studio 3D 아이템이 첫 소비자(지금은 롤만 반영).
-8. **FaceTask 입력 GPU화** — 레터박스·회전 크롭을 커널로 (지금 getImageData
-   CPU 픽셀 경유 — 저사양 필수 항목).
-9. 터치업/메이크업 기하 이관 (vcxrust_ai가 이미 Rust — features/face/로).
-10. OneEuroFilter VIDEO 파리티 (filter 파라미터 미확정 주석 해소).
+8. ~~FaceTask 입력 GPU화~~ **완료 (2026-08-14)** — 상세는 아래 §"FaceTask 입력
+   GPU화" 절.
+9. ~~터치업/메이크업 기하 이관~~ **완료 (2026-08-14)** — 위 §"터치업/메이크업
+   이관" 절.
+10. ~~OneEuroFilter VIDEO 파리티~~ **완료 (2026-08-14)** — §"잔잔한 마감 6종"
+    (MediaPipe 원본 확정값 + 좌표계 수리).
 
 **D. P4 웹 연결**
 11. **VbEngine 3함수** (config/destroy/processWorkerFrame) ai-wasm 구현 —
@@ -365,6 +389,172 @@ pipe.uses_fgr() 게이트 단언 포함. ⚠ 한계+수리 (2026-08-14, 사용�
   video.videoWidth/Height로 동기화 ②출력 캔버스 백킹=CSS 크기면 레티나(dpr 2)에서
   브라우저가 2배 업스케일 → **백킹 1280×720 + CSS 640×360** (디바이스 픽셀 1:1).
 
+**FaceTask 입력 GPU화 — 완료 (2026-08-14)**: 마지막 프레임당 CPU 픽셀 경유
+(getImageData 720p ~3.7MB 리드백 + JS RGB 재패킹 + wasm 복사) 제거.
+- 구조: `ai-tasks/src/detect/gpu/` 신설 — `letterbox.rs`+`crop.rs`(커널별 1rs+
+  1wgsl, `shaders/`) + `frame.rs`(FrameTex — Rgba8 상주 프레임, 웹 임포트/네이티브
+  write_texture) + `mod.rs`(**GpuPre** = 커널+프레임 홀더, KernelPair 공통 뼈대).
+  커널이 `input_storage()`(모델 입력 버퍼)에 **직결** — vb preprocess와 같은
+  f32/f16 명시 공유 레이아웃 규약. `GpuSession::input_storage/detect_uploaded`
+  신설, `FaceTask::process_tex(ctx, pre, view, det, lm, w, h, t)` 드라이버 추가
+  (레터박스는 재획득 프레임만, 크롭은 매 프레임 — 남는 CPU 전송은 uniform 몇십 B
+  + 소형 출력 리드백뿐).
+- **샘플링은 textureLoad 수동 bilinear** (HW 샘플러 금지 — 8비트 가중치 양자화로
+  ~4e-3 벌어진다): CPU 판(letterbox_u8_rgb/crop_u8_rgb)과 f32 동일 경로라
+  커널 게이트가 max 7.9e-6. 두 규약이 다름을 그대로 복제 — 레터박스=픽셀 중심
+  +패딩 lo, 크롭=warpPerspective 코너 정합+replicate.
+- 바인드그룹은 **디스패치마다 생성** (프레임 텍스처·세션이 호출 사이 바뀔 수
+  있고 낡은 바인딩은 이전 모델 버퍼에 조용히 씀 — studio_invalidate 사고 급).
+  프레임당 ≤2회라 µs대.
+- wasm: `face_task_tex(task, det, lm, canvas, t)`(스탠드얼론 — FrameTex 임포트) +
+  `studio_face(task, det, lm, t)`(**studio 파이프라인 프레임 텍스처 공유** —
+  `VideoPipeline::frame_view()` 신설, 재임포트 0). studio.js는 getImageData를
+  진짜 픽셀 소비자(게이즈 CNN 비전 틱 10fps·광원 프로브 8틱)로만 축소 —
+  probe는 JS가 페이싱을 소유하므로 `probe_scene_light_rgb_now`(무스로틀 판)
+  신설해 이중 스로틀(8×8=64틱) 방지.
+- 게이트: `tests/tex_input.rs`(커널 단독 CPU 대조, 모델 불필요 — 레터박스
+  128²[-1,1]/192²[0,1]·크롭 회전+경계 걸침, max<1e-4) +
+  `tests/face_task_tex.rs`(process_tex vs process_gpu **478pt 0.000px** + 트래킹
+  계약 + 재검출) + face-ab.html `tex` 스테이지(MediaPipe 대비 0.30px = 기존 경로와
+  동일, **lm-tex-vs-cpu 0.000px** tol 1.0) + studio 헤드리스·vb-diff 무회귀.
+- 잔여: HandTask·게이즈 CNN 크롭의 GPU화(커널은 범용 — lo/hi 인자화 완료, 게이즈는
+  비회전 bbox+ImageNet 정규화라 **별도 커널 필요**), items 광원 프로브 GPU화
+  (마지막 getImageData 소비자 — 16×16 샘플이면 다운스케일 리드백로도 충분).
+
+**잔잔한 마감 6종 — 완료 (2026-08-14)**:
+- **OneEuro VIDEO 확정** (smoothing.rs): MediaPipe face_landmarks_detector_graph
+  원본 대조 — one_euro **min_cutoff 0.05 / beta 80 / d_cutoff 1.0** (스트림 모드
+  + num_faces==1일 때만 — 우리도 lm 1명). **좌표계 버그 동시 수리**: MediaPipe는
+  denormalize(px) 후 필터인데 정규화 좌표를 그대로 미분하면 속도가 프레임 폭배
+  작아져 과잉 랙 — apply가 (img_w, img_h)를 받아 축별 px 속도로 계산,
+  object_scale도 MediaPipe 기본(lm bbox px (w+h)/2) 내부 계산으로 변경.
+- **강등 p90 창** (studio.js): 단발 2연속 → **v-ai _recordCycle 규약** — 1s
+  gpu_sync 샘플 ×10 = 창, 첫(웜업) 창 폐기, 창 p90>66ms 2연속이면 강등
+  (단발 스파이크 내성). v-ai 원본은 120프레임 창 — 우리는 비동기 GPU라 매 프레임
+  sync가 불가해 1s 샘플로 대체 (HUD gpu 샘플=큐 포함이 옳다는 측정 규율 유지).
+- **프레이밍 중 아이템 좌표 보정** (P3 이월 해소): ItemsOverlay::set_view_crop
+  (framing scale/cx/cy) — draw에서 compose 크롭의 역변환으로 화면 좌표화
+  (z도 1/s — 줌만큼 아이템 스케일 동행). studio.rs overlay가 framing_current()를
+  매 프레임 전달.
+- **C티어 ensure 분리**: Res의 모델 종속부를 **GpuLeg(Option)**로 분리 —
+  `process_mask_nogpu`/`with_frame_texture_nogpu` 신설 (**세그 세션 전혀 없이**
+  외부 마스크 합성 스택 전체 가동 = B/C 티어가 RVM 7.6MB 로드+컴파일 생략).
+  EMA(mask_lo) 해상도는 세션 있으면 모델, 없으면 외부 마스크 크기. 기존 경로
+  (process_gpu/process_gpu_mask+세션)는 동일 동작 — vb-diff·ffi 무회귀.
+  게이트 `tests/vb_nogpu.rs`: 모델 파일 0개로 절반 마스크 합성 — bg 순색/fg
+  프레임 픽셀 일치 확인. 잔여: 진짜 C티어(소프트 합성 — GPU 완전 부재)는 별개.
+- **세로 blur-fill 배치 결정 + 웹 이식**: 웹은 **호스트 몫** — v-ai
+  background-fit.js(캔버스 2D 1회 사전합성: contain 본층 + 미러 띠 + 2패스
+  선명/블러 — 정수 좌표·PAD 오버스캔 seam 함정 검증본)를 studio.js에 이식,
+  uploadBgBitmap에서 cropFactor≥1.6이면 자동 적용 (결과 비율=프레임 비율이라
+  엔진 cover 수학 1:1 통과 — 엔진 변경 0). 모바일은 ai-ffi 세로 대응 때 Rust
+  포팅 (로드맵 E).
+- **wasm 다이어트 (측정 완료 — 실행은 카드로)**: 출하 wasm 2.45MB. 크레이트
+  분해(디버그 심볼 빌드 4.15MB 기준, twiggy — `CARGO_PROFILE_RELEASE_DEBUG=1
+  cargo build --target wasm32-unknown-unknown + twiggy top`): **image 디코더
+  (png/jpeg/webp — GLB 텍스처용) 414KB/10%**, **rustfft (오디오 STFT) 250KB/6%**,
+  ai-* 크레이트 합 ~780KB/19%, std/serde/wgpu-naga ~570KB, 섹션·데이터 1.49MB
+  (이 중 bindgen 커스텀 섹션 541KB·이름 432KB는 출하본에서 제거됨, .rodata
+  508KB — WGSL 템플릿·앵커 포함). **결론 (우선순위 순 카드)**: ①**워커별
+  feature 빌드** — video/vision 워커에 rustfft(오디오 전용)와 image 디코더
+  (items3d 전용)는 사장 무게: audio·items feature 분리로 워커당 ~수백 KB 절감
+  ②**GLB 텍스처 디코드 외부화** (createImageBitmap→RGBA 주입 — image 크레이트
+  통째 제거) ③SwOp serde Deserialize 71KB — .sw 파서의 serde 탈피는 이득 대비
+  작음(보류). 실행 시점: P4 워커 조립 때 (빌드 매트릭스가 그때 생긴다).
+
+**자원 절약 감사 + studio 수리 4건 (2026-08-14 심야, 사용자 지적)**:
+- **`studio.html?audit=1` 신설** — off 시 진짜 안 도는지를 엔진 프레임 카운터
+  (model_stats_h.frames — JS 추정이 아니라 세션이 실제 추론한 횟수)로 단언하는
+  실루프 감사. 스케줄: 30f 전부 off(부가 모델 **로드조차 없어야**) → on(집중도+
+  아이템+터치업+메이크업+프레이밍) 70f → 전부 off 후 60f **델타 0 단언**.
+  얼굴 카메라(`--video=web/models/mediapipe/face_256x144.y4m` —
+  `tools/make_face_y4m.py`로 실얼굴 픽스처에서 생성, 전 세션 스크래치 유실분
+  도구화)로 **PASS: on det=lm=60/gaze=bs=9 → off 전부 동결, R11 미로드**.
+  ⚠ seg 카운터는 판정 제외 — frames는 finish_frame(동기화) 때만 기록되는데
+  studio 세그는 제출만 하는 설계라 항상 0 (가동 증거는 렌더 출력).
+- **R11 지연 로드**: 시작 시 무조건 로드하던 것을 B티어가 실제 필요할 때
+  (셀렉트 b / auto 강등 확정 / 헤드리스 B스모크)만 — perf 측정에서 "R11로
+  재나?" 오해의 원인이기도 했다 (**perf·기본 측정은 전부 RVM GPU**, R11은
+  폴백 전용이 사실이나 init 로그가 오해를 유발). 감사의 r11-eager 단언이 지킨다.
+- **?perf=1 "화면 멈춤"은 설계** (페이싱 프로토콜 종료 후 루프 정지) — 단
+  결과가 콘솔에만 있어 멈춤처럼 보였다 → 상태줄에 스테이지별 p50/p90 표기 추가.
+- **스크립트 스모크 게이트**: 자동 토글 시나리오(blur60·배경 전환 등)가
+  인터랙티브에서도 돌던 것을 `navigator.webdriver`(자동화)에서만으로 제한.
+- **ensureFaceTask/ensureGaze 이중 로드 레이스 수리** (audit이 잡음): item·focus
+  동시 켜기 → face 이중 로드 → 두 번째가 face를 덮어 num_faces=2가 유령 핸들에
+  적용(det=1로 발현) + 세션 누수. in-flight 가드 + 로드 완료 시 스위치 상태 반영.
+- **gaze CNN 통계 수리** (엔진): GazeTask CNN 블록이 finish_frame을 안 불러
+  stats.frames가 0 — 리드백이 이미 동기화라 비용 0으로 기록만 추가 (감사·강등
+  판정의 입력이 되는 카운터).
+- **강등 오발 사고 수리 (사용자 발견 — 필독)**: 배경+블러+메이크업을 켜면
+  auto 티어가 **멀쩡한 GPU를 B로 강등**시켰다. 원인 = 판정 입력이 "제출→큐
+  소진" 비동기 샘플이라 **큐에 쌓인 프레임까지 포함** — 120Hz rAF(8.3ms)에
+  실비용 15ms면 큐 2~3장이 상시라 샘플이 3~6배(60~100ms)로 부풀어 66ms 문턱을
+  허수로 돌파, "승격 없음" 규약 때문에 B에 갇혔다 (어제 "64.3ms 강등 코앞"
+  정정과 같은 허수의 실사고화). 수리: HUD/강등 샘플을 **페이싱 방식**으로 교체 —
+  1s마다 큐 배수 → 한 프레임 제출 → 완료 대기 (= ?perf=1과 같은 "한 프레임
+  실비용" 정의, 샘플 프레임만 ~2프레임 멈칫·비가시). 실비용 15~16ms는 66ms를
+  못 넘는다. + 수동 티어 A 선택 = 강등 상태 리셋(탈출구). 교훈: **강등 판정
+  입력도 실비용이어야 한다** — 큐 포함 지연은 rAF 주사율에 비례해 부푸는
+  양이라 문턱 비교에 못 쓴다 (v-ai webgl2는 readPixels 동기라 cycle≈실비용이
+  성립했던 것 — WebGPU로 오면서 전제가 깨졌던 자리).
+
+**집중도 마감 3종 — 완료 (2026-08-14)**: v-ai focus-tracker 정찰(파일:라인 대조)
+후 1:1 이식.
+- **다중 모니터 분류기** (`gaze/state.rs`): MonitorInfo/ScreenLayout(가상
+  데스크톱 px + yawDeg 오버라이드, targetIndex=**배열 위치**·isCurrent 기준) +
+  `matchMonitorByGazeDelta` 이식. 규약: ①매칭이 온타깃 박스 검사 **앞** — 박스 안
+  시선도 인접 모니터가 가로챈다 ②단위 혼용이 설계(시선 도° · 모니터 px/|px| →
+  proj는 도) ③인접(4px 이음새+겹침) 모니터는 정렬도 비례 완화 k→0.5 (24→12°),
+  yawDeg 모니터는 ×(1−min(|yaw|,60)/60×0.4) ④OTHER_MONITOR는 LOOKING_AWAY의
+  리라벨 — 히스테리시스 공유, 이미 이탈 상태면 즉시 전환 ⑤EYES_CLOSED도
+  monitor_index 유지(감김 전 분류) ⑥score엔 비집중으로 쌓임 ⑦baseline은 전역
+  1개, **타깃 모니터 변경 시 리셋**(GazeTask::set_layout). API: wasm
+  `gaze_layout(task, json|null)` — 레이아웃 조달(getScreenDetails)은 호스트 몫.
+- **MULTIPLE_FACES**: FaceTask `set_num_faces(2)` — MediaPipe FaceLandmarker의
+  "tracked<num_faces면 검출 지속" 규약 그대로 **트래킹 중에도 매 프레임 디텍터**
+  (count=post-NMS 검출 수 근사 — 웹은 landmarker 통과 수지만 우리 lm은 1명).
+  결과에 faceCount 노출, studio는 집중도 켤 때만 2 (끄면 1 — 디텍터 비용 제거).
+  분석·랜드마크는 최고점 1명 유지 (웹 analyze.ts도 faces[0]만).
+- **blink 블렌드셰이프 절반** (`face/blendshapes.rs`): **입력 규약을 MediaPipe
+  원본(face_blendshapes_graph.cc + landmarks_to_tensor_calculator.cc)에서 확정**
+  — 478→146 서브셋(kLandmarksSubsetIdxs, 홍채 468~477 포함 = refined 메시 전제),
+  좌표는 **프레임 px (x×W, y×H), 센터링·스케일 없음** (모델이 내부 L2 정규화),
+  출력 52계수 중 9/10 = eyeBlinkL/R. GazeTask가 비전 틱마다 bs 세션(옵션) 추론 →
+  `(bsL≥0.55 ∧ bsR≥0.55) ∨ EAR` (웹 blink.ts). wasm gaze_task_gpu에 bs 핸들
+  추가(**0=없음** — EAR만), 게이트 헬퍼 bs_input_from_landmarks.
+  **게이트가 규약을 실증**: face-ab bs 스테이지 — 우리 lm→우리 bs 모델 vs
+  MediaPipe faceBlendshapes 52계수 diff **max 0.0717 / blink 0.0175** (tol 0.12;
+  규약이 틀리면 크게 발산하는 구조). convert-mediapipe에 face_blendshapes 변환·
+  웹 복사 추가됨.
+- 잔여: 다중 모니터는 실멀티모니터 눈검증(사용자)과 v-ai 호스트 배선(P4)만.
+
+**터치업/메이크업 이관 — 완료 (2026-08-14)**: vcxrust_ai face/{touchup,makeup}.rs
+→ `features/face/{touchup,makeup}.rs` (래스터라이저 근사-원문 이식 + 옵션 타입
+동파일화), 소비자는 vcxrust pack 셰이더 → **compose.wgsl 통합**.
+- 파라미터 계약: EffectsPatch에 `touchUp {enabled, strength}` / `makeup {enabled,
+  intensity, lip/blush/shadow}` (camelCase — vcxrust update_effects_config와 동일
+  스키마라 ai-ffi도 공짜로 파리티).
+- 데이터 흐름: FaceTask 랜드마크(정규화) → `VideoPipeline::update_face_fx` —
+  CPU 래스터라이즈(128² 오버레이, 수십 µs) → write_texture(R8 터치업 + RGBA8
+  mul/over) → compose uniform(tu_map/tu_par/mk_map, 전부 0=off). studio는
+  studio_face가 process_tex 직후 자동 호출 (1프레임 지연 — 128² 소프트 마스크라
+  비가시).
+- 셰이더 수식 (vcxrust pack 1:1): 터치업 = 마스크 가중 3×3 가우스(1-2-1,
+  stride=face_w×0.022 clamp[1,8]px) ×1.02 리프트, α=0.62×strength — 단 luma가
+  아니라 **RGB에 적용** (웹 drawTouchUp이 RGB 블러; vcxrust만 YUV 사정으로 Y만).
+  메이크업 = multiply(base×mix(1,color,α)) → source-over(mix). 오버레이 샘플은
+  128² textureLoad bilinear(스트레이트 알파).
+- 크롭 보정 불필요의 근거: pack은 화면좌표 블러라 blur_px/crop_scale 보정이
+  필요했지만 우리는 프레임 좌표(cuv) 샘플이라 프레이밍 줌이 자동 반영.
+- 게이트: 래스터라이저 단위 5종(다크 헤일로 가드 포함 — 이관 그대로) +
+  **tests/face_fx.rs**(합성 랜드마크 + process_gpu_mask ema=off: 립 밴드 diff
+  36레벨 / 터치업 피부 diff / 얼굴 밖 0 / update_face_fx(None) 비트 복원 —
+  "크래시 없음" 스모크가 못 잡는 uniform 오배선을 픽셀로 잡는다). 함정: 립은
+  even-odd **밴드**만 칠해진다 — 입 중앙을 찍으면 diff 0이 정상.
+- studio: 터치업/메이크업 체크박스(기본 룩 = vcxrust 테스트 룩), 헤드리스
+  마일스톤에 스모크 포함. 실카메라 룩 튜닝은 사용자 몫.
+
 **실행 계획 (2026-08-13, INTEGRATION.md §3)** — 데모 HTML 주도
 (사용자 제안): `web/demo/studio.html` = 제품 UI 미니어처, 단계마다 효과를 켜며
 게이트+눈검증. P1 VideoPipeline(vcxrust_ai WGSL 이관) → P2 티어 정책(§1.5
@@ -410,7 +600,7 @@ v-ai 정찰 전체 지도(런타임·티어·플래그·file:line)는 메모리 
 | 3 | `Reshape` canon + `PRELU` + `MAX_POOL_2D` | **완료** (2026-08-13) — 5모델 전부 개통+ORT 게이트+벤치, §3.5 |
 | 4 | 랜드마크 스파이크 (face_detector → 좌표 diff) | **face 완료** (2026-08-13) — FaceTask+게이트 lm 0.30px PASS, §4. hand 복제·게이즈 체인 남음 |
 | 5 | 파이프라인 로직 (ROI 트래킹 / 회전 정규화 / OneEuroFilter / Horn 피팅) | **대부분 #4에서 선반영** — 남은 것: OneEuroFilter VIDEO 파리티, Horn 피팅, 게이즈 페이싱 |
-| 6 | 오디오 (DFT / 1D conv / 복소) | |
+| 6 | 오디오 (DFT / 1D conv / 복소) | **완료** (2026-08-14) — fastenhancer 16k/48k, SNR 125dB+, **wasm 0.85 / native 0.64ms — ORT wasm 1.39배 우위**, §6 |
 
 **폴백 사다리 (사용자 확정, 2026-08-13)**: ①로드 시 GPU 체크(`NoGpu`) → ②돌렸을 때
 프레임 실제로 나오는지(DeviceLost는 됨, "조용히 안 나옴" 헬스체크는 미구현) →
@@ -734,12 +924,82 @@ flatbuffer 임포터**(400~600줄, `.task` 직접 소비 → MediaPipe 버전업
 
 ---
 
-## 6. 오디오
+## 6. 오디오 — fastenhancer 개통 완료 (2026-08-14)
 
-`fastenhancer_b_48k` → `SplitToSequence` 미지원, `_16k` → `DFT` 미지원.
-STFT → 네트 → iSTFT 구조라 **1D conv·복소수·시퀀스 = 새 커널 계열**.
-그리고 **AudioWorklet에는 WebGPU가 없다** → 오디오는 무조건 CPU.
-즉 **`ai-cpu`가 선행 조건**이다.
+**결과**: 16k/48k 양 레이트 개통, **wav2wav ONNX 대비 SNR 126.4dB**(사실상 완전
+일치 — vcx-noise ncnn판은 49dB), 48k 실측 **native 1.83ms / wasm 2.79ms per
+hop**(예산 10.67ms의 17%/26%). 게이트: `tests/audio.rs`(그래프 오라클 1e-4 +
+e2e SNR≥45dB + hop<5ms) + `web/demo/audio-ab.html`(브라우저 SNR·벽시계 —
+**GPU 없이(init_engine 없이) 도는지도 검증** = audio 워커 계약).
+재현: `make convert-fastenhancer && cargo test -p ai-tasks --test audio`.
+
+**구조 (경로 결정의 근거 포함)**:
+- 공개 wav2wav ONNX는 이미 스트리밍 1-hop(wav_in+캐시 5)이고 DFT가 모델 안.
+  `tools/prep_fastenhancer.py`가 **DFT 양끝을 수술**해 spec2spec 서브그래프만
+  추출(경계: 압축스펙 mul_1 → 마스크 convolution) — **--verify가 numpy로
+  전/후처리를 재현해 원본과 1e-9 대조** (이 수식이 Rust 이식의 단일 기준:
+  α=0.3 압축·clip 1e-5·복소 마스크 곱·β=10/3 역압축·Nyquist드랍·conj-irfft).
+- **`.sw`가 아니라 전용 미니 실행기** (`features/audio/graph.rs+ops.rs` —
+  rank≤4 f32, JSON 그래프+가중치 blob 394KB): 서브그래프가 rank-4 attention·
+  동적 MatMul·ConvTranspose1d 등 이미지 IR과 이질적이고 텐서가 미소(최대
+  48×128)해서. vcx-noise가 ncnn 전용 재작성으로 간 것과 같은 판단 —
+  ai-convert 오디오 계열 일반화는 다음 오디오 모델 때.
+- `features/audio/stft.rs`(vcx-noise 이식, rustfft) + `enhancer.rs`(스트리밍
+  상태+전/후처리). wasm exports `enhancer_new/free/reset/frame_len/process`.
+- **오디오는 CPU 고정** (AudioWorklet에 WebGPU 없음 — 워커 토폴로지 규약).
+
+**ORT 추격전 완료 (2026-08-14 밤, 사용자 지시 — wasm 1차 + native 2차)**:
+**wasm 2.79 → 0.85ms (ORT wasm 1.18의 1.39배 우위) / native 0.90 → 0.637ms
+(ORT MLAS 0.58과 동급, 1.10배)**. SNR 125dB+ 유지. 수단 (전부 wasm 프로파일 근거 — enhancer_profile export 신설):
+① conv1d **레지스터 블로킹**: ox 16블록(F32x4×4)을 레지스터에 유지하고
+(ic,kk)를 안쪽으로 + **oc 4행 페어링**(x 로드 재사용 4배, acc 16+x4+w4=24
+vreg — wasm에서도 스필 없이 이득, 꼬리는 2행 경로) ② MatMul j 16블록 동일
+블로킹 ③ Gemm(W^T) 2행×4열 8누산 ④ **Cephes 다항 exp**(fast_exp/exp4 —
+MLAS MlasComputeLogistic 방식, sigmoid/tanh/softmax 벡터화 + F32x4::div 신설;
+오라클 1e-6 유지) ⑤ ew fast path(같은 shape/스칼라/마지막축 bias flat) +
+odometer 인덱싱 ⑥ **Slice/Split 마지막축 memcpy 특례** (GRU 게이트·헤드
+슬라이스 전부 이 모양) ⑦ Transpose 마지막축-유지 특례(행 memcpy)
+⑧ Reshape/Squeeze/Unsqueeze **zero-copy**(소비 카운트 기반 마지막 소비자
+move) ⑨ ConvTranspose 프리팩 gather(w [kk][oc][ic]·x [xi][ic] 재배치로 ic
+내적 연속화 — 원소 gather는 캐시미스로 퇴행했었다).
+**실패 실험 (재시도 금지)**: 첫 명시 F32x4 시도(kk 바깥, orow를
+load-modify-store로 훑는 구조)는 native 퇴행+wasm 무반응 — orow 메모리
+트래픽이 지배해서다. **블로킹 없는 벡터화는 이득이 없다**가 교훈 (acc를
+레지스터에 유지하는 구조로 바꾸자 2.5배). 잔여 카드: 텐서 플랜(할당 제거 —
+잡 op 0.3ms), ConvTranspose 블로킹, Gemm 프리팩.
+**함정 기록**: ①ONNX Slice의 ends=INT64_MAX가 wasm(32비트 isize) `as isize`
+캐스트에서 −1로 뭉개져 마지막 원소가 잘림 — **네이티브에선 무증상, audio-ab
+게이트가 잡음**. slice는 i64로 계산할 것 (ops.rs). ②run_profiled는 실행마다
+정렬 순서가 달라진다 — 프로파일 합산은 이름 기준으로.
+
+**데모 (2026-08-14, 사용자 지시로 2회 개편)**: `web/demo/audio-live.html` —
+**10초 녹음 → 모델 선택(ai_engine/onnxruntime/원음) → 출력** 워크플로.
+같은 녹음을 모델만 바꿔 반복 청취(엔진별 캐시), WAV 3트랙 다운로드.
+마이크는 기본 설정 그대로(제약 강제 없음 — 사용자 지시). 라이브 루프백·
+동시비교 SNR 화면은 이 개편으로 대체됨 (조사 결론은 아래 항목에 보존).
+실사용: `node tools/run_web.mjs demo/audio-live.html --headed` (--camera는
+가짜 장치용이라 실마이크 시엔 제외). 스모크: ?smoke=1 — 녹음 2초 단축,
+양 엔진 처리+재생 자동 (rec 2s: ai_engine 0.27s / ORT 0.35s 처리).
+
+**"ORT가 약간 좋게 들림" 조사 (2026-08-14 밤, 사용자 청감)**: 라이브 데모에
+**동시 비교 모드**(같은 입력 두 엔진 동시 처리 + 프레임번호 큐 정렬 + 실시간
+SNR)와 **3트랙 A/B 녹음**(원음/우리/ORT WAV 저장) 추가. 조사 결론:
+- **이 모델은 GRU 재귀 발산 시스템** — 미세 수치 차이가 시간에 따라 증폭돼
+  "정상 구현끼리도" 궤적이 갈라진다. 실측: 무음+비프 8초에서 numpy 청사진
+  (f64+ORT 서브그래프) vs full ONNX(ORT native) = **84dB**, 우리 Rust도
+  **84.3dB(청사진과 동급 = 구현 정합)**, wasm쌍(우리 vs ORT wasm)은 ~34dB.
+  랜덤 노이즈 3hop 검증(1e-9)이나 실음성 픽스처(126dB)에선 안 보이던 특성 —
+  **긴 무음 구간이 발산을 키운다**.
+- fast_exp/exp4는 원인 아님 (정확 exp 실험으로 반증 — 무변화).
+- 절대각 정합은 게이트 불가 → 라이브 diff 판정은 경로 정상성(>10dB — 정렬
+  깨짐/신호 불일치 감지)만. 실음질 판단은 **A/B 녹음**으로 (같은 발화 3트랙).
+- 함정: diff 측정은 ①무음 프레임 제외(−60dBFS 게이트 — 아니면 바닥 잔차
+  비율만 잰다) ②ORT busy 스킵 금지(입력 큐 — 프레임 유실 = 캐시 스트림
+  영구 어긋남) ③전환 시 양쪽 동시 백지 리셋.
+
+**잔여**: ①v-ai audio 워커 실연결(AudioWorklet 배선 — P4와 한 묶음)
+②16k 브라우저 게이트(네이티브 오라클은 통과, 픽스처는 48k만) ③텐서 플랜
+최적화 카드 ④ai-ffi 오디오 표면(진짜 vcx-noise 교체 — 모바일 실연결 때).
 
 ---
 

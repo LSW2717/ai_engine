@@ -29,6 +29,7 @@ ai-tasks = { path = "crates/ai-tasks" }
 wgpu = { version = "30", default-features = false }
 naga = "30"
 # GLB 텍스처 디코드 (items3d) — 순수 Rust 디코더라 wasm 동작
+rustfft = "6"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 
 # 공통

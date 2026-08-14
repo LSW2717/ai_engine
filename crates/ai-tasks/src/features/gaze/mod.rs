@@ -7,5 +7,5 @@ pub mod preprocess;
 pub mod state;
 pub mod task;
 
-pub use state::{FocusResult, FocusStatus};
+pub use state::{FocusResult, FocusStatus, MonitorInfo, ScreenLayout};
 pub use task::GazeTask;

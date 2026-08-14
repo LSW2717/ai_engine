@@ -17,9 +17,12 @@ pub struct Studio {
 }
 
 impl Studio {
-    /// 파이프라인 출력 위에 아이템 오버레이 (그릴 게 없으면 no-op)
+    /// 파이프라인 출력 위에 아이템 오버레이 (그릴 게 없으면 no-op).
+    /// 프레이밍 크롭을 넘겨 아이템 좌표가 줌을 따라가게 한다 (P3 이월분 해소).
     fn overlay(&mut self, ctx: &GpuContext, view: &wgpu::TextureView) {
         if let Some(items) = &mut self.items {
+            let (s, cx, cy) = self.pipeline.framing_current();
+            items.set_view_crop(s, cx, cy);
             items.draw(ctx, view, self.config.format, self.config.width, self.config.height);
         }
     }

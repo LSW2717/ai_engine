@@ -91,6 +91,12 @@ impl GpuSession {
         self.model.output_storage(name)
     }
 
+    /// 입력 텐서의 스토리지 버퍼 + desc — GPU 전처리 직결용 (`upload`의 GPU 짝,
+    /// output_storage의 입력판). `detect::gpu` 커널이 여기에 쓴다.
+    pub fn input_storage(&self, name: &str) -> Option<(&wgpu::Buffer, TensorDesc)> {
+        self.model.input_storage(name)
+    }
+
     /// 디텍터 프레임 1장 (CpuSession::detect의 GPU 짝): 레터박스된 입력 →
     /// 추론 → 전 출력 리드백 → 디코드+NMS → 원본 프레임 정규화 좌표 검출.
     /// 디텍터 출력은 KB 단위라 리드백이 싸다 — 세그 마스크와 달리 CPU로 내려와야
@@ -104,6 +110,18 @@ impl GpuSession {
         src_h: u32,
     ) -> Result<Vec<Detection>, TaskError> {
         self.upload(ctx, rgb)?;
+        self.detect_uploaded(ctx, post, src_w, src_h).await
+    }
+
+    /// `detect`의 업로드 생략판 — 입력 버퍼가 이미 채워진 상태에서 시작한다
+    /// (GPU 전처리 직결 경로: `detect::gpu` 레터박스 커널 → `input_storage`).
+    pub async fn detect_uploaded(
+        &mut self,
+        ctx: &GpuContext,
+        post: &DetectorPost,
+        src_w: u32,
+        src_h: u32,
+    ) -> Result<Vec<Detection>, TaskError> {
         self.infer(ctx).await?;
         let names: Vec<String> = self
             .model

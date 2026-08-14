@@ -9,6 +9,7 @@
 
 pub mod anchors;
 pub mod decode;
+pub mod gpu;
 pub mod letterbox;
 pub mod nms;
 pub mod roi;

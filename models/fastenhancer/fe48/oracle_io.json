@@ -1,0 +1,1 @@
+{"inputs": [{"name": "mul_1", "shape": [1, 512, 1, 2]}, {"name": "getitem", "shape": [36, 36]}, {"name": "getitem_8", "shape": [36, 36]}, {"name": "getitem_16", "shape": [36, 36]}], "outputs": [{"name": "convolution", "shape": [1, 2, 512]}, {"name": "add_3", "shape": [1, 36, 36]}, {"name": "add_10", "shape": [1, 36, 36]}, {"name": "add_16", "shape": [1, 36, 36]}]}

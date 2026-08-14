@@ -1679,6 +1679,13 @@ impl Items3dRenderer {
         if self.probe_counter % 8 != 1 {
             return;
         }
+        self.probe_scene_light_rgb_now(rgb, width, height);
+    }
+
+    /// 스로틀 없는 판 — **호출자가 페이싱을 소유할 때** (studio: getImageData
+    /// 리드백을 아끼려고 JS가 8틱 게이트를 하므로, 여기서 또 스로틀하면
+    /// 8×8=64틱으로 뭉개진다).
+    pub fn probe_scene_light_rgb_now(&mut self, rgb: &[u8], width: usize, height: usize) {
         let step = (width.max(height) / 16).max(1);
         let (mut sr, mut sg, mut sb, mut n) = (0.0f32, 0.0f32, 0.0f32, 0u32);
         let mut yy = step / 2;
@@ -1984,6 +1991,9 @@ pub struct ItemsOverlay {
     hat: String,
     eyewear: String,
     beard: String,
+    /// 프레이밍 크롭 (scale, cx, cy — compose와 동일 규약, 1/0.5/0.5 = 크롭 없음).
+    /// 화면이 crop 영역만 보여주므로 랜드마크를 같은 변환의 역으로 화면 좌표화.
+    view_crop: (f32, f32, f32),
 }
 
 impl ItemsOverlay {
@@ -2007,7 +2017,13 @@ impl ItemsOverlay {
             hat: "none".into(),
             eyewear: "none".into(),
             beard: "none".into(),
+            view_crop: (1.0, 0.5, 0.5),
         })
+    }
+
+    /// 프레이밍 크롭 갱신 (VideoPipeline::framing_current()) — 매 프레임 호출 가능
+    pub fn set_view_crop(&mut self, scale: f32, cx: f32, cy: f32) {
+        self.view_crop = (scale, cx, cy);
     }
 
     pub fn preload_glb(
@@ -2155,10 +2171,22 @@ impl ItemsOverlay {
         let Some(pts) = self.landmarks.clone() else {
             return false;
         };
-        // 정규화 → 화면 px (z는 폭 스케일 — MediaPipe 규약)
+        // 정규화 → 화면 px (z는 폭 스케일 — MediaPipe 규약).
+        // 프레이밍 크롭 중이면 화면 = crop 영역이므로 역변환으로 보정
+        // (compose: cuv = uv·s + (c − s/2) → uv = (p − (c − s/2))/s; z도 1/s —
+        // 줌만큼 얼굴이 커지니 아이템 스케일이 따라간다).
+        let (s, ccx, ccy) = self.view_crop;
+        let inv = 1.0 / s.max(1e-4);
+        let (ox, oy) = (ccx - s * 0.5, ccy - s * 0.5);
         let lm_px: Vec<[f32; 3]> = pts
             .iter()
-            .map(|p| [p[0] * vw as f32, p[1] * vh as f32, p[2] * vw as f32])
+            .map(|p| {
+                [
+                    (p[0] - ox) * inv * vw as f32,
+                    (p[1] - oy) * inv * vh as f32,
+                    p[2] * inv * vw as f32,
+                ]
+            })
             .collect();
         self.ensure_resolve(ctx, vw, vh);
         let drew = {

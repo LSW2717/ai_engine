@@ -11,8 +11,10 @@
 //! CPU(동기)/GPU(비동기) 드라이버가 같은 내부 단계를 공유하므로 웹·모바일·
 //! 네이티브가 한 벌이다.
 
+use ai_gpu::wgpu;
 use ai_gpu::GpuContext;
 
+use crate::detect::gpu::GpuPre;
 use crate::session::cpu::CpuSession;
 use crate::detect::letterbox::letterbox_u8_rgb;
 use crate::detect::roi::{crop_u8_rgb, project_landmarks, roi_from_detection, roi_from_landmarks, Roi};
@@ -42,6 +44,13 @@ pub struct FaceTask {
     post: &'static DetectorPost,
     prev_roi: Option<Roi>,
     smoother: Option<LandmarkSmoother>,
+    /// 감시할 최대 얼굴 수 — 1이면 트래킹 중 디텍터 생략(기존 동작), ≥2면
+    /// **매 프레임 디텍터로 얼굴 수 감시** (MediaPipe FaceLandmarker가
+    /// tracked<num_faces인 동안 검출을 계속 돌리는 것과 같은 규약 —
+    /// 집중도 MULTIPLE_FACES의 근거). 랜드마크·결과는 최고점 1명 유지
+    /// (웹 analyze.ts도 faces[0]만 분석한다).
+    num_faces: usize,
+    last_count: usize,
 }
 
 impl FaceTask {
@@ -51,12 +60,27 @@ impl FaceTask {
             post: detect::preset("face").expect("face 프리셋"),
             prev_roi: None,
             smoother: smoothing.then(LandmarkSmoother::face_default),
+            num_faces: 1,
+            last_count: 0,
         }
+    }
+
+    /// 얼굴 수 감시 설정 (집중도 켤 때 2 — 끄면 1로 되돌려 디텍터 비용 제거)
+    pub fn set_num_faces(&mut self, n: usize) {
+        self.num_faces = n.max(1);
+    }
+
+    /// 최근 프레임의 얼굴 수 — num_faces==1이면 0/1(트래킹 결과), ≥2면 디텍터
+    /// 검출 수(post-NMS, score≥0.5). 웹은 landmarker 통과 수를 세지만 우리는
+    /// 랜드마크가 1명뿐이라 디텍터 수로 근사 (문턱·NMS는 동일 프리셋).
+    pub fn face_count(&self) -> usize {
+        self.last_count
     }
 
     /// 트래킹 상태 폐기 — 다음 프레임은 검출부터
     pub fn reset(&mut self) {
         self.prev_roi = None;
+        self.last_count = 0;
         if let Some(s) = &mut self.smoother {
             s.reset();
         }
@@ -102,7 +126,7 @@ impl FaceTask {
             .collect();
         project_landmarks(&mut points, &roi, img_w, img_h);
         if let Some(s) = &mut self.smoother {
-            s.apply(t_ms, (roi.w + roi.h) * 0.5, &mut points);
+            s.apply(t_ms, img_w, img_h, &mut points);
         }
         self.prev_roi = Some(roi_from_landmarks(
             &points, LM_ROT_KP.0, LM_ROT_KP.1, ROI_SCALE, img_w, img_h,
@@ -122,21 +146,26 @@ impl FaceTask {
         t_ms: f64,
     ) -> Result<Option<FaceResult>, TaskError> {
         let (w, h) = (img_w as f32, img_h as f32);
-        let roi = match self.prev_roi {
-            Some(r) => r,
-            None => {
-                let (iw, ih) = self.post.input_size();
-                let [lo, hi] = self.post.input_range();
-                let input = letterbox_u8_rgb(
-                    frame, img_w as usize, img_h as usize, iw as usize, ih as usize, lo, hi,
-                );
-                let dets = det.detect(self.post, &input, img_w, img_h)?;
-                match self.roi_from_dets(&dets, w, h) {
-                    Some(r) => r,
-                    None => return Ok(None),
+        // 검출 — ROI 재획득(트래킹 끊김) 또는 얼굴 수 감시(num_faces≥2)
+        let mut acquired: Option<Roi> = None;
+        let mut det_count: Option<usize> = None;
+        if self.prev_roi.is_none() || self.num_faces >= 2 {
+            let (iw, ih) = self.post.input_size();
+            let [lo, hi] = self.post.input_range();
+            let input = letterbox_u8_rgb(
+                frame, img_w as usize, img_h as usize, iw as usize, ih as usize, lo, hi,
+            );
+            let dets = det.detect(self.post, &input, img_w, img_h)?;
+            det_count = Some(dets.len());
+            if self.prev_roi.is_none() {
+                acquired = self.roi_from_dets(&dets, w, h);
+                if acquired.is_none() {
+                    self.last_count = 0;
+                    return Ok(None);
                 }
             }
-        };
+        }
+        let roi = self.prev_roi.or(acquired).unwrap();
         let (lm_input, names) = {
             let sw = lm.model().sw();
             let names: Vec<String> =
@@ -147,7 +176,9 @@ impl FaceTask {
         lm.infer_frame(&crop)?;
         let outputs: Vec<Vec<f32>> =
             names.iter().map(|n| lm.read_output(n)).collect::<Result<_, _>>()?;
-        self.finish(&outputs, lm_input, roi, w, h, t_ms)
+        let result = self.finish(&outputs, lm_input, roi, w, h, t_ms)?;
+        self.last_count = det_count.unwrap_or(0).max(result.is_some() as usize);
+        Ok(result)
     }
 
     /// GPU 한 프레임 (비동기) — process_cpu와 같은 단계, 세션 호출만 다르다
@@ -162,21 +193,25 @@ impl FaceTask {
         t_ms: f64,
     ) -> Result<Option<FaceResult>, TaskError> {
         let (w, h) = (img_w as f32, img_h as f32);
-        let roi = match self.prev_roi {
-            Some(r) => r,
-            None => {
-                let (iw, ih) = self.post.input_size();
-                let [lo, hi] = self.post.input_range();
-                let input = letterbox_u8_rgb(
-                    frame, img_w as usize, img_h as usize, iw as usize, ih as usize, lo, hi,
-                );
-                let dets = det.detect(ctx, self.post, &input, img_w, img_h).await?;
-                match self.roi_from_dets(&dets, w, h) {
-                    Some(r) => r,
-                    None => return Ok(None),
+        let mut acquired: Option<Roi> = None;
+        let mut det_count: Option<usize> = None;
+        if self.prev_roi.is_none() || self.num_faces >= 2 {
+            let (iw, ih) = self.post.input_size();
+            let [lo, hi] = self.post.input_range();
+            let input = letterbox_u8_rgb(
+                frame, img_w as usize, img_h as usize, iw as usize, ih as usize, lo, hi,
+            );
+            let dets = det.detect(ctx, self.post, &input, img_w, img_h).await?;
+            det_count = Some(dets.len());
+            if self.prev_roi.is_none() {
+                acquired = self.roi_from_dets(&dets, w, h);
+                if acquired.is_none() {
+                    self.last_count = 0;
+                    return Ok(None);
                 }
             }
-        };
+        }
+        let roi = self.prev_roi.or(acquired).unwrap();
         let lm_input = lm.model().sw.tensors[lm.model().sw.inputs[0] as usize].h as f32;
         let crop = crop_u8_rgb(frame, img_w as usize, img_h as usize, &roi, lm_input as usize);
         lm.upload(ctx, &crop)?;
@@ -193,7 +228,76 @@ impl FaceTask {
             outputs.push(lm.read_output(ctx, n).await?);
         }
         lm.finish_frame(ctx).await?;
-        self.finish(&outputs, lm_input, roi, w, h, t_ms)
+        let result = self.finish(&outputs, lm_input, roi, w, h, t_ms)?;
+        self.last_count = det_count.unwrap_or(0).max(result.is_some() as usize);
+        Ok(result)
+    }
+
+    /// GPU 텍스처 한 프레임 — process_gpu와 같은 단계지만 **픽셀이 CPU를 거치지
+    /// 않는다**: 레터박스·크롭이 `GpuPre` 컴퓨트 커널로 모델 입력 버퍼에 직결된다
+    /// (남는 CPU 전송은 uniform 몇십 B + 소형 출력 리드백 — 후자는 ROI 제어
+    /// 흐름상 구조적으로 불가피, NEXT.md "GPU↔CPU 왕복" 문단).
+    /// `frame`은 img_w×img_h Rgba8Unorm 텍스처 뷰 — 스탠드얼론이면 `pre.frame`,
+    /// studio면 파이프라인 프레임 텍스처를 넘긴다.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn process_tex(
+        &mut self,
+        ctx: &GpuContext,
+        pre: &GpuPre,
+        frame: &wgpu::TextureView,
+        det: &mut GpuSession,
+        lm: &mut GpuSession,
+        img_w: u32,
+        img_h: u32,
+        t_ms: f64,
+    ) -> Result<Option<FaceResult>, TaskError> {
+        let (w, h) = (img_w as f32, img_h as f32);
+        let mut acquired: Option<Roi> = None;
+        let mut det_count: Option<usize> = None;
+        if self.prev_roi.is_none() || self.num_faces >= 2 {
+            let [lo, hi] = self.post.input_range();
+            {
+                let name = det.input_name().to_string();
+                let (buf, desc) = det.input_storage(&name).ok_or_else(|| {
+                    TaskError::Other(format!("det 입력 버퍼 없음: {name}"))
+                })?;
+                pre.letterbox_into(ctx, frame, img_w, img_h, buf, &desc, lo, hi)?;
+            }
+            let dets = det.detect_uploaded(ctx, self.post, img_w, img_h).await?;
+            det_count = Some(dets.len());
+            if self.prev_roi.is_none() {
+                acquired = self.roi_from_dets(&dets, w, h);
+                if acquired.is_none() {
+                    self.last_count = 0;
+                    return Ok(None);
+                }
+            }
+        }
+        let roi = self.prev_roi.or(acquired).unwrap();
+        let lm_input = {
+            let name = lm.input_name().to_string();
+            let (buf, desc) = lm
+                .input_storage(&name)
+                .ok_or_else(|| TaskError::Other(format!("lm 입력 버퍼 없음: {name}")))?;
+            pre.crop_into(ctx, frame, img_w, img_h, &roi, buf, &desc, 0.0, 1.0)?;
+            desc.h as f32
+        };
+        lm.infer(ctx).await?;
+        let names: Vec<String> = lm
+            .model()
+            .sw
+            .outputs
+            .iter()
+            .map(|&o| lm.model().sw.tensors[o as usize].name.clone())
+            .collect();
+        let mut outputs: Vec<Vec<f32>> = Vec::with_capacity(names.len());
+        for n in &names {
+            outputs.push(lm.read_output(ctx, n).await?);
+        }
+        lm.finish_frame(ctx).await?;
+        let result = self.finish(&outputs, lm_input, roi, w, h, t_ms)?;
+        self.last_count = det_count.unwrap_or(0).max(result.is_some() as usize);
+        Ok(result)
     }
 
     /// 트래킹 중인가 (다음 프레임에 디텍터를 건너뛰는가) — 진단용

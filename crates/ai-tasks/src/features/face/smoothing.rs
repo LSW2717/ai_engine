@@ -6,9 +6,14 @@
 //! 픽셀 이동이 "느린" 움직임이라 더 강하게 눌린다. 그 규약(value_scale =
 //! 1/object_scale)을 따른다.
 //!
-//! ⚠ 기본 파라미터는 MediaPipe face_landmarker의 것으로 추정한 값 — **VIDEO 모드
-//! 파리티 게이트로 검증 전까지는 미확정**이다 (단일 프레임 게이트에는 영향 없음:
-//! 첫 샘플은 그대로 통과한다).
+//! **파라미터 확정 (2026-08-14, MediaPipe face_landmarks_detector_graph.cc 원본
+//! 대조)**: VIDEO/스트림 모드 smooth_landmarks = one_euro **min_cutoff 0.05 /
+//! beta 80 / derivate_cutoff 1.0** (정지 시 α≈0.01, 고속 시 α≈0.94; num_faces==1
+//! 일 때만 적용 — 우리도 lm 1명이라 동일). ⚠ 속도는 **픽셀 좌표계** 기준이다 —
+//! LandmarksSmoothingCalculator가 정규화 랜드마크를 이미지 크기로 denormalize한
+//! 뒤 필터하므로, 정규화 좌표를 그대로 미분하면 속도가 프레임 폭배만큼 작아져
+//! 과잉 스무딩(랙)이 된다. object_scale도 MediaPipe 기본(랜드마크 bbox px의
+//! (w+h)/2)을 따른다.
 
 const TAU: f32 = 2.0 * std::f32::consts::PI;
 
@@ -63,25 +68,37 @@ pub struct LandmarkSmoother {
 }
 
 impl LandmarkSmoother {
-    /// face_landmarker 추정 기본값 (미확정 — 모듈 헤더 참조)
+    /// face_landmarker VIDEO 확정값 (모듈 헤더 — MediaPipe 원본 대조)
     pub fn face_default() -> Self {
-        LandmarkSmoother { filters: Vec::new(), min_cutoff: 0.1, beta: 40.0, d_cutoff: 1.0 }
+        LandmarkSmoother { filters: Vec::new(), min_cutoff: 0.05, beta: 80.0, d_cutoff: 1.0 }
     }
 
     pub fn reset(&mut self) {
         self.filters.clear();
     }
 
-    /// object_scale: ROI 크기(절대 px, (w+h)/2). 랜드마크 수가 바뀌면 리셋.
-    pub fn apply(&mut self, t_ms: f64, object_scale: f32, pts: &mut [[f32; 3]]) {
+    /// pts: 원본 프레임 **정규화** [x,y,z]. img_w/img_h로 픽셀 속도를 계산한다
+    /// (MediaPipe는 denormalize 후 필터 — 모듈 헤더 ⚠). object_scale은 랜드마크
+    /// bbox px (w+h)/2 를 내부 계산. 랜드마크 수가 바뀌면 리셋.
+    pub fn apply(&mut self, t_ms: f64, img_w: f32, img_h: f32, pts: &mut [[f32; 3]]) {
         if self.filters.len() != pts.len() {
             let f = OneEuro::new(self.min_cutoff, self.beta, self.d_cutoff);
             self.filters = vec![[f.clone(), f.clone(), f]; pts.len()];
         }
+        let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for p in pts.iter() {
+            x0 = x0.min(p[0]);
+            y0 = y0.min(p[1]);
+            x1 = x1.max(p[0]);
+            y1 = y1.max(p[1]);
+        }
+        let object_scale = ((x1 - x0) * img_w + (y1 - y0) * img_h) * 0.5;
         let scale = if object_scale > 0.0 { 1.0 / object_scale } else { 1.0 };
+        // 속도는 px 좌표계 — 축별 denormalize 계수 (z는 x축 스케일 관례)
+        let dims = [img_w, img_h, img_w];
         for (p, fs) in pts.iter_mut().zip(&mut self.filters) {
             for c in 0..3 {
-                p[c] = fs[c].apply(t_ms, scale, p[c]);
+                p[c] = fs[c].apply(t_ms, dims[c] * scale, p[c]);
             }
         }
     }

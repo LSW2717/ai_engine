@@ -295,7 +295,7 @@ async function main() {
   let fr = null;
   let t = 1000;
   for (let i = 0; i < 30; i++, t += 100) {
-    fr = await aiMod.gaze_task_gpu(gtask, gazeH2, rgb, W, H, flat, 1, t);
+    fr = await aiMod.gaze_task_gpu(gtask, gazeH2, 0, rgb, W, H, flat, 1, t);
   }
   const taskOk =
     fr.status === 'FOCUSED' && fr.attentive === true &&
@@ -308,8 +308,8 @@ async function main() {
   );
 
   const empty = new Float32Array(0);
-  const hold = await aiMod.gaze_task_gpu(gtask, gazeH2, rgb, W, H, empty, 0, t);
-  const gone = await aiMod.gaze_task_gpu(gtask, gazeH2, rgb, W, H, empty, 0, t + 700);
+  const hold = await aiMod.gaze_task_gpu(gtask, gazeH2, 0, rgb, W, H, empty, 0, t);
+  const gone = await aiMod.gaze_task_gpu(gtask, gazeH2, 0, rgb, W, H, empty, 0, t + 700);
   const nofaceOk = hold.status === 'FOCUSED' && gone.status === 'NO_FACE';
   pass = pass && nofaceOk;
   row('noface', `${hold.status} → ${gone.status}`, 'FOCUSED → NO_FACE', nofaceOk);
