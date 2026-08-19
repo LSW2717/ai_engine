@@ -52,7 +52,8 @@ thread_local! {
 #[wasm_bindgen(start)]
 fn start() {
     console_error_panic_hook::set_once();
-    let _ = console_log::init_with_level(log::Level::Info);
+    // 로거 미설치 — log:: 매크로(자체 + wgpu)가 전부 no-op 이라 브라우저 콘솔이
+    // 조용하다 (2026-08-19, 콘솔 스팸 제거). 패닉 훅은 크래시 진단용으로 유지.
 }
 
 pub(crate) fn engine() -> Result<Rc<GpuContext>, JsValue> {

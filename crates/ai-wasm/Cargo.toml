@@ -21,7 +21,6 @@ web-sys = { version = "0.3", features = ["HtmlCanvasElement", "OffscreenCanvas",
 serde.workspace = true
 serde-wasm-bindgen.workspace = true
 console_error_panic_hook.workspace = true
-console_log.workspace = true
 log.workspace = true
 bytemuck.workspace = true
 
