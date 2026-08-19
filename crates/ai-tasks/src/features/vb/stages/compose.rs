@@ -30,7 +30,7 @@ impl Compose {
             "video-compose",
             &src,
             target,
-            &[Bind::Tex, Bind::Tex, Bind::Tex, Bind::Tex, Bind::Sampler, Bind::Uniform, Bind::Tex,
+            &[Bind::Tex, Bind::Tex, Bind::Tex, Bind::Tex, Bind::Sampler, Bind::Uniform,
                 Bind::Tex, Bind::Tex, Bind::Tex],
         );
         Compose { fs, params: ubo(ctx, "video-compose", 256) }
@@ -45,7 +45,6 @@ impl Compose {
         st: &EffectsState,
         (fw, fh): (u32, u32),
         bg_dims: Option<(u32, u32)>,
-        use_fgr: bool,
         framing: (f32, f32, f32),
         face_fx: &FaceFxParams,
     ) {
@@ -113,7 +112,7 @@ impl Compose {
         // scale/offset은 유효값(contain 배율 반영), texel = (scale/W, scale/H) —
         // v-ai applyScaleAndOffset 규약 (이미지 배경 자체 블러 오프셋)
         for v in [sx, sy, offx, offy, d.light_wrapping,
-            if use_fgr { 1.0 } else { 0.0 }, sx / fw as f32, sy / fh as f32]
+            0.0 /* _pad0 (구 use_fgr 슬롯) */, sx / fw as f32, sy / fh as f32]
         {
             b.extend_from_slice(&v.to_le_bytes());
         }

@@ -17,6 +17,7 @@ ai-gpu.workspace = true
 ai-tasks.workspace = true
 log.workspace = true
 pollster.workspace = true
+serde_json.workspace = true
 
 # 안드로이드는 C ABI 대신 JNI 심볼을 소비한다 (vcxrust_ai와 같은 플랫폼 분리)
 [target.'cfg(target_os = "android")'.dependencies]

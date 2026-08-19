@@ -45,8 +45,6 @@ struct GpuLeg {
     mask_bytes_per_row: u32,
     out_cg: u32,
     out_name: String,
-    /// RVM 전경색 출력 (c==3) — 있으면 매팅 합성에 사용
-    fgr: Option<(String, wgpu::Texture, u32)>, // (이름, 스테이징, bytes_per_row)
     mask_kind_alpha: bool,
     in_f16: bool,
     in_w: u32,
@@ -278,15 +276,6 @@ impl VideoPipeline {
         self.face_fx = fx;
     }
 
-    /// 매팅 합성(fgr) 사용 중인가 — 진단·게이트용
-    pub fn uses_fgr(&self) -> bool {
-        self.res
-            .as_ref()
-            .and_then(|r| r.gpu.as_ref())
-            .map(|g| g.fgr.is_some())
-            .unwrap_or(false)
-    }
-
     /// 세션 교체 시 리소스 폐기 (모델 버퍼가 바인드그룹에 박혀 있다).
     /// ⚠ 프레이밍 스무딩 상태는 유지 — v-ai 규율: 리셋하면 옵션 조작마다 줌이
     /// 1x로 튕겼다 재수렴한다("띡띡"). 리셋은 스트림 파기에서만.
@@ -369,7 +358,6 @@ impl VideoPipeline {
         if let Some(model) = model {
             let in_name = model.sw.tensors[model.sw.inputs[0] as usize].name.clone();
             let (out_name, out_desc) = mask_output(model)?;
-            let fgr_out = fgr_output(model, &out_name);
             let (in_buf, in_desc) = model
                 .input_storage(&in_name)
                 .ok_or_else(|| TaskError::Other("세그 입력 버퍼 없음".into()))?;
@@ -383,8 +371,7 @@ impl VideoPipeline {
                     "마스크 행 {mask_bytes_per_row}B가 256 정렬 아님 (W={mw} cg={out_cg})"
                 )));
             }
-            gpu_meta =
-                Some((in_buf, in_desc, out_name, out_desc, fgr_out, mask_bytes_per_row));
+            gpu_meta = Some((in_buf, in_desc, out_name, out_desc, mask_bytes_per_row));
         } else {
             (mw, mh) = ext_dims;
             if mw == 0 || mh == 0 {
@@ -458,9 +445,9 @@ impl VideoPipeline {
                 entries,
             })
         };
-        // GPU 추론 경로 리소스 — 세션 있을 때만 (스테이징·전처리·인제스트·fgr)
+        // GPU 추론 경로 리소스 — 세션 있을 때만 (스테이징·전처리·인제스트)
         let gpu_leg = gpu_meta.map(
-            |(in_buf, in_desc, out_name, out_desc, fgr_out, mask_bytes_per_row)| {
+            |(in_buf, in_desc, out_name, out_desc, mask_bytes_per_row)| {
                 let out_cg = out_desc.cg();
                 let texel_bytes = out_desc.dt.vec4_bytes() as u32;
                 let (staging, staging_view) = tex2d(
@@ -501,23 +488,6 @@ impl VideoPipeline {
                         )
                     })
                     .collect();
-                // RVM 전경색 스테이징 (마스크와 같은 dtype 규약)
-                let fgr = fgr_out.map(|(n, d)| {
-                    let tb = d.dt.vec4_bytes() as u32;
-                    let (t, _) = tex2d(
-                        ctx,
-                        "vb-fgr-staging",
-                        d.w * d.cg(),
-                        d.h,
-                        if tb == 8 {
-                            wgpu::TextureFormat::Rgba16Float
-                        } else {
-                            wgpu::TextureFormat::Rgba32Float
-                        },
-                        wgpu::TextureUsages::COPY_DST,
-                    );
-                    (n, t, d.w * d.cg() * tb)
-                });
                 GpuLeg {
                     staging,
                     pre_bind,
@@ -525,7 +495,6 @@ impl VideoPipeline {
                     mask_bytes_per_row,
                     out_cg,
                     out_name,
-                    fgr,
                     mask_kind_alpha: out_desc.c == 1,
                     in_f16: in_desc.dt.vec4_bytes() == 8,
                     in_w: in_desc.w,
@@ -611,10 +580,6 @@ impl VideoPipeline {
                 )
             })
             .collect();
-        let fgr_view = gpu_leg
-            .as_ref()
-            .and_then(|g| g.fgr.as_ref())
-            .map(|(_, t, _)| t.create_view(&Default::default()));
         // 터치업/메이크업 128² 오버레이 — uniform이 0(off)이면 셰이더가 안 읽는다
         let fx_tex = [
             tex2d(ctx, "vb-fx-touchup", 128, 128, wgpu::TextureFormat::R8Unorm,
@@ -636,13 +601,9 @@ impl VideoPipeline {
                 E { binding: 3, resource: BTex(bg_view) },
                 E { binding: 4, resource: BSampler(&self.sampler) },
                 E { binding: 5, resource: self.comp.params.as_entire_binding() },
-                E {
-                    binding: 6,
-                    resource: BTex(fgr_view.as_ref().unwrap_or(&frame_view)),
-                },
-                E { binding: 7, resource: BTex(&fx_tex[0].1) },
-                E { binding: 8, resource: BTex(&fx_tex[1].1) },
-                E { binding: 9, resource: BTex(&fx_tex[2].1) },
+                E { binding: 6, resource: BTex(&fx_tex[0].1) },
+                E { binding: 7, resource: BTex(&fx_tex[1].1) },
+                E { binding: 8, resource: BTex(&fx_tex[2].1) },
             ],
         );
         self.res = Some(Res {
@@ -692,7 +653,6 @@ impl VideoPipeline {
                 ctx,
                 r,
                 if g.mask_kind_alpha { MaskKind::Alpha } else { MaskKind::Logits2 },
-                g.fgr.is_some(),
             );
             let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("video-pre"),
@@ -728,32 +688,6 @@ impl VideoPipeline {
             },
             wgpu::Extent3d { width: r.mw * g.out_cg, height: r.mh, depth_or_array_layers: 1 },
         );
-        if let Some((fgr_name, fgr_tex, fgr_bpr)) = &g.fgr {
-            let (fgr_buf, fd) = model
-                .output_storage(fgr_name)
-                .ok_or_else(|| TaskError::Other("fgr 버퍼 없음".into()))?;
-            enc.copy_buffer_to_texture(
-                wgpu::TexelCopyBufferInfo {
-                    buffer: fgr_buf,
-                    layout: wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(*fgr_bpr),
-                        rows_per_image: Some(fd.h),
-                    },
-                },
-                wgpu::TexelCopyTextureInfo {
-                    texture: fgr_tex,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::Extent3d {
-                    width: fd.w * fd.cg(),
-                    height: fd.h,
-                    depth_or_array_layers: 1,
-                },
-            );
-        }
         self.encode_stack(&mut enc, r, p, &g.ingest_bind[p], bbox_slot, target);
         ctx.queue.submit([enc.finish()]);
         if let Some(s) = bbox_slot {
@@ -890,7 +824,6 @@ impl VideoPipeline {
             ctx,
             r,
             if ch == 1 { MaskKind::Alpha } else { MaskKind::Logits2 },
-            false,
             ema,
         );
         let mut enc = ctx
@@ -904,18 +837,11 @@ impl VideoPipeline {
     }
 
     /// 이펙트 스택 uniform 일괄 기록 — process_gpu / process_gpu_mask 공유
-    fn write_stack_params(&self, ctx: &GpuContext, r: &Res, kind: MaskKind, use_fgr: bool) {
-        self.write_stack_params_ema(ctx, r, kind, use_fgr, true);
+    fn write_stack_params(&self, ctx: &GpuContext, r: &Res, kind: MaskKind) {
+        self.write_stack_params_ema(ctx, r, kind, true);
     }
 
-    fn write_stack_params_ema(
-        &self,
-        ctx: &GpuContext,
-        r: &Res,
-        kind: MaskKind,
-        use_fgr: bool,
-        ema: bool,
-    ) {
+    fn write_stack_params_ema(&self, ctx: &GpuContext, r: &Res, kind: MaskKind, ema: bool) {
         self.ingest.write_params(ctx, kind, ema);
         let d = self.state.derived();
         self.up.write_params(ctx, d.sigma_space, d.sigma_color, (r.fw, r.fh), (r.mw, r.mh));
@@ -932,7 +858,6 @@ impl VideoPipeline {
             &self.state,
             (r.fw, r.fh),
             self.bg_img.as_ref().map(|b| (b.2, b.3)),
-            use_fgr,
             self.framing_override.unwrap_or_else(|| self.framing.current()),
             &self.face_fx,
         );
@@ -991,20 +916,3 @@ fn mask_output(
     cands.into_iter().next().ok_or_else(|| TaskError::Other("세그 출력 없음".into()))
 }
 
-/// RVM류 전경색 출력 (c==3, 마스크와 다른 텐서) — 256정렬 안 되면 미사용
-fn fgr_output(
-    model: &ai_gpu_runtime::Model,
-    mask_name: &str,
-) -> Option<(String, ai_core::TensorDesc)> {
-    let names: Vec<String> = model
-        .sw
-        .outputs
-        .iter()
-        .map(|&o| model.sw.tensors[o as usize].name.clone())
-        .collect();
-    names
-        .into_iter()
-        .filter(|n| n != mask_name)
-        .filter_map(|n| model.output_storage(&n).map(|(_, d)| (n, d)))
-        .find(|(_, d)| d.c == 3 && (d.w * d.cg() * d.dt.vec4_bytes() as u32) % 256 == 0)
-}

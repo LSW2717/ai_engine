@@ -35,6 +35,8 @@ struct Staged {
     view: wgpu::TextureView,
     w: u32,
     h: u32,
+    /// 텍셀 바이트 (8=rgba16float/f16 모델, 16=rgba32float/f32) — dtype 바뀌면 재생성
+    tb: u32,
     /// 바인드그룹은 두 텍스처가 그대로면 재사용한다.
     /// 매 프레임 만들면 30fps에서 분당 1800개가 쌓여 시간이 계속 늘어난다
     /// (실측: 추론 2.59 → 6.76ms로 단조 증가).
@@ -206,31 +208,38 @@ impl Compositor {
         let p = [desc.w, desc.h, desc.cg(), opts.channel, opts.mode, opts.bg, 0u32, 0u32];
         ctx.queue.write_buffer(&self.params, 0, bytemuck::cast_slice(&p));
 
-        // NHWC-C4 버퍼 → rgba32float 텍스처. 텍스처 폭 = W * cg (채널그룹 인터리브).
+        // NHWC-C4 버퍼 → rgba16/32float 텍스처 (모델 dtype 따라 — f16 모델을
+        // 16B/texel로 읽으면 버퍼 범위 초과로 커맨드버퍼가 무효화된다, 검은 화면).
+        // 텍스처 폭 = W * cg (채널그룹 인터리브).
         // copy_buffer_to_texture는 bytes_per_row가 256의 배수여야 한다.
         let (tw, th) = (desc.w * desc.cg(), desc.h);
-        let bytes_per_row = tw * 16;
+        let tb = desc.dt.vec4_bytes() as u32;
+        let bytes_per_row = tw * tb;
         if bytes_per_row % 256 != 0 {
             return Err(format!(
-                "composite: 행 바이트 {bytes_per_row}가 256 정렬이 아님 (W={} cg={})",
+                "composite: 행 바이트 {bytes_per_row}가 256 정렬이 아님 (W={} cg={} tb={tb})",
                 desc.w,
                 desc.cg()
             ));
         }
         let mut st = self.staging.borrow_mut();
-        if st.as_ref().map(|s| (s.w, s.h)) != Some((tw, th)) {
+        if st.as_ref().map(|s| (s.w, s.h, s.tb)) != Some((tw, th, tb)) {
             let tex = ctx.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("composite-staging"),
                 size: wgpu::Extent3d { width: tw, height: th, depth_or_array_layers: 1 },
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba32Float,
+                format: if tb == 8 {
+                    wgpu::TextureFormat::Rgba16Float
+                } else {
+                    wgpu::TextureFormat::Rgba32Float
+                },
                 usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             });
             let view = tex.create_view(&Default::default());
-            *st = Some(Staged { tex, view, w: tw, h: th, bind: None, frame_gen: u32::MAX });
+            *st = Some(Staged { tex, view, w: tw, h: th, tb, bind: None, frame_gen: u32::MAX });
         }
         let ft = self.frame.borrow();
         let frame = ft.as_ref().ok_or_else(|| "with_frame_texture() 먼저".to_string())?;

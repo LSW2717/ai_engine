@@ -19,6 +19,22 @@
   .panel label { text-align: right; opacity: .85; }
   #hud { font-variant-numeric: tabular-nums; font-size: .85rem; opacity: .8; margin-top: .5rem; }
   button { padding: .35rem .9rem; }
+  /* 로드 베일 — 엔진·모델 준비 동안 원본 영상을 강블러로 깔고 "화면 조정 중" 표기.
+     죽은 화면 오인 방지 + 합성 전 원본 배경 노출 방지(블러가 가림)를 동시에 해결.
+     해제는 studio.js가 첫 합성 프레임 완료 때 (에러 시엔 숨기고 status로 넘김) */
+  #veil { position: absolute; inset: 0; display: grid; place-items: center;
+    overflow: hidden; border-radius: 6px; background: #222;
+    transition: opacity .6s ease; }
+  #veil.fade { opacity: 0; pointer-events: none; } /* 페이드 후 JS가 hidden 처리 */
+  #veil[hidden] { display: none; }
+  #veil video { position: absolute; inset: 0; width: 100%; height: 100%;
+    object-fit: cover; filter: blur(28px) brightness(.8); transform: scale(1.15); }
+  #veil span { position: relative; color: #fff; font-size: .95rem;
+    text-shadow: 0 1px 8px #000c; display: flex; align-items: center; gap: .5rem; }
+  #veil span::before { content: ""; width: 1em; height: 1em; border-radius: 50%;
+    border: 2px solid #fff9; border-top-color: transparent;
+    animation: veilspin .9s linear infinite; }
+  @keyframes veilspin { to { transform: rotate(360deg) } }
 </style>
 </head>
 <body>
@@ -34,6 +50,7 @@
        3D 아이템은 엔진 wgpu 오버레이가 out 서피스에 직접 그린다 (three.js 제거) -->
   <div style="position:relative; width:640px; height:360px">
     <canvas id="out" width="1280" height="720" style="width:640px; height:360px"></canvas>
+    <div id="veil" hidden><span>화면 조정 중…</span></div>
   </div>
   <div class="panel">
     <label>배경</label>

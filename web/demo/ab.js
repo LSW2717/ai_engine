@@ -52,6 +52,7 @@ let fgA = null, fgACtx = null, fgB = null, fgBCtx = null;
 let snap = null, snapCtx = null;
 let inv = null, invCtx = null; // (1-m) 임시 캔버스
 let rgbNhwc = null, rgbNchw = null;
+let wglDims = null, wglSmall = null, wglSmallCtx = null; // webgl2 자체 해상도 (우리와 다를 때)
 let wgl = null, wglRecurrent = [];
 let pendingPresent = null;
 const t0Page = performance.now();
@@ -265,12 +266,25 @@ async function frame() {
   snapCtx.drawImage(video, 0, 0, w, h);
   smallCtx.drawImage(snap, 0, 0, io.w, io.h);
   const px = smallCtx.getImageData(0, 0, io.w, io.h).data;
-  const plane = io.w * io.h;
   for (let p = 0, q = 0; p < px.length; p += 4, q += 3) {
-    const r = px[p] / 255, g = px[p + 1] / 255, b = px[p + 2] / 255;
-    rgbNhwc[q] = r; rgbNhwc[q + 1] = g; rgbNhwc[q + 2] = b;   // 인터리브
-    const i = q / 3;
-    rgbNchw[i] = r; rgbNchw[plane + i] = g; rgbNchw[2 * plane + i] = b; // 플래너
+    rgbNhwc[q] = px[p] / 255;         // 인터리브 (우리 모델 해상도)
+    rgbNhwc[q + 1] = px[p + 1] / 255;
+    rgbNhwc[q + 2] = px[p + 2] / 255;
+  }
+  // webgl2 플래너 입력 — 해상도 같으면 같은 픽셀 재사용, 다르면(우리만 320×176 등)
+  // 자기 해상도 캔버스에서 따로 추출 (같은 스냅샷이라 시점은 일치)
+  if (RUN_WGL) {
+    let wp = px;
+    if (wglSmallCtx) {
+      wglSmallCtx.drawImage(snap, 0, 0, wglDims.w, wglDims.h);
+      wp = wglSmallCtx.getImageData(0, 0, wglDims.w, wglDims.h).data;
+    }
+    const plane = wglDims.w * wglDims.h;
+    for (let p = 0, i = 0; p < wp.length; p += 4, i++) {
+      rgbNchw[i] = wp[p] / 255;
+      rgbNchw[plane + i] = wp[p + 1] / 255;
+      rgbNchw[2 * plane + i] = wp[p + 2] / 255;
+    }
   }
 
   // 2) ai_engine — GPU에 둔 채 캔버스로 (리드백 없음). 실패하면 리드백 경로로 폴백한다.
@@ -382,6 +396,18 @@ async function start() {
 
     small = mkCanvas(io.w, io.h);
     smallCtx = small.getContext('2d', { willReadFrequently: true });
+    // webgl2 plan은 자기 고정 해상도(input_1 NCHW shape)를 쓴다 — 우리 모델과
+    // 해상도가 달라도(예: 320×176 vs 256×144) 각자 제 해상도로 돈다.
+    // "동일 입력"의 의미는 같은 프레임 스냅샷이지 같은 텐서 크기가 아니다.
+    {
+      const inp = wgl.plan.inputs.find((i) => i.name === 'input_1');
+      const [, , ph, pw] = inp.shape;
+      wglDims = { w: pw, h: ph };
+      if (pw !== io.w || ph !== io.h) {
+        wglSmall = mkCanvas(pw, ph);
+        wglSmallCtx = wglSmall.getContext('2d', { willReadFrequently: true });
+      }
+    }
     // 우리 마스크는 WebGPU 서피스 캔버스에 직접 그려진다 (OffscreenCanvas 아님)
     // ⚠ 합성은 **셰이더 안에서** 끝낸다. 캔버스 2D 블렌드(multiply/difference/lighter)는
     // 브라우저마다 결과가 달라서 사파리에서 합성만 깨졌다. outA 자체가 WebGPU
@@ -393,9 +419,9 @@ async function start() {
       say(`present 초기화 실패: ${e}`, true);
       throw e;
     }
-    wglPresent = makeWglPresent(wgl.gl, io.w, io.h);
+    wglPresent = makeWglPresent(wgl.gl, wglDims.w, wglDims.h);
     rgbNhwc = new Float32Array(io.h * io.w * 3);
-    rgbNchw = new Float32Array(io.h * io.w * 3);
+    rgbNchw = new Float32Array(wglDims.h * wglDims.w * 3);
 
     // 시작 시 한 번은 **리드백으로** 알파를 꺼내 통계를 찍는다.
     // "추론이 0인가 / present가 0을 그리는가"를 가르는 유일한 방법이다.
@@ -425,7 +451,7 @@ async function start() {
       console.log('[demo] readback 모드 — present 사용 안 함');
     }
 
-    say(`실행 중 — ${io.w}×${io.h}, 두 엔진 동일 입력`);
+    say(`실행 중 — ours ${io.w}×${io.h} / webgl2 ${wglDims.w}×${wglDims.h}, 같은 프레임 스냅샷`);
     running = true;
     $('stop').disabled = false;
     requestAnimationFrame(frame);

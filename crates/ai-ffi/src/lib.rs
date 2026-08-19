@@ -34,9 +34,12 @@ use std::slice;
 use std::sync::Mutex;
 use std::time::Instant;
 
+use std::sync::atomic::Ordering;
+
 use ai_gpu::wgpu;
 use ai_gpu::GpuContext;
 use ai_tasks::features::audio::Enhancer;
+use ai_tasks::features::vb::SoftPipeline;
 use ai_tasks::Director;
 
 /// 0=Success, -1=Failure (vcxrust_ai VbResult와 동일 값 — 기존 호스트의
@@ -62,9 +65,62 @@ struct Ffi {
     rgba: Vec<u8>,
     rgb: Vec<u8>,
     epoch: Instant,
+    /// mirror/degree — 프레임 변환은 호스트 몫 계약이라 엔진에 안 넘기고 여기 산다.
+    /// 인물(프레임)만 뒤집고 배경 이미지는 화면에 고정된다 (모바일 제품 스펙).
+    mirror: bool,
+    degree: f32,
+    /// B 티어 CPU 세그 (infer_mask만 사용 — 합성·EMA는 Director/GPU 소유)
+    cpu_seg: Option<SoftPipeline>,
 }
 
 static STATE: Mutex<Option<Ffi>> = Mutex::new(None);
+
+/// C 티어(소프트 합성) 상태 — 호스트가 set_render_tier(2)로 선언한 기기 전용.
+/// GPU 심볼(wgpu 컨텍스트·셰이더 컴파일)을 일절 만들지 않는다 — 비호환 드라이버가
+/// 컴파일 중 프로세스째 죽는(SIGSEGV) 기기가 진입 조건이라, 이 경로의 존재 이유가
+/// "GPU를 건드리지 않음" 그 자체다.
+struct Soft {
+    pipe: SoftPipeline,
+    rgba: Vec<u8>,
+    mirror: bool,
+    degree: f32,
+}
+
+use std::sync::atomic::AtomicI32;
+
+/// 렌더 티어 (INTEGRATION.md §1.5): 0=A(GPU 추론+GPU 합성), 1=B(CPU 추론+GPU
+/// 합성 — GPU는 살아있지만 추론이 느린 기기), 2=C(전부 CPU — GPU 자체가 불가).
+static TIER: AtomicI32 = AtomicI32::new(0);
+static SOFT: Mutex<Option<Soft>> = Mutex::new(None);
+
+fn soft_state(guard: &mut Option<Soft>) -> &mut Soft {
+    guard.get_or_insert_with(|| Soft {
+        pipe: SoftPipeline::default(),
+        rgba: Vec::new(),
+        mirror: false,
+        degree: 0.0,
+    })
+}
+
+/// 렌더 티어 선언 — 0=A(GPU), 1=B(CPU 추론+GPU 합성), 2=C(GPU 완전 회피).
+/// 모델 주입 전에 호출해야 한다. B/C 전환 시 세그 모델(경량 CPU용)을
+/// set_video_stream_info로 다시 주입하는 것까지가 호스트 몫.
+#[unsafe(no_mangle)]
+pub extern "C" fn set_render_tier(tier: c_int) -> VbResult {
+    if !(0..=2).contains(&tier) {
+        return VbResult::Failure;
+    }
+    TIER.store(tier, Ordering::Relaxed);
+    VbResult::Success
+}
+
+fn soft_tier() -> bool {
+    TIER.load(Ordering::Relaxed) == 2
+}
+
+fn b_tier() -> bool {
+    TIER.load(Ordering::Relaxed) == 1
+}
 
 fn ffi_log(msg: &str) {
     log::error!("[ai-ffi] {msg}");
@@ -88,6 +144,9 @@ fn ensure_state(guard: &mut Option<Ffi>) -> Result<&mut Ffi, String> {
             rgba: Vec::new(),
             rgb: Vec::new(),
             epoch: Instant::now(),
+            mirror: false,
+            degree: 0.0,
+            cpu_seg: None,
         });
     }
     Ok(guard.as_mut().unwrap())
@@ -127,6 +186,17 @@ pub unsafe extern "C" fn set_video_stream_info(
             ffi_log("set_video_stream_info: path not utf-8");
             return VbResult::Failure;
         };
+        if soft_tier() {
+            let bytes = match std::fs::read(path) {
+                Ok(b) => b,
+                Err(e) => {
+                    ffi_log(&format!("set_video_stream_info(soft): read {path}: {e}"));
+                    return VbResult::Failure;
+                }
+            };
+            soft_state(&mut SOFT.lock().unwrap()).pipe.set_model(bytes);
+            return VbResult::Success;
+        }
         let mut guard = STATE.lock().unwrap();
         let st = match ensure_state(&mut guard) {
             Ok(s) => s,
@@ -135,6 +205,22 @@ pub unsafe extern "C" fn set_video_stream_info(
                 return VbResult::Failure;
             }
         };
+        if b_tier() {
+            // B 티어: 세그는 CPU — GPU 세그 세션(RVM 컴파일)을 만들지 않는다.
+            // 합성/태스크는 Director(GPU)가 그대로 소유.
+            let bytes = match std::fs::read(path) {
+                Ok(b) => b,
+                Err(e) => {
+                    ffi_log(&format!("set_video_stream_info(b): read {path}: {e}"));
+                    return VbResult::Failure;
+                }
+            };
+            let mut pipe = SoftPipeline::default();
+            pipe.set_model(bytes);
+            st.cpu_seg = Some(pipe);
+            st.director.reset(); // 기존 GPU 세그 세션/파이프라인 리소스 반납
+            return VbResult::Success;
+        }
         match load_model_file(st, "seg", path) {
             Ok(()) => VbResult::Success,
             Err(e) => {
@@ -181,6 +267,9 @@ pub unsafe extern "C" fn set_gaze_model_info(
     bs_path: *const c_char,
 ) -> VbResult {
     let result = catch_unwind(AssertUnwindSafe(|| {
+        if soft_tier() {
+            return VbResult::Success;
+        }
         let gaze = match unsafe { cstr(gaze_path) } {
             Ok(v) => v,
             Err(e) => {
@@ -219,6 +308,10 @@ fn set_model_pair(
     path_b: *const c_char,
 ) -> VbResult {
     let result = catch_unwind(AssertUnwindSafe(|| {
+        // C 티어는 얼굴/손 스택이 없다 (효과별 최소 티어 = B 이상) — 조용히 성공
+        if soft_tier() {
+            return VbResult::Success;
+        }
         let (a, b) = match (unsafe { cstr(path_a) }, unsafe { cstr(path_b) }) {
             (Ok(a), Ok(b)) => (a, b),
             (Err(e), _) | (_, Err(e)) => {
@@ -252,6 +345,9 @@ fn set_model_pair(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn set_item_model_dir(dir: *const c_char) -> VbResult {
     let result = catch_unwind(AssertUnwindSafe(|| {
+        if soft_tier() {
+            return VbResult::Success;
+        }
         let dir = match unsafe { cstr(dir) } {
             Ok(v) => v,
             Err(e) => {
@@ -299,6 +395,40 @@ pub unsafe extern "C" fn update_effects_config(json: *const c_char) -> VbResult 
                 return VbResult::Failure;
             }
         };
+        // mirror/degree는 여기서 흡수한다 (머지 규약 유지: 없음=유지) — 프레임 변환은
+        // 호스트(ffi) 몫이고, 엔진의 bg_mat 배경 보정까지 타면 배경 이미지가 같이
+        // 뒤집힌다. 모바일 스펙은 "인물만 반전, 배경은 화면 고정".
+        let mut mirror_patch: Option<bool> = None;
+        let mut degree_patch: Option<f32> = None;
+        let forwarded = match serde_json::from_str::<serde_json::Value>(&json) {
+            Ok(mut v) => {
+                if let Some(obj) = v.as_object_mut() {
+                    mirror_patch = obj.remove("mirror").map(|m| m.as_bool().unwrap_or(false));
+                    degree_patch = obj
+                        .remove("degree")
+                        .map(|d| (d.as_f64().unwrap_or(0.0) as f32).rem_euclid(360.0));
+                }
+                v.to_string()
+            }
+            Err(_) => json, // 파싱 실패는 엔진 쪽 에러 메시지로 일원화
+        };
+        if soft_tier() {
+            let mut guard = SOFT.lock().unwrap();
+            let st = soft_state(&mut guard);
+            if let Some(m) = mirror_patch {
+                st.mirror = m;
+            }
+            if let Some(d) = degree_patch {
+                st.degree = d;
+            }
+            return match st.pipe.apply_json(&forwarded) {
+                Ok(()) => VbResult::Success,
+                Err(e) => {
+                    ffi_log(&format!("update_effects_config(soft): {e}"));
+                    VbResult::Failure
+                }
+            };
+        }
         let mut guard = STATE.lock().unwrap();
         let st = match ensure_state(&mut guard) {
             Ok(s) => s,
@@ -307,7 +437,13 @@ pub unsafe extern "C" fn update_effects_config(json: *const c_char) -> VbResult 
                 return VbResult::Failure;
             }
         };
-        match st.director.apply_json(&json) {
+        if let Some(m) = mirror_patch {
+            st.mirror = m;
+        }
+        if let Some(d) = degree_patch {
+            st.degree = d;
+        }
+        match st.director.apply_json(&forwarded) {
             Ok(()) => VbResult::Success,
             Err(e) => {
                 ffi_log(&format!("update_effects_config: {e}"));
@@ -336,6 +472,12 @@ pub unsafe extern "C" fn set_background_image(
         }
         let (w, h) = (width as u32, height as u32);
         let data = unsafe { slice::from_raw_parts(rgba, (w * h * 4) as usize) };
+        if soft_tier() {
+            soft_state(&mut SOFT.lock().unwrap())
+                .pipe
+                .set_background_image(data, w as usize, h as usize);
+            return VbResult::Success;
+        }
         let mut guard = STATE.lock().unwrap();
         let st = match ensure_state(&mut guard) {
             Ok(s) => s,
@@ -437,22 +579,66 @@ pub unsafe extern "C" fn render_mask(
             )
         };
 
+        if soft_tier() {
+            return render_mask_soft(yb, ub, vb, w, h, sy, su, sv);
+        }
         let mut guard = STATE.lock().unwrap();
         let Some(st) = guard.as_mut() else {
             ffi_log("render_mask: 미초기화 (set_video_stream_info 먼저)");
             return VbResult::Failure;
         };
-        // 완전 무가공 — 변환조차 하지 않는다 (최대 절약)
+        // mirror/degree 프레임 변환은 호스트 몫 계약 — ffi가 추론 전에 적용한다
+        // (웹 워커 전처리 등가). 90/270은 in-place I420 치수 계약과 상충해 미지원.
+        let (mirror, degree) = (st.mirror, st.degree);
+        let rot180 = (degree - 180.0).abs() < 0.5;
+        if degree != 0.0 && !rot180 {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                ffi_log(&format!("render_mask: degree {degree} 미지원 (0/180만) — 무시"));
+            }
+        }
+        let (flip_h, flip_v) = (mirror ^ rot180, rot180);
+        let flip = flip_h || flip_v;
         if st.director.passthrough() {
+            // 완전 무가공 — 변환조차 하지 않는다 (최대 절약)
+            if !flip {
+                return VbResult::Success;
+            }
+            // mirror/180만 켠 경우 — GPU 없이 CPU 왕복만으로 뒤집어 되쓴다
+            st.rgba.resize(w * h * 4, 0);
+            yuv::i420_to_rgba(yb, ub, vb, w, h, sy, su, sv, &mut st.rgba);
+            yuv::flip_rgba(&mut st.rgba, w, h, flip_h, flip_v);
+            yuv::rgba_to_i420(&st.rgba, w, h, yb, ub, vb, sy, su, sv);
             return VbResult::Success;
         }
         let t_ms = st.epoch.elapsed().as_secs_f64() * 1e3;
         st.rgba.resize(w * h * 4, 0);
         yuv::i420_to_rgba(yb, ub, vb, w, h, sy, su, sv, &mut st.rgba);
+        if flip {
+            yuv::flip_rgba(&mut st.rgba, w, h, flip_h, flip_v);
+        }
 
-        // 프레임 텍스처 채우기 (비디오 경로면 세그 ensure, 아니면 세션리스)
-        let Ffi { ctx, director, rgba, rgb, target, .. } = st;
-        let upload = pollster::block_on(director.with_frame(ctx, w as u32, h as u32, |tex| {
+        // B 티어: 세그를 CPU에서 먼저 — 마스크 해상도가 프레임 리소스 ensure에 필요.
+        // 마스크는 EMA 없이 원시로 넘긴다 (시간 상태는 GPU ingest 소유 — A와 동일 규약).
+        let Ffi { ctx, director, rgba, rgb, target, cpu_seg, .. } = st;
+        let mut bmask: Option<(&[f32], u32, u32, u32)> = None;
+        if b_tier() && director.needs_render() {
+            let Some(cpu) = cpu_seg.as_mut() else {
+                ffi_log("render_mask(b): CPU 세그 미주입 (set_video_stream_info 먼저)");
+                return VbResult::Failure;
+            };
+            match cpu.infer_mask(rgba, w, h) {
+                Ok(m) => bmask = Some(m),
+                Err(e) => {
+                    ffi_log(&format!("render_mask(b): CPU 추론: {e}"));
+                    return VbResult::Failure;
+                }
+            }
+        }
+
+        // 프레임 텍스처 채우기 (A: 세그 ensure / B: 마스크 해상도 ensure / 태스크: 세션리스)
+        let fill = |tex: &wgpu::Texture| {
             ctx.queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: tex,
@@ -472,7 +658,12 @@ pub unsafe extern "C" fn render_mask(
                     depth_or_array_layers: 1,
                 },
             );
-        }));
+        };
+        let upload = if let Some((_, mw, mh, _)) = bmask {
+            director.with_frame_mask(ctx, w as u32, h as u32, (mw, mh), fill)
+        } else {
+            pollster::block_on(director.with_frame(ctx, w as u32, h as u32, fill))
+        };
         if let Err(e) = upload {
             ffi_log(&format!("render_mask: 프레임 업로드: {e}"));
             return VbResult::Failure;
@@ -513,14 +704,16 @@ pub unsafe extern "C" fn render_mask(
             }
         }
         let view = target.as_ref().filter(|_| needs).map(|t| &t.view);
-        if let Err(e) = pollster::block_on(director.frame(
-            ctx,
-            w as u32,
-            h as u32,
-            view,
-            rgb_opt,
-            t_ms,
-        )) {
+        let framed = if let Some((mask, mw, mh, ch)) = bmask {
+            // B 티어 — 외부 마스크 주입 (needs_render일 때만 bmask가 생긴다)
+            let tv = view.expect("bmask는 needs_render 전제");
+            pollster::block_on(director.frame_mask(
+                ctx, mask, ch, mw, mh, w as u32, h as u32, tv, rgb_opt, t_ms,
+            ))
+        } else {
+            pollster::block_on(director.frame(ctx, w as u32, h as u32, view, rgb_opt, t_ms))
+        };
+        if let Err(e) = framed {
             ffi_log(&format!("render_mask: {e}"));
             return VbResult::Failure;
         }
@@ -533,11 +726,55 @@ pub unsafe extern "C" fn render_mask(
                     return VbResult::Failure;
                 }
             }
+        } else if flip {
+            // mirror/180만 켠 경우 — 합성 없이 뒤집힌 원본을 되쓴다
+            yuv::rgba_to_i420(rgba, w, h, yb, ub, vb, sy, su, sv);
         }
         // analyzer-only: 프레임 무수정 (원본이 그대로 나간다 — vcxrust 고속경로 등가)
         VbResult::Success
     }));
     result.unwrap_or_else(|_| handle_panic())
+}
+
+/// C 티어 프레임 처리 — CPU 추론 + 소프트 합성, GPU 관여 0.
+/// mirror/180 호스트 변환은 GPU 티어와 동일 계약으로 여기서도 적용한다.
+#[allow(clippy::too_many_arguments)]
+fn render_mask_soft(
+    yb: &mut [u8],
+    ub: &mut [u8],
+    vb: &mut [u8],
+    w: usize,
+    h: usize,
+    sy: usize,
+    su: usize,
+    sv: usize,
+) -> VbResult {
+    let mut guard = SOFT.lock().unwrap();
+    let st = soft_state(&mut guard);
+    let rot180 = (st.degree - 180.0).abs() < 0.5;
+    let (flip_h, flip_v) = (st.mirror ^ rot180, rot180);
+    let flip = flip_h || flip_v;
+    if st.pipe.passthrough() && !flip {
+        return VbResult::Success;
+    }
+    st.rgba.resize(w * h * 4, 0);
+    yuv::i420_to_rgba(yb, ub, vb, w, h, sy, su, sv, &mut st.rgba);
+    if flip {
+        yuv::flip_rgba(&mut st.rgba, w, h, flip_h, flip_v);
+    }
+    let Soft { pipe, rgba, .. } = st;
+    match pipe.process(rgba, w, h) {
+        Ok(processed) => {
+            if processed || flip {
+                yuv::rgba_to_i420(rgba, w, h, yb, ub, vb, sy, su, sv);
+            }
+            VbResult::Success
+        }
+        Err(e) => {
+            ffi_log(&format!("render_mask(soft): {e}"));
+            VbResult::Failure
+        }
+    }
 }
 
 /// 타깃 텍스처 → RGBA (256 정렬 패딩 행 제거)
@@ -630,6 +867,16 @@ pub extern "C" fn destroy_custom_video_stream() -> VbResult {
         if let Some(st) = STATE.lock().unwrap().as_mut() {
             st.director.reset();
             st.target = None;
+            st.mirror = false;
+            st.degree = 0.0;
+            if let Some(c) = st.cpu_seg.as_mut() {
+                c.reset();
+            }
+        }
+        if let Some(st) = SOFT.lock().unwrap().as_mut() {
+            st.pipe.reset();
+            st.mirror = false;
+            st.degree = 0.0;
         }
         VbResult::Success
     }));

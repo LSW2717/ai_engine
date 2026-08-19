@@ -6,9 +6,11 @@ pub mod framing; // 인물 중앙 프레이밍 — 순수 로직 (bbox → 크�
 pub mod gate; // 픽셀 diff 게이트 하네스 (vb-diff.html)
 pub mod params;
 pub mod pipeline;
+pub mod soft; // C 티어 — 합성 GPU 불가 기기의 소프트(CPU) 합성
 pub(crate) mod stages;
 
 pub use framing::FramingOptions;
 pub use gate::GateHarness;
 pub use params::{Background, EffectsPatch, EffectsState};
 pub use pipeline::VideoPipeline;
+pub use soft::SoftPipeline;

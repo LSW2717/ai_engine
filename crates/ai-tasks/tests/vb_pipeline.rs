@@ -137,7 +137,7 @@ fn rvm_mask_appears() {
     let frac = fg as f32 / (w * h) as f32;
     println!("전경 비율 {frac:.3} (기대 0.10~0.35)");
     // 프레임타임 분리 계측 (동기화 포함 — 측정규율): 추론 단독 vs 파이프라인 전체.
-    // 이펙트 스택(EMA/JBF/refine/blur/compose+fgr)이 추론에 얹는 비용을 격리한다.
+    // 이펙트 스택(EMA/JBF/refine/blur/compose)이 추론에 얹는 비용을 격리한다.
     let reps = 50;
     for _ in 0..5 {
         pollster::block_on(seg.infer(&ctx)).unwrap();
@@ -160,7 +160,6 @@ fn rvm_mask_appears() {
         full_ms - infer_ms
     );
 
-    assert!(pipe.uses_fgr(), "RVM인데 fgr 매팅 경로 비활성");
     assert!(pha_mean > 0.05, "pha 전멸 — 전처리(f16)/추론 경로 사망");
     assert!(frac > 0.05 && frac < 0.6, "합성 전경 비율 비정상 {frac} — 마스크 스택 사망");
 

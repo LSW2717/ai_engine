@@ -70,6 +70,8 @@ fn item_adjust(kind: &str) -> (f32, f32, f32, f32, f32, f32) {
         "hat_bicycle" => (1.08, -std::f32::consts::FRAC_PI_2, -0.32, 0.45, 1.0, 1.0),
         "hat_christmas" => (1.0, std::f32::consts::FRAC_PI_6, 0.05, -0.29, 1.0, 1.0),
         "glasses_heart" => (1.0, 0.0, 0.0, 0.14, 1.0, 1.0),
+        // 풀 비어드 — canonical cm 직접 배치 GLB, 웹 GLB_BEARDS 와 동일 (dy -3cm)
+        "beard_full" => (1.0, 0.0, -3.0, 0.0, 1.0, 1.0),
         _ => (1.0, 0.0, 0.0, 0.0, 1.0, 1.0),
     }
 }
@@ -90,7 +92,7 @@ const EYEWEAR_KINDS: [&str; 5] = [
     "glasses_yellow",
 ];
 // 수염류 GLB 는 canonical 얼굴 cm 좌표(원점=얼굴 원점)에 직접 구워져 있다 — 그룹 앵커 없음.
-const BEARD_KINDS: [&str; 2] = ["mustache1", "mustache2"];
+const BEARD_KINDS: [&str; 3] = ["mustache1", "mustache2", "beard_full"];
 
 // ═══════════════════ 미니 행렬/쿼터니언 ═══════════════════
 // 열우선(column-major) 4x4 — wgpu/WGSL mat4x4 레이아웃과 일치.

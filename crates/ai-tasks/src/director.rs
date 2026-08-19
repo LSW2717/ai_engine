@@ -288,7 +288,8 @@ impl Director {
         self.hand_cfg.is_some() || self.focus_cfg.is_some()
     }
 
-    /// 완전 무가공 — 호스트는 원본 프레임을 그대로 내보내면 된다 (제로카피)
+    /// 완전 무가공 — 호스트는 원본 프레임을 그대로 내보내면 된다 (제로카피).
+    /// 단 mirror/degree 프레임 변환은 호스트 몫 계약이라 이 판정에 없다.
     pub fn passthrough(&self) -> bool {
         !self.needs_render() && !self.tasks_active()
     }

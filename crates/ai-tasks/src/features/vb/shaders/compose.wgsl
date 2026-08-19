@@ -22,7 +22,7 @@ struct P {
     bg_scale: vec2f,     // 이미지 cover 크롭
     bg_offset: vec2f,
     light_wrap: f32,
-    use_fgr: f32,
+    _pad0: f32,          // 구 use_fgr 슬롯 (fgr 매팅 제거 — 2026-08-18)
     texel: vec2f,        // 출력(캔버스) 텍셀 — 이미지 배경 자체 블러가 소비
     // 스튜디오 조명 (v-ai RELIGHT 등가): x=enabled, y=ambient, z=aspect
     relight: vec4f,
@@ -42,12 +42,10 @@ struct P {
     mk_map: vec4f,
 }
 @group(0) @binding(5) var<uniform> p: P;
-// RVM 전경색 (매팅) — use_fgr=0이면 미사용 (프레임 뷰가 더미로 바인딩됨)
-@group(0) @binding(6) var fgr_tex: texture_2d<f32>;
 // 터치업 피부 마스크 (R8 128²) + 메이크업 오버레이 (RGBA8 128² ×2)
-@group(0) @binding(7) var touchup_tex: texture_2d<f32>;
-@group(0) @binding(8) var makeup_mul_tex: texture_2d<f32>;
-@group(0) @binding(9) var makeup_over_tex: texture_2d<f32>;
+@group(0) @binding(6) var touchup_tex: texture_2d<f32>;
+@group(0) @binding(7) var makeup_mul_tex: texture_2d<f32>;
+@group(0) @binding(8) var makeup_over_tex: texture_2d<f32>;
 
 fn apply_relight(base: vec3f, pm: f32, uv: vec2f) -> vec3f {
     if (p.relight.x < 0.5) { return base; }
@@ -179,17 +177,9 @@ fn apply_makeup(base: vec3f, cuv: vec2f) -> vec3f {
         bg = blur_bg_image((c * 0.5 + 0.5) * p.bg_scale + p.bg_offset);
     }
 
-    // 매팅 합성 (RVM): fgr = 모델이 복원한 순수 전경색 — 단 **모델 해상도**
-    // (256×144)라 전면 사용하면 인물이 통째로 소프트해진다 (1280 입력에서 5배
-    // 업스케일 — 실제로 눈에 띄어 수리). 매팅의 실익(머리카락에 옛 배경이 배는
-    // 오염 제거)은 경계 불확실 구간에만 있으므로: 알파가 확실한 내부는 카메라
-    // 원본(풀해상), 경계만 fgr. 원리적 해결(풀해상 fgr)은 mnv4-RVM 교체 때.
+    // fgr 매팅은 제거됨 (2026-08-18) — 모델 해상도(256×144) fgr 업스케일이
+    // 테두리를 각지게 만들어 뺐다. 전경은 항상 카메라 원본(풀해상).
     var fg = color;
-    if (p.use_fgr > 0.5) {
-        let f = textureSampleLevel(fgr_tex, samp, cuv, 0.0).rgb;
-        let interior = smoothstep(p.cov.y, 1.0, raw);
-        fg = mix(f, color, interior);
-    }
     // light wrapping — 배경 빛이 인물 윤곽에 감기는 효과 (screen 블렌드).
     // v-ai에선 단색(#hex)도 image 스테이지를 타므로 색/이미지 배경 공통.
     if (p.bg_mode >= 2u) {
@@ -211,9 +201,7 @@ fn apply_makeup(base: vec3f, cuv: vec2f) -> vec3f {
     }
 
     let pm = smoothstep(p.cov.x, p.cov.y, raw);
-    // 스필 억제/엣지 다크닝은 매팅 모드에서도 살아있는 조정 파라미터다 —
-    // fgr가 오염을 원리적으로 줄이지만 잔여 스필(실제 조명 반사·fgr 추정 오차)은
-    // 남는다. 끄고 싶으면 파라미터를 0으로 (코드로 막지 않는다).
+    // 스필 억제/엣지 다크닝 — 끄고 싶으면 파라미터를 0으로 (코드로 막지 않는다).
     // 단 passthrough(원본 배경)는 v-ai에 스필/엣지 자체가 없다 — 모드로 끈다.
     let edge = clamp(1.0 - abs(pm * 2.0 - 1.0), 0.0, 1.0);
     if (p.bg_mode != 0u) {

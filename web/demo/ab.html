@@ -50,8 +50,10 @@
     <button id="stop" disabled>정지</button>
     <label>ai_engine 모델
       <select id="model">
-        <option value="../models/rvm_256x144_fp16w.sw">가중치 fp16 (7.8MB)</option>
-        <option value="../models/rvm_256x144.sw">fp32 (15.1MB)</option>
+        <option value="../models/rvm_256x144.sw">f16 256×144 (기본)</option>
+        <option value="../models/rvm_320x176.sw">f16 320×176 (고해상 1단)</option>
+        <option value="../models/rvm_352x192.sw">f16 352×192 (고해상 2단)</option>
+        <option value="../models/rvm_512x288.sw">f16 512×288 (정확 16:9, 4배 비용)</option>
       </select>
     </label>
     <label>배경

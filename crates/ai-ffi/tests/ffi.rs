@@ -116,6 +116,121 @@ fn c_surface_smoke() {
     }
 }
 
+/// C 티어 스모크 — set_render_tier(2) 후 같은 시나리오가 GPU 관여 0으로 돈다
+/// (c_surface_smoke의 소프트판 — 단색 배경 Y 실측 동일 기준).
+#[test]
+fn c_surface_smoke_soft_tier() {
+    let _lock = SURFACE_LOCK.lock().unwrap();
+    let Some(path) = model_path() else {
+        eprintln!("모델 없음 — 스킵 (make convert-rvm-web)");
+        return;
+    };
+    unsafe {
+        assert_eq!(ai_ffi::set_render_tier(2), VbResult::Success);
+        let r = ai_ffi::set_video_stream_info(path.as_ptr(), path.len());
+        assert_eq!(r, VbResult::Success, "모델 로드(soft)");
+
+        let json = std::ffi::CString::new(r##"{"background":"#00a05a"}"##).unwrap();
+        assert_eq!(ai_ffi::update_effects_config(json.as_ptr()), VbResult::Success);
+
+        let (w, h) = (FW, FH);
+        let mut y = vec![128u8; w * h];
+        let mut u = vec![128u8; w * h / 4];
+        let mut v = vec![128u8; w * h / 4];
+        let r = ai_ffi::render_mask(
+            y.as_mut_ptr(),
+            u.as_mut_ptr(),
+            v.as_mut_ptr(),
+            w as i32,
+            h as i32,
+            w as i32,
+            (w / 2) as i32,
+            (w / 2) as i32,
+        );
+        assert_eq!(r, VbResult::Success, "render_mask(soft)");
+        let mean_y: f64 = y.iter().map(|&v| v as f64).sum::<f64>() / (w * h) as f64;
+        assert!(
+            (95.0..115.0).contains(&mean_y),
+            "C티어 배경색 Y 기대 ~104, 실측 {mean_y:.1}"
+        );
+
+        // mirror-only도 소프트 경로에서 프레임을 뒤집는다 (호스트 변환 계약)
+        let json = std::ffi::CString::new(r#"{"background":null,"mirror":true}"#).unwrap();
+        assert_eq!(ai_ffi::update_effects_config(json.as_ptr()), VbResult::Success);
+        let mut y2 = vec![0u8; w * h];
+        for (i, p) in y2.iter_mut().enumerate() {
+            *p = if i % w < w / 2 { 40 } else { 200 }; // 좌우 비대칭 패턴
+        }
+        let (mut u2, mut v2) = (vec![128u8; w * h / 4], vec![128u8; w * h / 4]);
+        let r = ai_ffi::render_mask(
+            y2.as_mut_ptr(),
+            u2.as_mut_ptr(),
+            v2.as_mut_ptr(),
+            w as i32,
+            h as i32,
+            w as i32,
+            (w / 2) as i32,
+            (w / 2) as i32,
+        );
+        assert_eq!(r, VbResult::Success, "render_mask(soft mirror)");
+        assert!(y2[0] > 128 && y2[w - 1] < 128, "mirror 미적용: {} {}", y2[0], y2[w - 1]);
+
+        assert_eq!(ai_ffi::destroy_custom_video_stream(), VbResult::Success);
+        assert_eq!(ai_ffi::set_render_tier(0), VbResult::Success); // 다른 테스트 오염 방지
+    }
+}
+
+/// B 티어 스모크 — set_render_tier(1): 세그만 CPU(r11 로짓), 합성·EMA는 GPU.
+/// 단색 배경 Y 실측 기준은 A/C와 동일.
+#[test]
+fn c_surface_smoke_b_tier() {
+    let _lock = SURFACE_LOCK.lock().unwrap();
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
+    let r11 = format!("{root}/web/models/segm_r11_160x288.sw");
+    if !std::path::Path::new(&r11).exists() {
+        eprintln!("skip: segm_r11_160x288.sw 없음");
+        return;
+    }
+    unsafe {
+        assert_eq!(ai_ffi::set_render_tier(1), VbResult::Success);
+        let r = ai_ffi::set_video_stream_info(r11.as_ptr(), r11.len());
+        assert_eq!(r, VbResult::Success, "r11 CPU 로드(b)");
+
+        let json = std::ffi::CString::new(r##"{"background":"#00a05a"}"##).unwrap();
+        assert_eq!(ai_ffi::update_effects_config(json.as_ptr()), VbResult::Success);
+
+        let (w, h) = (FW, FH);
+        let mut y = vec![128u8; w * h];
+        let mut u = vec![128u8; w * h / 4];
+        let mut v = vec![128u8; w * h / 4];
+        // EMA(로짓 0.03/0.9)가 GPU에서 수렴하도록 수 프레임
+        for _ in 0..8 {
+            y.fill(128);
+            u.fill(128);
+            v.fill(128);
+            let r = ai_ffi::render_mask(
+                y.as_mut_ptr(),
+                u.as_mut_ptr(),
+                v.as_mut_ptr(),
+                w as i32,
+                h as i32,
+                w as i32,
+                (w / 2) as i32,
+                (w / 2) as i32,
+            );
+            assert_eq!(r, VbResult::Success, "render_mask(b)");
+        }
+        let mean_y: f64 = y.iter().map(|&v| v as f64).sum::<f64>() / (w * h) as f64;
+        assert!(
+            (95.0..115.0).contains(&mean_y),
+            "B티어 배경색 Y 기대 ~104, 실측 {mean_y:.1}"
+        );
+
+        assert_eq!(ai_ffi::destroy_custom_video_stream(), VbResult::Success);
+        assert_eq!(ai_ffi::set_render_tier(0), VbResult::Success);
+    }
+}
+
 /// 신규 표면 스모크 — 단일 JSON 설정으로 집중도(실추론) + 결과 폴링 + 오디오 +
 /// destroy=리셋(웜 재가동)까지. 모델 없으면 스킵.
 #[test]

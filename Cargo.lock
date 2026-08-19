@@ -79,6 +79,7 @@ dependencies = [
  "jni",
  "log",
  "pollster",
+ "serde_json",
 ]
 
 [[package]]

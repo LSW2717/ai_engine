@@ -374,12 +374,31 @@ async function main() {
   video.muted = true;
   await video.play();
 
+  // 로드 베일 — 카메라가 뜨는 즉시 강블러 원본 + "화면 조정 중" (studio.html 참조).
+  // 베일 안에 video를 넣어도 drawImage 소스로는 계속 쓸 수 있다 (hidden 이후 포함)
+  const veil = $('veil');
+  veil.prepend(video);
+  veil.hidden = false;
+  // 해제는 페이드아웃 — 합성 화면이 이미 밑에 그려진 뒤라 자연스럽게 겹쳐 사라진다.
+  // 페이드 끝나면 hidden으로 완전 제거 (베일 속 video 렌더 비용 차단)
+  let veilGone = false;
+  const veilFade = () => {
+    if (veilGone) return;
+    veilGone = true;
+    veil.classList.add('fade');
+    setTimeout(() => (veil.hidden = true), 700); // transition .6s + 여유
+  };
+
   say('엔진 초기화…');
   await loadAiWasm();
   if (!navigator.gpu) throw new Error('WebGPU 미지원');
   await aiMod.init_engine();
   const bytes = new Uint8Array(
-    await (await fetch('../models/rvm_256x144.sw')).arrayBuffer()
+    // ?seg=256|320|352|512 로 해상도 선택 (기본 512 — 고해상 실험 중)
+    await (await fetch(`../models/rvm_${
+      { 256: '256x144', 320: '320x176', 352: '352x192', 512: '512x288' }[QS.get('seg')] ??
+      '512x288'
+    }.sw`)).arrayBuffer()
   );
   const seg = (await aiMod.load_model_h(bytes)).handle;
   aiMod.studio_attach($('out'));
@@ -394,6 +413,7 @@ async function main() {
   src.height = video.videoHeight || 720;
   const sctx = src.getContext('2d');
   if (PERF) {
+    veil.hidden = true; // 측정 모드 — 베일이 캔버스를 가리면 곤란
     say('페이싱 측정 중…');
     await perfProtocol(seg, src, sctx, video);
     return;
@@ -590,6 +610,7 @@ async function main() {
       } else {
         await submitFrame();
       }
+      veilFade(); // 첫 합성 프레임 나감 — 조정 끝, 페이드아웃
       // 3D 아이템 + 집중도 — FaceTask 랜드마크 공유 (얼굴 lm 1회 추론 공유가
       // v-ai 이중 로드 낭비의 수리 지점). 아이템은 매 프레임(오버레이 부드러움),
       // 집중도만 켜져 있으면 비전 틱 10fps(웹 visionFps)로 페이싱.
@@ -719,6 +740,7 @@ async function main() {
 
 $('start').addEventListener('click', () => {
   main().catch((e) => {
+    $('veil').hidden = true; // 베일 유지 = "조정 중" 거짓말 — 에러는 status로
     say('오류: ' + e);
     log(`studio fatal ${String(e).slice(0, 200)}`);
     log('studio-done');

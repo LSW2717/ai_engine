@@ -60,9 +60,47 @@ pub fn rgba_to_i420(
     }
 }
 
+/// RGBA 프레임 뒤집기 — mirror(수평) / 180도 회전(수평+수직). 프레임 변환은
+/// 호스트 몫 계약이라 모바일 호스트(ffi)가 추론 전에 적용한다 (웹 워커 전처리 등가).
+pub fn flip_rgba(rgba: &mut [u8], w: usize, h: usize, flip_h: bool, flip_v: bool) {
+    let stride = w * 4;
+    if flip_h {
+        for row in rgba[..stride * h].chunks_exact_mut(stride) {
+            for x in 0..w / 2 {
+                let (a, b) = (x * 4, (w - 1 - x) * 4);
+                for k in 0..4 {
+                    row.swap(a + k, b + k);
+                }
+            }
+        }
+    }
+    if flip_v {
+        for yy in 0..h / 2 {
+            let (top, bottom) = rgba.split_at_mut((h - 1 - yy) * stride);
+            top[yy * stride..(yy + 1) * stride].swap_with_slice(&mut bottom[..stride]);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flip_h_v() {
+        // 2×2 픽셀 인덱스 [0,1 / 2,3] — R 채널에 인덱스 기록
+        let base: Vec<u8> = (0..4u8).flat_map(|i| [i, 0, 0, 255]).collect();
+        let r = |buf: &[u8]| [buf[0], buf[4], buf[8], buf[12]];
+        let mut m = base.clone();
+        flip_rgba(&mut m, 2, 2, true, false);
+        assert_eq!(r(&m), [1, 0, 3, 2], "수평");
+        let mut m = base.clone();
+        flip_rgba(&mut m, 2, 2, false, true);
+        assert_eq!(r(&m), [2, 3, 0, 1], "수직");
+        let mut m = base.clone();
+        flip_rgba(&mut m, 2, 2, true, true);
+        assert_eq!(r(&m), [3, 2, 1, 0], "180도");
+    }
 
     #[test]
     fn roundtrip_flat_colors() {

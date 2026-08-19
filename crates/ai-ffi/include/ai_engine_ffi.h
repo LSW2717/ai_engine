@@ -23,6 +23,13 @@ typedef enum VbResult {
 typedef struct FeHandle FeHandle;
 
 /**
+ * 렌더 티어 선언 — 0=A(GPU), 1=B(CPU 추론+GPU 합성), 2=C(GPU 완전 회피).
+ * 모델 주입 전에 호출해야 한다. B/C 전환 시 세그 모델(경량 CPU용)을
+ * set_video_stream_info로 다시 주입하는 것까지가 호스트 몫.
+ */
+enum VbResult set_render_tier(int tier);
+
+/**
  * 세그(.sw) 모델 경로 — vcxrust_ai와 동일 시그니처(ptr+len, NUL 아님·UTF-8)
  *
  * # Safety

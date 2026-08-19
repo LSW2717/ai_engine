@@ -48,6 +48,15 @@ macro_rules! cpath {
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_com_cloudwebrtc_webrtc_AiEngine_setRenderTier(
+    _env: JNIEnv,
+    _cls: JClass,
+    tier: jint,
+) -> jint {
+    crate::set_render_tier(tier) as jint
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_com_cloudwebrtc_webrtc_AiEngine_setVideoStreamInfo(
     mut env: JNIEnv,
     _cls: JClass,
