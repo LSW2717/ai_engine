@@ -28,6 +28,8 @@ use serde::Deserialize;
 
 use crate::detect::gpu::GpuPre;
 use crate::error::TaskError;
+use crate::features::avatar::{AvatarBg, AvatarOverlay};
+use crate::features::vb::params::Background;
 use crate::features::face::items3d::ItemsOverlay;
 use crate::features::face::FaceTask;
 use crate::features::gaze::GazeTask;
@@ -65,6 +67,28 @@ impl Default for FaceItems {
 impl FaceItems {
     fn any(&self) -> bool {
         self.enabled && (self.hat != "none" || self.eyewear != "none" || self.beard != "none")
+    }
+}
+
+/// VRM 아바타 모드 — 켜지면 카메라 프레임을 통째로 대체한다. 세그/합성/아이템/
+/// 터치업·메이크업은 엔진 레벨에서 전부 스킵 (상호배타 — 프레임엔 아바타만).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AvatarMode {
+    pub enabled: bool,
+    /// 프리셋 이름 — set_avatar_vrm(wasm 선주입) / glb_loader "vrm/{model}"(ffi) 키
+    pub model: String,
+}
+
+impl Default for AvatarMode {
+    fn default() -> Self {
+        AvatarMode { enabled: false, model: String::new() }
+    }
+}
+
+impl AvatarMode {
+    fn any(&self) -> bool {
+        self.enabled && !self.model.is_empty()
     }
 }
 
@@ -106,6 +130,8 @@ struct TasksPatch {
     hand_detection: Option<Option<HandDetection>>,
     #[serde(deserialize_with = "double")]
     focus_detection: Option<Option<FocusDetection>>,
+    #[serde(deserialize_with = "double")]
+    avatar: Option<Option<AvatarMode>>,
 }
 
 /// 모델 종류 키 (`set_model`) — 문서화된 유일한 이름들
@@ -113,6 +139,14 @@ pub const MODEL_KINDS: [&str; 7] =
     ["seg", "face_det", "face_lm", "gaze", "gaze_bs", "hand_det", "hand_lm"];
 
 const GESTURE_QUEUE_CAP: usize = 16;
+
+/// 아바타 팔/손가락용 손 추적 fps — 제스처(기본 10)보다 촘촘해야 팔이 부드럽다.
+/// 검출 사이는 rig 스무딩(0.5 lerp + strength 램프)이 보간한다.
+const AVATAR_HAND_FPS: f32 = 20.0;
+
+/// 아바타 손 추적 스위치 — **off: 팔은 차렷 고정** (사용자 지정 2026-08-26).
+/// IK/손가락 파이프라인은 살아 있으므로 true 로만 바꾸면 추적 재개.
+const AVATAR_HAND_TRACKING: bool = false;
 
 fn gesture_name(g: Gesture) -> &'static str {
     match g {
@@ -146,10 +180,19 @@ pub struct Director {
     gestures: GestureClassifier,
     gesture_queue: VecDeque<GestureEvent>,
     gaze: Option<(GazeTask, GpuSession, Option<GpuSession>)>,
+    avatar: Option<AvatarOverlay>,
+    /// 조달 시도한 VRM 이름 (실패도 기록 — 재시도 스팸 방지, items_loaded 규약)
+    avatar_loaded: HashSet<String>,
     face_items: Option<FaceItems>,
     hand_cfg: Option<HandDetection>,
     focus_cfg: Option<FocusDetection>,
+    avatar_cfg: Option<AvatarMode>,
     last_face: Option<Vec<[f32; 3]>>,
+    /// 아바타용 손 21pt(픽셀) 최신 관측 + 시각 — 오래되면(>400ms) 미사용
+    last_avatar_hands: Vec<[[f32; 2]; 21]>,
+    last_avatar_hands_ms: f64,
+    /// 배경 이미지 사본 — 아바타 오버레이가 (재)생성될 때 재업로드용
+    bg_cache: Option<(Vec<u8>, u32, u32)>,
     last_focus_ms: f64,
     last_hand_ms: f64,
     probe_tick: u32,
@@ -172,10 +215,16 @@ impl Director {
             gestures: GestureClassifier::default(),
             gesture_queue: VecDeque::new(),
             gaze: None,
+            avatar: None,
+            avatar_loaded: HashSet::new(),
             face_items: None,
             hand_cfg: None,
             focus_cfg: None,
+            avatar_cfg: None,
             last_face: None,
+            last_avatar_hands: Vec::new(),
+            last_avatar_hands_ms: f64::NEG_INFINITY,
+            bg_cache: None,
             last_focus_ms: f64::NEG_INFINITY,
             last_hand_ms: f64::NEG_INFINITY,
             probe_tick: 0,
@@ -216,6 +265,12 @@ impl Director {
                 self.last_focus = None;
             }
         }
+        if let Some(v) = t.avatar {
+            self.avatar_cfg = v.filter(|a| a.any());
+            if let (Some(cfg), Some(av)) = (&self.avatar_cfg, &mut self.avatar) {
+                av.set_active(&cfg.model);
+            }
+        }
         Ok(())
     }
 
@@ -231,9 +286,14 @@ impl Director {
         }
     }
 
-    /// 배경 이미지 (RGBA8) — EffectsPatch background:"image"가 이걸 쓴다
+    /// 배경 이미지 (RGBA8) — EffectsPatch background:"image"가 이걸 쓴다.
+    /// 아바타 모드도 같은 배경을 아바타 뒤에 깐다 (오버레이 재생성 대비 사본 유지).
     pub fn set_background_image(&mut self, ctx: &GpuContext, rgba: &[u8], w: u32, h: u32) {
         self.pipeline.set_background_image(ctx, rgba, w, h);
+        if let Some(av) = &mut self.avatar {
+            av.set_background_image(ctx, rgba, w, h);
+        }
+        self.bg_cache = Some((rgba.to_vec(), w, h));
     }
 
     /// 모델 바이트 주입 — kind는 `MODEL_KINDS` 참조. 같은 kind 재주입 = 교체
@@ -261,6 +321,29 @@ impl Director {
         self.glb_loader = Some(f);
     }
 
+    /// VRM 아바타 선주입 (프리셋당 1회 — 호스트 fetch). ffi 는 대신
+    /// glb_loader("vrm/{name}") 지연 조달 경로를 쓴다.
+    pub fn set_avatar_vrm(
+        &mut self,
+        ctx: &GpuContext,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<(), TaskError> {
+        if self.avatar.is_none() {
+            self.avatar = Some(AvatarOverlay::new(ctx).map_err(TaskError::Other)?);
+        }
+        self.avatar
+            .as_mut()
+            .unwrap()
+            .preload_vrm(ctx, name, bytes)
+            .map_err(TaskError::Other)?;
+        self.avatar_loaded.insert(name.to_string());
+        if let Some(cfg) = &self.avatar_cfg {
+            self.avatar.as_mut().unwrap().set_active(&cfg.model);
+        }
+        Ok(())
+    }
+
     /// GLB 선주입 (종류당 1회 — 호스트 fetch)
     pub fn set_item_glb(
         &mut self,
@@ -278,9 +361,16 @@ impl Director {
 
     // ── 활성 판정 (호스트의 passthrough/타깃 결정 근거) ──
 
-    /// 세그+합성(비디오 경로)이 필요한가 — 3D 아이템도 합성 타깃이 필요하다
+    /// 세그+합성(비디오 경로)이 필요한가 — 3D 아이템도 합성 타깃이 필요하다.
+    /// 아바타는 target 은 필요하지만 세그는 아니다 (avatar_active 로 분기).
     pub fn needs_render(&self) -> bool {
-        self.pipeline.state.any_active() || self.face_items.is_some()
+        self.pipeline.state.any_active() || self.face_items.is_some() || self.avatar_cfg.is_some()
+    }
+
+    /// 아바타 모드 활성 — 켜지면 다른 영상 처리(세그/합성/아이템/fx)는 전부
+    /// 스킵된다 (상호배타는 엔진이 보장, UI 는 표시만)
+    pub fn avatar_active(&self) -> bool {
+        self.avatar_cfg.is_some()
     }
 
     /// analyzer 태스크(손/집중도)가 켜져 있는가
@@ -303,8 +393,12 @@ impl Director {
         let hand_due = self.hand_cfg.as_ref().map(|c| {
             t_ms - self.last_hand_ms >= 1000.0 / c.detect_fps.max(1.0) as f64
         });
+        // 아바타 팔/손가락 — 손 CNN 이 rgb 픽셀을 요구한다 (추적 스위치 on 일 때만)
+        let avatar_hand_due = AVATAR_HAND_TRACKING
+            && self.avatar_cfg.is_some()
+            && t_ms - self.last_hand_ms >= 1000.0 / AVATAR_HAND_FPS as f64;
         let probe_due = self.face_items.is_some() && self.probe_tick % 8 == 0;
-        focus_due.unwrap_or(false) || hand_due.unwrap_or(false) || probe_due
+        focus_due.unwrap_or(false) || hand_due.unwrap_or(false) || avatar_hand_due || probe_due
     }
 
     // ── 프레임 ──
@@ -319,7 +413,7 @@ impl Director {
         h: u32,
         f: impl FnOnce(&wgpu::Texture) -> R,
     ) -> Result<R, TaskError> {
-        if self.needs_render() {
+        if self.needs_render() && !self.avatar_active() {
             self.ensure_seg(ctx).await?;
             let seg = self
                 .seg
@@ -327,7 +421,8 @@ impl Director {
                 .ok_or_else(|| TaskError::Other("seg 모델 미주입 (set_model \"seg\")".into()))?;
             self.pipeline.with_frame_texture(ctx, seg, w, h, f)
         } else {
-            // analyzer-only: 마스크 경로를 안 쓰므로 EMA 해상도는 형식값
+            // analyzer-only/아바타: 마스크 경로를 안 쓰므로 EMA 해상도는 형식값
+            // (아바타는 프레임 텍스처를 FaceTask 입력으로만 쓴다 — 세그 세션 불필요)
             self.pipeline.with_frame_texture_nogpu(ctx, w, h, (2, 2), f)
         }
     }
@@ -358,7 +453,13 @@ impl Director {
         rgb: Option<&[u8]>,
         t_ms: f64,
     ) -> Result<(), TaskError> {
-        if self.pipeline.state.any_active() || self.face_items.is_some() {
+        if self.avatar_active() {
+            // 아바타 모드: 세그/합성 통째로 스킵 — target 은 run_tasks 의
+            // 아바타 렌더가 clear+draw 로 전부 채운다
+            if target.is_none() {
+                return Err(TaskError::Other("avatar 모드인데 target 없음".into()));
+            }
+        } else if self.pipeline.state.any_active() || self.face_items.is_some() {
             let target = target.ok_or_else(|| {
                 TaskError::Other("needs_render()인데 target 없음".into())
             })?;
@@ -404,13 +505,17 @@ impl Director {
         rgb: Option<&[u8]>,
         t_ms: f64,
     ) -> Result<(), TaskError> {
-        // 얼굴 소비자 (아이템·터치업/메이크업·집중도)
-        let fx_on = self.pipeline.state.touch_up.is_some() || self.pipeline.state.makeup.is_some();
+        // 얼굴 소비자 (아이템·터치업/메이크업·집중도·아바타)
+        let avatar_on = self.avatar_active();
+        // 아바타 모드에선 fx 래스터라이즈도 스킵 (합성 자체가 안 돌므로)
+        let fx_on = !avatar_on
+            && (self.pipeline.state.touch_up.is_some() || self.pipeline.state.makeup.is_some());
         let focus_due = match &self.focus_cfg {
             Some(c) => t_ms - self.last_focus_ms >= 1000.0 / c.detect_fps.max(1.0) as f64,
             None => false,
         };
-        let want_face = self.face_items.is_some() || fx_on || focus_due;
+        let want_face =
+            (self.face_items.is_some() && !avatar_on) || fx_on || focus_due || avatar_on;
         let mut face_count = 0usize;
         if want_face && self.ensure_face(ctx).await? {
             let view = self
@@ -427,10 +532,17 @@ impl Director {
             self.last_face = r.map(|f| f.points);
             // 터치업/메이크업 오버레이 (off·소실이면 내부 no-op/해제)
             self.pipeline.update_face_fx(ctx, self.last_face.as_deref());
+        } else {
+            // 얼굴 태스크가 안 도는 프레임 — face_fx uniform 을 반드시 해제한다.
+            // 이펙트를 끄면 fx_on=false 로 이 블록 자체가 스킵되는데, 마지막
+            // 프레임의 mk_map/tu_map 이 compose uniform 에 남아 입술/터치업
+            // 오버레이가 마지막 얼굴 위치에 고정 표시된다. update_face_fx(None)
+            // 은 기본값(전부 0 = 셰이더 no-op) 대입뿐이라 프레임당 비용이 없다.
+            self.pipeline.update_face_fx(ctx, None);
         }
 
-        // 3) 3D 아이템 — 합성 위 오버레이 (프레이밍 크롭 동행)
-        if let Some(fi) = self.face_items.clone() {
+        // 3) 3D 아이템 — 합성 위 오버레이 (프레이밍 크롭 동행). 아바타 모드는 스킵.
+        if let Some(fi) = self.face_items.clone().filter(|_| !avatar_on) {
             if let Some(target) = target {
                 self.ensure_items(ctx, &fi)?;
                 if let Some(items) = &mut self.items {
@@ -481,17 +593,21 @@ impl Director {
             }
         }
 
-        // 5) 손 제스처 (detectFps 페이싱 — rgb 필요)
-        let hand_due = match &self.hand_cfg {
+        // 5) 손 (detectFps 페이싱 — rgb 필요): 제스처 분류 + 아바타 팔/손가락 입력
+        let gesture_due = match &self.hand_cfg {
             Some(c) => t_ms - self.last_hand_ms >= 1000.0 / c.detect_fps.max(1.0) as f64,
             None => false,
         };
-        if hand_due {
+        let avatar_hand_due = AVATAR_HAND_TRACKING
+            && avatar_on
+            && t_ms - self.last_hand_ms >= 1000.0 / AVATAR_HAND_FPS as f64;
+        if gesture_due || avatar_hand_due {
             if let Some(rgb) = rgb {
                 if self.ensure_hand(ctx).await? {
                     self.last_hand_ms = t_ms;
                     let (task, det, lm) = self.hand.as_mut().unwrap();
                     let hands = task.process_gpu(ctx, det, lm, rgb, fw, fh, t_ms).await?;
+                    let mut px_hands: Vec<[[f32; 2]; 21]> = Vec::with_capacity(hands.len());
                     let snaps: Vec<HandSnapshot> = hands
                         .iter()
                         .map(|h| {
@@ -499,25 +615,71 @@ impl Director {
                             for (i, p) in h.points.iter().take(21).enumerate() {
                                 landmarks[i] = [p[0], p[1]];
                             }
+                            px_hands.push(landmarks);
                             let handedness = if h.handedness > 0.5 {
                                 Handedness::Left
                             } else {
                                 Handedness::Right
                             };
-                            HandSnapshot { landmarks, handedness }
+                            HandSnapshot { landmarks, handedness, presence: h.presence }
                         })
                         .collect();
-                    let filter = self.hand_cfg.as_ref().map(|c| c.gestures.clone()).unwrap_or_default();
-                    for ev in self.gestures.classify(&snaps, t_ms) {
-                        if !filter.is_empty()
-                            && !filter.iter().any(|g| g == gesture_name(ev.gesture))
-                        {
-                            continue;
+                    if avatar_on {
+                        self.last_avatar_hands = px_hands;
+                        self.last_avatar_hands_ms = t_ms;
+                    }
+                    if self.hand_cfg.is_some() {
+                        let filter =
+                            self.hand_cfg.as_ref().map(|c| c.gestures.clone()).unwrap_or_default();
+                        for ev in self.gestures.classify(&snaps, t_ms) {
+                            if !filter.is_empty()
+                                && !filter.iter().any(|g| g == gesture_name(ev.gesture))
+                            {
+                                continue;
+                            }
+                            if self.gesture_queue.len() >= GESTURE_QUEUE_CAP {
+                                self.gesture_queue.pop_front(); // 가장 오래된 것 드랍
+                            }
+                            self.gesture_queue.push_back(ev);
                         }
-                        if self.gesture_queue.len() >= GESTURE_QUEUE_CAP {
-                            self.gesture_queue.pop_front(); // 가장 오래된 것 드랍
-                        }
-                        self.gesture_queue.push_back(ev);
+                    }
+                }
+            }
+        }
+
+        // 6) 아바타 — 프레임 전체 대체 (배경 clear + 스킨 메시). 손 블록 뒤 =
+        // 이번 틱 손 관측을 지연 없이 소비. 손 관측이 오래되면(>400ms) 비운다 —
+        // rig 가 팔을 rest 로 감쇠 복귀시킨다.
+        if avatar_on {
+            if let Some(target) = target {
+                if let Some(cfg) = self.avatar_cfg.clone() {
+                    self.ensure_avatar(ctx, &cfg)?;
+                    let hands: &[[[f32; 2]; 21]] =
+                        if AVATAR_HAND_TRACKING && t_ms - self.last_avatar_hands_ms <= 400.0 {
+                            &self.last_avatar_hands
+                        } else {
+                            &[]
+                        };
+                    // VB 배경 선택을 아바타 배경으로 매핑 (blur 는 카메라 픽셀
+                    // 개념이라 아바타에선 의미 없음 — Studio 폴백)
+                    let bg = match &self.pipeline.state.background {
+                        Background::Image => AvatarBg::Image,
+                        Background::Color(c) => AvatarBg::Color(*c),
+                        Background::None => AvatarBg::Studio,
+                    };
+                    if let Some(av) = &mut self.avatar {
+                        av.set_active(&cfg.model);
+                        av.draw(
+                            ctx,
+                            target,
+                            self.target_format,
+                            fw,
+                            fh,
+                            self.last_face.as_deref(),
+                            hands,
+                            bg,
+                            t_ms,
+                        );
                     }
                 }
             }
@@ -605,6 +767,8 @@ impl Director {
         self.pre = None;
         self.items = None;
         self.items_loaded.clear();
+        self.avatar = None;
+        self.avatar_loaded.clear();
     }
 
     // ── 지연 로드 ──
@@ -661,6 +825,32 @@ impl Director {
             self.hand = Some((HandTask::new(2), det, lm));
         }
         Ok(true)
+    }
+
+    fn ensure_avatar(&mut self, ctx: &GpuContext, cfg: &AvatarMode) -> Result<(), TaskError> {
+        if self.avatar.is_none() {
+            let mut av = AvatarOverlay::new(ctx).map_err(TaskError::Other)?;
+            if let Some((rgba, w, h)) = &self.bg_cache {
+                av.set_background_image(ctx, rgba, *w, *h);
+            }
+            self.avatar = Some(av);
+        }
+        // VRM 지연 조달 (ffi 로더 경로 — wasm 은 set_avatar_vrm 선주입이라 로더 없음)
+        let name = cfg.model.as_str();
+        if !self.avatar_loaded.contains(name) {
+            if let Some(loader) = &self.glb_loader {
+                if let Some(bytes) = loader(&format!("vrm/{name}")) {
+                    self.avatar
+                        .as_mut()
+                        .unwrap()
+                        .preload_vrm(ctx, name, &bytes)
+                        .map_err(TaskError::Other)?;
+                }
+            }
+            // 실패도 기록 — 없는 에셋 재시도 스팸 방지 (items_loaded 규약)
+            self.avatar_loaded.insert(name.to_string());
+        }
+        Ok(())
     }
 
     fn ensure_items(&mut self, ctx: &GpuContext, fi: &FaceItems) -> Result<(), TaskError> {

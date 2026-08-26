@@ -39,6 +39,7 @@ enum Pending {
     Config(String),
     Model(String, Vec<u8>),
     Glb(String, Vec<u8>),
+    AvatarVrm(String, Vec<u8>),
     BgImage(Vec<u8>, u32, u32),
     Layout(String),
     Detach,
@@ -58,6 +59,9 @@ fn apply_op(ctx: &GpuContext, vb: &mut Vb, op: Pending) -> Result<(), JsValue> {
         Pending::Config(json) => vb.director.apply_json(&json).map_err(js_err),
         Pending::Model(kind, bytes) => vb.director.set_model(&kind, bytes).map_err(js_err),
         Pending::Glb(kind, bytes) => vb.director.set_item_glb(ctx, &kind, &bytes).map_err(js_err),
+        Pending::AvatarVrm(name, bytes) => {
+            vb.director.set_avatar_vrm(ctx, &name, &bytes).map_err(js_err)
+        }
         Pending::BgImage(rgba, w, h) => {
             vb.director.set_background_image(ctx, &rgba, w, h);
             Ok(())
@@ -181,6 +185,12 @@ pub fn vb_model(kind: String, bytes: Vec<u8>) -> Result<(), JsValue> {
 #[wasm_bindgen]
 pub fn vb_glb(kind: String, bytes: Vec<u8>) -> Result<(), JsValue> {
     submit(Pending::Glb(kind, bytes))
+}
+
+/// VRM 아바타 바이트 주입 (프리셋당 1회 — 호스트 fetch). 비행 중 큐잉.
+#[wasm_bindgen]
+pub fn vb_avatar_vrm(name: String, bytes: Vec<u8>) -> Result<(), JsValue> {
+    submit(Pending::AvatarVrm(name, bytes))
 }
 
 /// 배경 이미지 (RGBA8) — background:"image"가 소비. 비행 중 큐잉.

@@ -132,6 +132,11 @@ impl DetectorPost {
         }
     }
 
+    /// 검출 점수 문턱 조정 — 튜닝/실험용 (프리셋 기본 0.5)
+    pub fn set_min_score(&mut self, v: f32) {
+        self.opts.min_score = v;
+    }
+
     /// 모델 입력 크기 (호스트가 레터박스 캔버스를 이 크기로 만든다)
     pub fn input_size(&self) -> (u32, u32) {
         (self.input_w, self.input_h)

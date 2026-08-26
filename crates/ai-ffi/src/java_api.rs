@@ -33,6 +33,23 @@ use jni::JNIEnv;
 
 use crate::VbResult;
 
+/// logcat 로거 — 라이브러리 로드 시 1회. 없으면 log:: 매크로(ffi_log 포함)가 전부
+/// no-op 이라 GPU 초기화/모델 로드 실패 원인을 기기에서 볼 방법이 없다 (프로브가
+/// ok=false 만 남기고 이유는 사라졌던 실사고 2026-08-21). 태그 "ai-ffi".
+#[unsafe(no_mangle)]
+pub extern "system" fn JNI_OnLoad(
+    _vm: *mut std::ffi::c_void,
+    _reserved: *mut std::ffi::c_void,
+) -> jint {
+    android_logger::init_once(
+        android_logger::Config::default()
+            .with_max_level(log::LevelFilter::Info)
+            .with_tag("ai-ffi"),
+    );
+    log::info!("ai-ffi loaded");
+    jni::sys::JNI_VERSION_1_6
+}
+
 fn jstr(env: &mut JNIEnv, s: &JString) -> Option<String> {
     env.get_string(s).ok().map(|v| v.into())
 }

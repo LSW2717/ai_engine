@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<title>hand_test — 손 검출/판정 실시간 확인</title>
+<style>
+  body { margin: 0; background: #111; color: #eee; font: 13px/1.5 -apple-system, monospace; display: flex; }
+  #stage { position: relative; }
+  canvas { display: block; }
+  #clapFlash {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    font-size: 120px; opacity: 0; pointer-events: none; transition: opacity .12s;
+  }
+  #panel { padding: 12px 16px; width: 380px; }
+  #handCount { font-size: 42px; font-weight: 700; }
+  #handCount.two { color: #ff5252; }
+  .hand0 { color: #4caf50; } .hand1 { color: #ff5252; }
+  #events { max-height: 200px; overflow-y: auto; font-size: 12px; }
+  #ticks { max-height: 260px; overflow-y: auto; font-size: 11px; white-space: pre; color: #9e9e9e; }
+  .muted { color: #757575; }
+  h3 { margin: 12px 0 4px; font-size: 13px; color: #bdbdbd; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="cv" width="1280" height="720"></canvas>
+  <div id="clapFlash">👏</div>
+</div>
+<div id="panel">
+  <div>backend: <span id="backend" class="muted">로딩…</span> · detectFps 15</div>
+  <div id="handCount">hands: -</div>
+  <div id="pairInfo" class="muted"></div>
+  <h3>손 상세</h3>
+  <div id="handInfo"></div>
+  <h3>제스처 이벤트 (판정 = 프로덕션 wasm 그대로)</h3>
+  <div id="events"></div>
+  <h3>틱 로그 (t, n손, d, cd, 라벨)</h3>
+  <div id="ticks"></div>
+</div>
+<script type="module">
+const FPS = 15;
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+const flash = document.getElementById('clapFlash');
+const $ = (id) => document.getElementById(id);
+
+// ── wasm 로드 — v-ai vision.worker.ts 와 동일 시퀀스 ──
+let ai, hDet, hLm, handTask, gestureTask, backend;
+async function loadEngine() {
+  try {
+    ai = await import('./pkg-relaxed/ai_engine.js');
+    await ai.default();
+  } catch {
+    ai = await import('./pkg/ai_engine.js');
+    await ai.default();
+  }
+  const bytes = async (u) => new Uint8Array(await (await fetch(u)).arrayBuffer());
+  const [det, lm] = await Promise.all([
+    bytes('./models/mediapipe/hand_detector.sw'),
+    bytes('./models/mediapipe/hand_landmarks.sw'),
+  ]);
+  try {
+    await ai.init_engine();
+    hDet = (await ai.load_model_h(det)).handle;
+    hLm = (await ai.load_model_h(lm)).handle;
+    backend = 'gpu';
+  } catch (e) {
+    console.warn('WebGPU 불가 — CPU 폴백:', e);
+    hDet = ai.load_model_cpu_h(det).handle;
+    hLm = ai.load_model_cpu_h(lm).handle;
+    backend = 'cpu';
+  }
+  handTask = ai.hand_task_new(2);
+  gestureTask = ai.gesture_new();
+  $('backend').textContent = backend;
+}
+
+// ── 기하 (gesture.rs 동일 공식 — 표시용 재계산) ──
+const TIPS = [4, 8, 12, 16, 20];
+const MCPS = [5, 9, 13, 17];
+const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
+const palmWidth = (p) => dist(p[5], p[17]);
+const palmCenter = (p) => {
+  let x = 0, y = 0;
+  for (const i of MCPS) { x += p[i][0]; y += p[i][1]; }
+  return [x / 4, y / 4];
+};
+const axisDeg = (p) =>
+  Math.abs(Math.atan2(p[9][0] - p[0][0], -(p[9][1] - p[0][1])) * 180 / Math.PI);
+const minTipDist = (a, b) => {
+  let best = Infinity;
+  for (const i of TIPS) for (const j of TIPS) best = Math.min(best, dist(a[i], b[j]));
+  return best;
+};
+
+// ── 카메라 ──
+const video = document.createElement('video');
+video.muted = true; video.playsInline = true;
+const stream = await navigator.mediaDevices.getUserMedia({
+  video: { width: 1280, height: 720 },
+});
+video.srcObject = stream;
+await video.play();
+cv.width = video.videoWidth; cv.height = video.videoHeight;
+
+await loadEngine();
+
+// RGB 추출 (워커 동일 — 재사용 캔버스)
+const rgbCv = new OffscreenCanvas(cv.width, cv.height);
+const rgbCtx = rgbCv.getContext('2d', { willReadFrequently: true });
+function extractRgb() {
+  rgbCtx.drawImage(video, 0, 0, cv.width, cv.height);
+  const d = rgbCtx.getImageData(0, 0, cv.width, cv.height).data;
+  const rgb = new Uint8Array(cv.width * cv.height * 3);
+  for (let i = 0, j = 0; i < d.length; i += 4, j += 3) {
+    rgb[j] = d[i]; rgb[j + 1] = d[i + 1]; rgb[j + 2] = d[i + 2];
+  }
+  return rgb;
+}
+
+// 뼈대 연결 (MediaPipe hands)
+const BONES = [
+  [0,1],[1,2],[2,3],[3,4], [0,5],[5,6],[6,7],[7,8], [5,9],[9,10],[10,11],[11,12],
+  [9,13],[13,14],[14,15],[15,16], [13,17],[17,18],[18,19],[19,20], [0,17],
+];
+const COLORS = ['#4caf50', '#ff5252'];
+
+const t0 = performance.now();
+let clapCount = 0;
+const tickLines = [];
+let busy = false;
+
+async function tick() {
+  if (busy || video.readyState < 2) return;
+  busy = true;
+  try {
+    const ts = performance.now() - t0;
+    const rgb = extractRgb();
+    const results = backend === 'gpu'
+      ? await ai.hand_task_gpu(handTask, hDet, hLm, rgb, cv.width, cv.height, ts)
+      : ai.hand_task_cpu(handTask, hDet, hLm, rgb, cv.width, cv.height, ts);
+
+    // 미러 표시 — 영상과 랜드마크를 같은 변환으로 그린다
+    ctx.save();
+    ctx.setTransform(-1, 0, 0, 1, cv.width, 0);
+    ctx.drawImage(video, 0, 0, cv.width, cv.height);
+    const pts2d = results.map((r) => r.points.map(([x, y]) => [x, y]));
+    pts2d.forEach((p, hi) => {
+      ctx.strokeStyle = COLORS[hi] ?? '#ffeb3b';
+      ctx.fillStyle = COLORS[hi] ?? '#ffeb3b';
+      ctx.lineWidth = 3;
+      for (const [a, b] of BONES) {
+        ctx.beginPath();
+        ctx.moveTo(p[a][0] * cv.width, p[a][1] * cv.height);
+        ctx.lineTo(p[b][0] * cv.width, p[b][1] * cv.height);
+        ctx.stroke();
+      }
+      for (let i = 0; i < 21; i++) {
+        ctx.beginPath();
+        ctx.arc(p[i][0] * cv.width, p[i][1] * cv.height, TIPS.includes(i) ? 7 : 4, 0, 7);
+        ctx.fill();
+      }
+      const c = palmCenter(p);
+      ctx.lineWidth = 4;
+      ctx.beginPath();
+      ctx.moveTo(c[0] * cv.width - 14, c[1] * cv.height);
+      ctx.lineTo(c[0] * cv.width + 14, c[1] * cv.height);
+      ctx.moveTo(c[0] * cv.width, c[1] * cv.height - 14);
+      ctx.lineTo(c[0] * cv.width, c[1] * cv.height + 14);
+      ctx.stroke();
+    });
+    ctx.restore();
+    // 라벨 텍스트 (미러 밖 — 좌표만 반전해 정방향 글자)
+    pts2d.forEach((p, hi) => {
+      const r = results[hi];
+      const c = palmCenter(p);
+      const label = r.handedness > 0.5 ? 'Left' : 'Right';
+      ctx.fillStyle = COLORS[hi] ?? '#ffeb3b';
+      ctx.font = 'bold 18px monospace';
+      ctx.fillText(
+        `${label} pres=${r.presence.toFixed(2)} pL=${r.handedness.toFixed(2)}`,
+        (1 - c[0]) * cv.width - 60, c[1] * cv.height - 24,
+      );
+    });
+
+    // HUD
+    const n = results.length;
+    $('handCount').textContent = `hands: ${n}`;
+    $('handCount').className = n >= 2 ? 'two' : '';
+    $('handInfo').innerHTML = pts2d.map((p, hi) => {
+      const r = results[hi];
+      return `<div class="hand${hi}">#${hi} ${r.handedness > 0.5 ? 'Left' : 'Right'}` +
+        ` pres=${r.presence.toFixed(2)} pw=${palmWidth(p).toFixed(3)} ax=${axisDeg(p).toFixed(0)}°</div>`;
+    }).join('');
+    let dS = '', cdS = '';
+    if (n >= 2) {
+      const scale = Math.max(palmWidth(pts2d[0]), palmWidth(pts2d[1]), 1e-6);
+      const d = minTipDist(pts2d[0], pts2d[1]) / scale;
+      const acd = dist(palmCenter(pts2d[0]), palmCenter(pts2d[1]));
+      $('pairInfo').textContent =
+        `d=${d.toFixed(2)}팜폭  cd=${(acd / scale).toFixed(2)}팜폭  절대cd=${acd.toFixed(3)}`;
+      dS = d.toFixed(2); cdS = (acd / scale).toFixed(2);
+    } else $('pairInfo').textContent = '';
+
+    // 판정 — 프로덕션 워커와 동일 마샬링
+    const flat = new Float32Array(n * 42);
+    const pLeft = new Float32Array(n);
+    results.forEach((r, i) => {
+      pLeft[i] = r.handedness;
+      for (let j = 0; j < 21; j++) {
+        flat[i * 42 + j * 2] = r.points[j][0];
+        flat[i * 42 + j * 2 + 1] = r.points[j][1];
+      }
+    });
+    const events = ai.gesture_classify(gestureTask, flat, pLeft, ts);
+    for (const e of events) {
+      const line = document.createElement('div');
+      line.textContent = `${(e.tsMs / 1000).toFixed(1)}s ${e.gesture} conf=${e.confidence.toFixed(2)}`;
+      if (e.gesture === 'clap') {
+        clapCount++;
+        line.textContent += `  👏 (누적 ${clapCount})`;
+        line.style.color = '#ffeb3b';
+        flash.style.opacity = '1';
+        setTimeout(() => (flash.style.opacity = '0'), 350);
+      }
+      $('events').prepend(line);
+    }
+
+    tickLines.unshift(
+      `${(ts / 1000).toFixed(2)} n=${n} d=${dS} cd=${cdS} ` +
+      results.map((r) => (r.handedness > 0.5 ? 'L' : 'R')).join('/'),
+    );
+    if (tickLines.length > 40) tickLines.pop();
+    $('ticks').textContent = tickLines.join('\n');
+  } catch (e) {
+    console.error(e);
+  } finally {
+    busy = false;
+  }
+}
+setInterval(tick, 1000 / FPS);
+</script>
+</body>
+</html>

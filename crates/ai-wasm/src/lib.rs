@@ -1371,7 +1371,8 @@ pub fn gesture_classify(
             }
             let handedness =
                 if p > 0.5 { Handedness::Left } else { Handedness::Right };
-            HandSnapshot { landmarks, handedness }
+            // flat API에는 presence가 없다 — 1.0(게이트 통과)로 기존 동작 유지
+            HandSnapshot { landmarks, handedness, presence: 1.0 }
         })
         .collect();
     let events = GESTURES.with(|p| {

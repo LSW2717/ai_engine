@@ -247,6 +247,35 @@ struct FitResult {
     scale: f32,
 }
 
+/// 랜드마크(픽셀 x,y + MediaPipe z) → 카메라계 얼굴 포즈 (쿼터니언, 위치 cm).
+/// render() 내부 피팅 블록과 동일 수식 (동공간격 depth 추정 + 역투영 + Horn) —
+/// 아바타 등 items3d 밖 소비자용 진입점. 스무딩은 소비자 몫.
+pub(crate) fn face_pose_from_landmarks(
+    landmarks: &[[f32; 3]],
+    vw: u32,
+    vh: u32,
+) -> Option<([f32; 4], [f32; 3])> {
+    if landmarks.len() < 468 {
+        return None;
+    }
+    let f = vh as f32 / 2.0 / (METRIC_VFOV_DEG.to_radians() / 2.0).tan();
+    let er = landmarks[159];
+    let el = landmarks[386];
+    let iod_px = ((el[0] - er[0]).powi(2) + (el[1] - er[1]).powi(2))
+        .sqrt()
+        .max(1.0);
+    let depth = ((f * CANON_PUPIL_DIST) / iod_px).max(10.0);
+    let (wf, hf) = (vw as f32, vh as f32);
+    let mut obs = [[0.0f32; 3]; 15];
+    for (i, fp) in FIT_PTS.iter().enumerate() {
+        let p = landmarks[fp.0];
+        let zi = depth + p[2] * (depth / f);
+        obs[i] = [((p[0] - wf / 2.0) * zi) / f, ((hf / 2.0 - p[1]) * zi) / f, -zi];
+    }
+    let fit = fit_pose(&obs);
+    Some((fit.quat, fit.pos))
+}
+
 /// canonical(FIT_PTS) → obs 유사변환 피팅 (Horn 1987 쿼터니언법, 웹 fitPose 이식).
 fn fit_pose(obs: &[[f32; 3]; 15]) -> FitResult {
     const N: usize = 15;

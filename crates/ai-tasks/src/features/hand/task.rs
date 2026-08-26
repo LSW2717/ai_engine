@@ -19,7 +19,7 @@ use ai_gpu::GpuContext;
 
 use crate::detect::letterbox::letterbox_u8_rgb;
 use crate::detect::roi::{crop_u8_rgb, project_landmarks, Roi};
-use crate::detect::{self, Detection, DetectorPost};
+use crate::detect::{Detection, DetectorPost};
 use crate::error::TaskError;
 use crate::session::cpu::CpuSession;
 use crate::session::gpu::GpuSession;
@@ -44,18 +44,33 @@ const PRESENCE_MIN: f32 = 0.5;
 const ASSOC_IOU: f32 = 0.5;
 
 pub struct HandTask {
-    post: &'static DetectorPost,
+    post: DetectorPost,
     num_hands: usize,
     prev_rois: Vec<Roi>,
+    /// 신규 검출 ROI의 presence 문턱 (시드 — 엄격 유지)
+    presence_seed: f32,
+    /// 트래킹 유지 ROI의 presence 문턱 (히스테리시스 — 시드보다 낮출 수 있다)
+    presence_cont: f32,
 }
 
 impl HandTask {
     pub fn new(num_hands: usize) -> Self {
         HandTask {
-            post: detect::preset("palm").expect("palm 프리셋"),
+            post: DetectorPost::palm_full(),
             num_hands: num_hands.max(1),
             prev_rois: Vec::new(),
+            presence_seed: PRESENCE_MIN,
+            presence_cont: PRESENCE_MIN,
         }
+    }
+
+    /// 검출 문턱 조정 — (팜 검출 점수, 시드 presence, 트래킹 유지 presence).
+    /// 시드는 엄격하게 유지하고 유지 문턱만 낮추면 유령 손 없이 접촉/모서리
+    /// 자세에서 트래킹이 살아남는다.
+    pub fn set_thresholds(&mut self, min_score: f32, seed: f32, cont: f32) {
+        self.post.set_min_score(min_score);
+        self.presence_seed = seed;
+        self.presence_cont = cont;
     }
 
     /// 트래킹 상태 폐기 — 다음 프레임은 검출부터
@@ -84,6 +99,55 @@ impl HandTask {
         }
     }
 
+    /// 같은 손 중복 추적 판정 — 팜 중심 거리가 팜폭 대비 임계 미만이면 두 ROI가
+    /// 한 손에 앉은 것. 실측(박수 영상): 중복은 0.5 미만, 진짜 양손은 접촉
+    /// 순간에도 0.9 이상 — 분포가 분리된다.
+    fn same_hand(a: &HandResult, b: &HandResult) -> bool {
+        const DUP_CENTER_DIST: f32 = 0.6; // 팜폭 단위
+        let pcw = |p: &[[f32; 3]]| {
+            let ids = [5usize, 9, 13, 17]; // 네 손가락 MCP
+            let (mut cx, mut cy) = (0f32, 0f32);
+            for &i in &ids {
+                cx += p[i][0];
+                cy += p[i][1];
+            }
+            let w = ((p[5][0] - p[17][0]).powi(2) + (p[5][1] - p[17][1]).powi(2)).sqrt();
+            ([cx / 4.0, cy / 4.0], w)
+        };
+        let (ca, wa) = pcw(&a.points);
+        let (cb, wb) = pcw(&b.points);
+        let cd = ((ca[0] - cb[0]).powi(2) + (ca[1] - cb[1]).powi(2)).sqrt();
+        cd < DUP_CENTER_DIST * wa.max(wb).max(1e-6)
+    }
+
+    /// 중복 추적 정리 — 두 ROI가 같은 손을 보고하면 presence 낮은 쪽을 버린다.
+    /// 트래킹이 num_hands로 가득 차면 재검출이 영영 안 뛰어, 반대 손이 화면에
+    /// 있어도 되찾지 못한다(박수 접촉 후 고질 증상). 하나를 비워야 다음
+    /// 프레임 재검출이 실제 반대 손을 잡는다.
+    fn dedup_tracked(results: &mut Vec<HandResult>, next: &mut Vec<Roi>) {
+        let mut i = 0;
+        while i < results.len() {
+            let mut j = i + 1;
+            let mut removed_i = false;
+            while j < results.len() {
+                if Self::same_hand(&results[i], &results[j]) {
+                    let drop = if results[i].presence >= results[j].presence { j } else { i };
+                    results.remove(drop);
+                    next.remove(drop);
+                    if drop == i {
+                        removed_i = true;
+                        break;
+                    }
+                } else {
+                    j += 1;
+                }
+            }
+            if !removed_i {
+                i += 1;
+            }
+        }
+    }
+
     /// 랜드마크 원시 출력 → 결과 1손 (presence 게이트 통과 시).
     fn finish_one(
         outputs: &[Vec<f32>],
@@ -91,6 +155,7 @@ impl HandTask {
         roi: Roi,
         img_w: f32,
         img_h: f32,
+        presence_min: f32,
     ) -> Result<Option<HandResult>, TaskError> {
         let lms: Vec<&Vec<f32>> =
             outputs.iter().filter(|o| o.len() >= 63 && o.len() % 3 == 0).collect();
@@ -107,7 +172,7 @@ impl HandTask {
         // raw score를 주고 label_items[0]="Right"다 (게이트가 잡은 뒤집힘).
         // 필드는 P(Left)로 통일 — MediaPipe categoryName과 >0.5 판정이 일치한다.
         let (presence, handedness) = (scalars[0], 1.0 - scalars[1]);
-        if presence < PRESENCE_MIN {
+        if presence < presence_min {
             return Ok(None);
         }
         let amp = |v: &[f32]| v.iter().fold(0f32, |m, x| m.max(x.abs()));
@@ -130,20 +195,6 @@ impl HandTask {
         Ok(Some(HandResult { points, world, presence, handedness, roi }))
     }
 
-    /// 이번 프레임에 쓸 ROI 목록 (검출은 클로저 — 트래킹이 충분하면 안 불린다)
-    fn frame_rois<E>(
-        &mut self,
-        w: f32,
-        h: f32,
-        detect: impl FnOnce() -> Result<Vec<Detection>, E>,
-    ) -> Result<Vec<Roi>, E> {
-        let mut rois = self.prev_rois.clone();
-        if rois.len() < self.num_hands {
-            self.merge_detections(&mut rois, &detect()?, w, h);
-        }
-        Ok(rois)
-    }
-
     /// CPU 한 프레임 (동기): u8 RGB 프레임 → 손 목록 (0~num_hands개)
     pub fn process_cpu(
         &mut self,
@@ -155,15 +206,18 @@ impl HandTask {
         _t_ms: f64,
     ) -> Result<Vec<HandResult>, TaskError> {
         let (w, h) = (img_w as f32, img_h as f32);
-        let (iw, ih) = self.post.input_size();
-        let [lo, hi] = self.post.input_range();
-        let post = self.post;
-        let rois = self.frame_rois(w, h, || {
+        // 트래킹 ROI 우선, 부족분만 검출 (앞 tracked_n개 = 유지 문턱 대상)
+        let tracked_n = self.prev_rois.len();
+        let mut rois = self.prev_rois.clone();
+        if rois.len() < self.num_hands {
+            let (iw, ih) = self.post.input_size();
+            let [lo, hi] = self.post.input_range();
             let input = letterbox_u8_rgb(
                 frame, img_w as usize, img_h as usize, iw as usize, ih as usize, lo, hi,
             );
-            det.detect(post, &input, img_w, img_h)
-        })?;
+            let dets = det.detect(&self.post, &input, img_w, img_h)?;
+            self.merge_detections(&mut rois, &dets, w, h);
+        }
         let (lm_input, names) = {
             let sw = lm.model().sw();
             let names: Vec<String> =
@@ -172,17 +226,19 @@ impl HandTask {
         };
         let mut results = Vec::new();
         let mut next = Vec::new();
-        for roi in rois {
+        for (i, roi) in rois.into_iter().enumerate() {
+            let pmin = if i < tracked_n { self.presence_cont } else { self.presence_seed };
             let crop =
                 crop_u8_rgb(frame, img_w as usize, img_h as usize, &roi, lm_input as usize);
             lm.infer_frame(&crop)?;
             let outputs: Vec<Vec<f32>> =
                 names.iter().map(|n| lm.read_output(n)).collect::<Result<_, _>>()?;
-            if let Some(r) = Self::finish_one(&outputs, lm_input, roi, w, h)? {
+            if let Some(r) = Self::finish_one(&outputs, lm_input, roi, w, h, pmin)? {
                 next.push(roi_from_hand_landmarks(&r.points, w, h));
                 results.push(r);
             }
         }
+        Self::dedup_tracked(&mut results, &mut next);
         self.prev_rois = next;
         Ok(results)
     }
@@ -199,7 +255,8 @@ impl HandTask {
         _t_ms: f64,
     ) -> Result<Vec<HandResult>, TaskError> {
         let (w, h) = (img_w as f32, img_h as f32);
-        // 검출 (async라 frame_rois 클로저로 못 넘긴다 — 같은 순서를 펼쳐 쓴다)
+        // 트래킹 ROI 우선, 부족분만 검출 (앞 tracked_n개 = 유지 문턱 대상)
+        let tracked_n = self.prev_rois.len();
         let mut rois = self.prev_rois.clone();
         if rois.len() < self.num_hands {
             let (iw, ih) = self.post.input_size();
@@ -207,7 +264,7 @@ impl HandTask {
             let input = letterbox_u8_rgb(
                 frame, img_w as usize, img_h as usize, iw as usize, ih as usize, lo, hi,
             );
-            let dets = det.detect(ctx, self.post, &input, img_w, img_h).await?;
+            let dets = det.detect(ctx, &self.post, &input, img_w, img_h).await?;
             self.merge_detections(&mut rois, &dets, w, h);
         }
         let lm_input = lm.model().sw.tensors[lm.model().sw.inputs[0] as usize].h as f32;
@@ -220,7 +277,8 @@ impl HandTask {
             .collect();
         let mut results = Vec::new();
         let mut next = Vec::new();
-        for roi in rois {
+        for (i, roi) in rois.into_iter().enumerate() {
+            let pmin = if i < tracked_n { self.presence_cont } else { self.presence_seed };
             let crop =
                 crop_u8_rgb(frame, img_w as usize, img_h as usize, &roi, lm_input as usize);
             lm.upload(ctx, &crop)?;
@@ -230,11 +288,12 @@ impl HandTask {
                 outputs.push(lm.read_output(ctx, n).await?);
             }
             lm.finish_frame(ctx).await?;
-            if let Some(r) = Self::finish_one(&outputs, lm_input, roi, w, h)? {
+            if let Some(r) = Self::finish_one(&outputs, lm_input, roi, w, h, pmin)? {
                 next.push(roi_from_hand_landmarks(&r.points, w, h));
                 results.push(r);
             }
         }
+        Self::dedup_tracked(&mut results, &mut next);
         self.prev_rois = next;
         Ok(results)
     }
@@ -255,7 +314,7 @@ mod tests {
         // 순서: [화면 lm(px), presence, handedness, 월드(작은 값)] — .sw 출력 순서
         let outputs =
             vec![lm63(1.0), vec![0.93], vec![0.8], lm63(0.001)];
-        let r = HandTask::finish_one(&outputs, 224.0, roi, 100.0, 100.0)
+        let r = HandTask::finish_one(&outputs, 224.0, roi, 100.0, 100.0, 0.5)
             .unwrap()
             .expect("presence 통과");
         assert_eq!(r.points.len(), 21);
@@ -268,7 +327,9 @@ mod tests {
 
         // presence 미달 → None
         let outputs = vec![lm63(1.0), vec![0.2], vec![0.8], lm63(0.001)];
-        assert!(HandTask::finish_one(&outputs, 224.0, roi, 100.0, 100.0).unwrap().is_none());
+        assert!(HandTask::finish_one(&outputs, 224.0, roi, 100.0, 100.0, 0.5)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

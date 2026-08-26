@@ -345,9 +345,9 @@ fn set_model_pair(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn set_item_model_dir(dir: *const c_char) -> VbResult {
     let result = catch_unwind(AssertUnwindSafe(|| {
-        if soft_tier() {
-            return VbResult::Success;
-        }
+        // soft tier(C)여도 로더는 등록한다 — 등록은 클로저 저장뿐이라 GPU 를 안 건드리고,
+        // 여기서 건너뛰면 이 세션에서 티어가 A/B 로 회복돼도 GLB 로더가 영영 비어
+        // 3D 아이템이 조용히 안 뜬다. 실제 렌더 차단은 프레임 경로의 티어 게이트 몫.
         let dir = match unsafe { cstr(dir) } {
             Ok(v) => v,
             Err(e) => {

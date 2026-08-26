@@ -25,7 +25,11 @@ ai-gpu = { path = "crates/ai-gpu" }
 ai-gpu-runtime = { path = "crates/ai-gpu-runtime" }
 ai-tasks = { path = "crates/ai-tasks" }
 
-# GPU
+# GPU — vendor/wgpu 포크 사용 (아래 [patch.crates-io]).
+# 포크 사유: webgpu 백엔드에 create_compute_pipeline_webgpu_async 추가 —
+# 동기 createComputePipeline 은 브라우저 GPU 프로세스 디바이스 타임라인에서
+# 컴파일돼 Windows(FXC)에서 브라우저 전체를 수 초 멈춘다. 업스트림 부재:
+# gfx-rs/wgpu#3794. wgpu 버전 올릴 때 vendor/wgpu 재생성 + 패치 재적용 필요.
 wgpu = { version = "30", default-features = false }
 naga = "30"
 # GLB 텍스처 디코드 (items3d) — 순수 Rust 디코더라 wasm 동작
@@ -39,6 +43,7 @@ thiserror = "2"
 log = "0.4"
 pollster = "0.4"
 futures-channel = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 
 # wasm 경계 (wgpu 30이 벤더링한 wasm-bindgen 버전과 일치해야 함)
 wasm-bindgen = "0.2.115"
@@ -56,6 +61,12 @@ console_log = "1"
 
 # dev
 env_logger = "0.11"
+
+[patch.crates-io]
+wgpu = { path = "vendor/wgpu" }
+# wgpu-hal 포크 사유: Adreno 가 uniformAndStorageBuffer16BitAccess 를 안 줘
+# SHADER_F16 이 통째로 꺼지던 것 완화 (vendor/wgpu-hal/src/vulkan/adapter.rs).
+wgpu-hal = { path = "vendor/wgpu-hal" }
 
 [profile.release]
 opt-level = 3

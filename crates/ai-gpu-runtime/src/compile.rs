@@ -67,13 +67,12 @@ pub async fn compile_all(
     #[cfg(target_arch = "wasm32")]
     {
         // ⚠ 여기가 콜드 로드의 전부다 (브라우저 실측: fetch 25ms vs 컴파일 2000ms).
-        // wgpu에 async 파이프라인 생성이 없어(gfx-rs/wgpu#3794) createComputePipeline이
-        // 동기로 불리고, 고유 파이프라인 수만큼 메인 스레드에서 직렬 컴파일된다.
-        // 모듈을 먼저 다 만들어도 비싼 일(Tint→MSL→Metal)은 파이프라인 단계에 있어
-        // 병렬화되지 않는다. AI_PIPE_TIMING 빌드에서 개당 시간을 찍어 어느 셰이더가
-        // 비싼지 본다.
-        // 모듈 생성(Tint 파싱·검증)과 파이프라인 생성(→MSL→Metal)을 따로 잰다.
-        // 둘 다 재야 한다 — 한쪽만 재면 "컴파일이 공짜"라는 오답이 나온다.
+        // createComputePipelineAsync(vendor/wgpu 포크 패치) 로 만든다 — 동기
+        // createComputePipeline 은 GPU 프로세스 디바이스 타임라인에서 직렬 컴파일돼
+        // Windows(D3D12/FXC)에선 컴파일 내내 브라우저 전체 합성이 멈췄다.
+        // join_all 이 첫 poll 라운드에 모든 JS promise 를 발사하므로 브라우저가
+        // 백그라운드 풀에서 병렬 컴파일한다(블로킹 0 + 벽시계도 단축).
+        // 모듈 생성(Tint 파싱·검증)은 여전히 동기 — 파이프라인 단계보다 훨씬 싸다.
         let mut t_mod = 0.0f64;
         let mut pending = Vec::with_capacity(unique.len());
         for s in &unique {
@@ -81,23 +80,20 @@ pub async fn compile_all(
             pending.push(kernel::begin_compile(ctx, *s));
             t_mod += t0.elapsed().as_secs_f64() * 1e3;
         }
-        let mut timings: Vec<(f64, String)> = Vec::new();
-        for p in pending {
-            let t0 = web_time::Instant::now();
-            let k = kernel::finish_compile(ctx, p);
-            timings.push((t0.elapsed().as_secs_f64() * 1e3, k.key.clone()));
+        let t0 = web_time::Instant::now();
+        let count = pending.len();
+        let compiled = futures_util::future::join_all(
+            pending.into_iter().map(|p| kernel::finish_compile_async(ctx, p)),
+        )
+        .await;
+        for k in compiled {
             map.insert(k.key.clone(), Arc::new(k));
         }
-        timings.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
-        let t_pipe: f64 = timings.iter().map(|t| t.0).sum();
         log::info!(
-            "[ai-gpu-runtime] 셰이더모듈 {t_mod:.0}ms + 파이프라인 {t_pipe:.0}ms = {:.0}ms / {}개",
-            t_mod + t_pipe,
-            timings.len()
+            "[ai-gpu-runtime] 셰이더모듈 {t_mod:.0}ms + 파이프라인(async 병렬) {:.0}ms / {}개",
+            t0.elapsed().as_secs_f64() * 1e3,
+            count
         );
-        for (ms, key) in timings.iter().take(10) {
-            log::info!("[ai-gpu-runtime]   pipe {ms:7.1}ms  {key}");
-        }
     }
 
     // 신규 컴파일분을 컨텍스트 캐시에 반영

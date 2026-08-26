@@ -111,6 +111,33 @@ pub fn finish_compile(ctx: &GpuContext, p: PendingKernel) -> CompiledKernel {
     CompiledKernel { pipeline, bgl: p.bgl, key: p.key }
 }
 
+/// 2단계 async 판 — wasm(WebGPU)에선 createComputePipelineAsync(vendor/wgpu 포크
+/// 패치)로 만든다. 동기 create 는 GPU 프로세스 디바이스 타임라인에서 컴파일돼
+/// Windows(FXC)에서 브라우저 전체를 수 초 멈춘다(gfx-rs/wgpu#3794). async 는
+/// 백그라운드 풀 컴파일이라 안 막고, resolve 시점엔 스톨 없이 바로 쓸 수 있다.
+/// 네이티브는 동기 생성과 동일(자체 스레드 팬아웃이 이미 담당).
+pub async fn finish_compile_async(ctx: &GpuContext, p: PendingKernel) -> CompiledKernel {
+    let device = &ctx.device;
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some(&p.key),
+        bind_group_layouts: &[Some(&p.bgl)],
+        ..Default::default()
+    });
+    let desc = wgpu::ComputePipelineDescriptor {
+        label: Some(&p.key),
+        layout: Some(&layout),
+        module: &p.module,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    };
+    #[cfg(target_arch = "wasm32")]
+    let pipeline = device.create_compute_pipeline_webgpu_async(&desc).await;
+    #[cfg(not(target_arch = "wasm32"))]
+    let pipeline = device.create_compute_pipeline(&desc);
+    CompiledKernel { pipeline, bgl: p.bgl, key: p.key }
+}
+
 /// error scope 없이 일괄 컴파일 — 병렬 팬아웃용
 pub fn compile_unscoped(ctx: &GpuContext, spec: &dyn KernelSpec) -> CompiledKernel {
     finish_compile(ctx, begin_compile(ctx, spec))
@@ -144,6 +171,20 @@ fn bgl_entries(storage: &[StorageDir]) -> Vec<wgpu::BindGroupLayoutEntry> {
 
 /// KernelSpec → CompiledKernel. validation error scope로 감싸 오류를 Result로.
 pub async fn compile(ctx: &GpuContext, spec: &dyn KernelSpec) -> Result<CompiledKernel, String> {
+    // wasm 은 어차피 scope 미사용(with_validation 웹 분기) — async 생성 경로로 직행해
+    // 동기 createComputePipeline 의 GPU 프로세스 블로킹(Windows FXC)을 피한다.
+    #[cfg(target_arch = "wasm32")]
+    {
+        return Ok(finish_compile_async(ctx, begin_compile(ctx, spec)).await);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        compile_scoped(ctx, spec).await
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn compile_scoped(ctx: &GpuContext, spec: &dyn KernelSpec) -> Result<CompiledKernel, String> {
     let key = spec.cache_key(&ctx.caps);
     let src = spec.wgsl(&ctx.caps);
     let entries = bgl_entries(&spec.bindings());
