@@ -364,7 +364,10 @@ pub unsafe extern "C" fn set_item_model_dir(dir: *const c_char) -> VbResult {
             }
         };
         st.director.set_glb_loader(Box::new(move |kind| {
-            let path = format!("{dir}/{kind}.glb");
+            // 아바타 프리셋(vrm/{model})은 .vrm 그대로 — 웹 에셋과 파일명·확장자 동일.
+            // VRM 은 바이너리 glTF 컨테이너라 파서는 .glb 와 같은 경로를 탄다.
+            let ext = if kind.starts_with("vrm/") { "vrm" } else { "glb" };
+            let path = format!("{dir}/{kind}.{ext}");
             match std::fs::read(&path) {
                 Ok(b) => Some(b),
                 Err(e) => {
@@ -395,17 +398,17 @@ pub unsafe extern "C" fn update_effects_config(json: *const c_char) -> VbResult 
                 return VbResult::Failure;
             }
         };
-        // mirror/degree는 여기서 흡수한다 (머지 규약 유지: 없음=유지) — 프레임 변환은
-        // 호스트(ffi) 몫이고, 엔진의 bg_mat 배경 보정까지 타면 배경 이미지가 같이
-        // 뒤집힌다. 모바일 스펙은 "인물만 반전, 배경은 화면 고정".
+        // mirror/degree — 프레임 변환은 호스트(ffi) 몫이라 값을 읽어 st에 흡수하되,
+        // 키는 엔진에도 그대로 전달한다. 엔진 compose가 배경 샘플 좌표를 같은 변환으로
+        // 보정해 "배경 포함 전체 거울"이 된다 (웹 wasm 스펙 동일 — 2026-08-27 통일).
         let mut mirror_patch: Option<bool> = None;
         let mut degree_patch: Option<f32> = None;
         let forwarded = match serde_json::from_str::<serde_json::Value>(&json) {
-            Ok(mut v) => {
-                if let Some(obj) = v.as_object_mut() {
-                    mirror_patch = obj.remove("mirror").map(|m| m.as_bool().unwrap_or(false));
+            Ok(v) => {
+                if let Some(obj) = v.as_object() {
+                    mirror_patch = obj.get("mirror").map(|m| m.as_bool().unwrap_or(false));
                     degree_patch = obj
-                        .remove("degree")
+                        .get("degree")
                         .map(|d| (d.as_f64().unwrap_or(0.0) as f32).rem_euclid(360.0));
                 }
                 v.to_string()

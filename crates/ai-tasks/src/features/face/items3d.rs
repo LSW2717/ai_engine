@@ -76,23 +76,33 @@ fn item_adjust(kind: &str) -> (f32, f32, f32, f32, f32, f32) {
     }
 }
 
-const HAT_KINDS: [&str; 6] = [
+// hat_headphones 이후 / glasses_square 이후는 웹 전용 에셋 — 호스트가 GLB 를 조달하지
+// 못하면 Director 가 실패를 캐시해 조용히 미표시한다 (items_loaded 규약).
+const HAT_KINDS: [&str; 10] = [
     "hat1",
     "hat3",
     "hat5",
     "hat_bicycle",
     "hat_christmas",
     "hat_cat_ears",
+    "hat_headphones",
+    "hat_headphones_cat",
+    "hat_cat_ears_white",
+    "hat_bunny_ears",
 ];
-const EYEWEAR_KINDS: [&str; 5] = [
+const EYEWEAR_KINDS: [&str; 9] = [
     "glasses1",
     "glasses2",
     "glasses3",
     "glasses_heart",
     "glasses_yellow",
+    "glasses_square",
+    "glasses_wood",
+    "glasses_zebra",
+    "glasses_neon",
 ];
 // 수염류 GLB 는 canonical 얼굴 cm 좌표(원점=얼굴 원점)에 직접 구워져 있다 — 그룹 앵커 없음.
-const BEARD_KINDS: [&str; 3] = ["mustache1", "mustache2", "beard_full"];
+const BEARD_KINDS: [&str; 4] = ["mustache1", "mustache2", "beard_full", "beard_bushy"];
 
 // ═══════════════════ 미니 행렬/쿼터니언 ═══════════════════
 // 열우선(column-major) 4x4 — wgpu/WGSL mat4x4 레이아웃과 일치.
