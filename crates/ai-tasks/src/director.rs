@@ -330,7 +330,13 @@ impl Director {
         bytes: &[u8],
     ) -> Result<(), TaskError> {
         if self.avatar.is_none() {
-            self.avatar = Some(AvatarOverlay::new(ctx).map_err(TaskError::Other)?);
+            let mut av = AvatarOverlay::new(ctx).map_err(TaskError::Other)?;
+            // ensure_avatar 와 동일 시드 — 여기서 만든 오버레이만 배경을 모르면
+            // 첫 아바타 적용에서 VB 이미지 대신 스튜디오 폴백이 그려진다.
+            if let Some((rgba, w, h)) = &self.bg_cache {
+                av.set_background_image(ctx, rgba, *w, *h);
+            }
+            self.avatar = Some(av);
         }
         self.avatar
             .as_mut()
