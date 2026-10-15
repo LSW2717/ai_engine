@@ -598,6 +598,59 @@ pub fn finger_curls_from_px(lm: &[[f32; 2]; 21]) -> [f32; 5] {
 /// 478pt 랜드마크 → 감김 정도 0(뜸)..1(감김). 양눈 평균.
 /// EAR = (윗꺼풀-아랫꺼풀 거리) / (눈 가로폭), 왼눈 159/145·33/133,
 /// 오른눈 386/374·362/263 (MediaPipe 메시 인덱스).
+/// 478pt 랜드마크 → 입 벌림 정도 0(다뭄)..1(크게 벌림).
+///
+/// blink 의 EAR 과 같은 방식 — 세로/가로 비(MAR). 세로는 **안쪽 입술**
+/// 13(위)/14(아래), 가로는 입꼬리 61/291 (MediaPipe 메시 인덱스).
+/// 안쪽 입술을 쓰는 이유: 바깥 입술(0/17)은 입을 다물어도 두께만큼 거리가 남아
+/// 다문 상태의 바닥값이 개인차로 크게 흔들린다.
+///
+/// 추가 추론 비용 0 — 이 랜드마크는 머리 회전·blink 때문에 이미 매 프레임 돈다.
+pub fn mouth_from_landmarks(lm: &[[f32; 3]]) -> Option<f32> {
+    if lm.len() < 468 {
+        return None;
+    }
+    let d = |a: usize, b: usize| -> f32 {
+        let dx = lm[a][0] - lm[b][0];
+        let dy = lm[a][1] - lm[b][1];
+        (dx * dx + dy * dy).sqrt()
+    };
+    let mar = d(13, 14) / d(61, 291).max(1e-3);
+    Some(((mar - MOUTH_MAR_CLOSED) / (MOUTH_MAR_OPEN - MOUTH_MAR_CLOSED)).clamp(0.0, 1.0))
+}
+
+/// MAR 매핑 하한 — 이 아래는 "다뭄". 입술 두께/카메라 각도의 바닥 노이즈를 흡수한다.
+/// 너무 낮추면 다물고 있어도 입이 미세하게 떨린다.
+const MOUTH_MAR_CLOSED: f32 = 0.05;
+/// MAR 매핑 상한 — 이 위는 "완전히 벌림". 일상 발화는 0.10~0.25 구간이라
+/// 상한을 크게 잡으면 말할 때 입이 거의 안 움직인다.
+const MOUTH_MAR_OPEN: f32 = 0.30;
+/// 벌릴 때 추종 계수(빠르게) / 다물 때(조금 느리게) — 말할 때 딱딱거림 방지.
+const MOUTH_OPEN_ALPHA: f32 = 0.60;
+const MOUTH_CLOSE_ALPHA: f32 = 0.40;
+
+/// 입 모프 컨트롤러 — blink 와 달리 자동 동작(auto-blink 같은 것)은 없다.
+/// 관측이 없으면 다문 쪽으로 감쇠한다: 얼굴을 잃었을 때 입을 벌린 채로
+/// 굳어 있으면 인형처럼 보인다.
+#[derive(Default)]
+pub struct MouthCtl {
+    weight: f32,
+}
+
+impl MouthCtl {
+    /// obs = 관측 벌림 정도 (얼굴 추적 프레임에만 Some). 반환 = 모프 가중 0..1.
+    pub fn update(&mut self, obs: Option<f32>) -> f32 {
+        match obs {
+            Some(o) => {
+                let alpha = if o > self.weight { MOUTH_OPEN_ALPHA } else { MOUTH_CLOSE_ALPHA };
+                self.weight += (o - self.weight) * alpha;
+            }
+            None => self.weight *= 0.85,
+        }
+        self.weight
+    }
+}
+
 pub fn blink_from_landmarks(lm: &[[f32; 3]]) -> Option<f32> {
     if lm.len() < 468 {
         return None;
@@ -729,5 +782,42 @@ mod tests {
         assert!(blink_from_landmarks(&lm).unwrap() < 0.05);
         set(&mut lm, false);
         assert!(blink_from_landmarks(&lm).unwrap() > 0.95);
+    }
+
+    #[test]
+    fn mar_closed_open() {
+        // 합성 랜드마크: 입꼬리 간격 100px 고정, 안쪽 입술 세로만 바꾼다.
+        // 다뭄 MAR 0.02(<0.05) → 0, 크게 벌림 MAR 0.40(>0.30) → 1
+        let mut lm = vec![[0.0f32; 3]; 478];
+        let set = |lm: &mut Vec<[f32; 3]>, gap: f32| {
+            lm[61] = [0.0, 0.0, 0.0];
+            lm[291] = [100.0, 0.0, 0.0];
+            lm[13] = [50.0, 0.0, 0.0];
+            lm[14] = [50.0, gap, 0.0];
+        };
+        set(&mut lm, 2.0);
+        assert!(mouth_from_landmarks(&lm).unwrap() < 1e-6, "다문 입은 0");
+        set(&mut lm, 40.0);
+        assert!(mouth_from_landmarks(&lm).unwrap() > 0.999, "크게 벌린 입은 1");
+        // 일상 발화 구간(MAR 0.15)은 중간값 — 상한이 너무 크면 여기서 0에 붙는다
+        set(&mut lm, 15.0);
+        let w = mouth_from_landmarks(&lm).unwrap();
+        assert!((0.3..0.5).contains(&w), "발화 구간 응답: {w}");
+    }
+
+    #[test]
+    fn mouth_ctl_closes_when_face_lost() {
+        let mut ctl = MouthCtl::default();
+        // 벌림 관측 → 빠르게 추종
+        let mut w = 0.0;
+        for _ in 0..5 {
+            w = ctl.update(Some(1.0));
+        }
+        assert!(w > 0.9, "벌림 추종: {w}");
+        // 얼굴 소실 → 다문 쪽으로 감쇠 (벌린 채 굳지 않는다)
+        for _ in 0..20 {
+            w = ctl.update(None);
+        }
+        assert!(w < 0.05, "소실 후 감쇠: {w}");
     }
 }

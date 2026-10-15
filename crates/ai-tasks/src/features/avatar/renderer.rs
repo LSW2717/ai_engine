@@ -17,8 +17,8 @@ use ai_gpu::wgpu::*;
 use ai_gpu::GpuContext;
 
 use super::rig::{
-    blink_from_landmarks, mat_compose, mat_mul, mat_perspective, quat_axis_angle, quat_mul,
-    quat_slerp, BlinkCtl, Quat, Rig,
+    blink_from_landmarks, mat_compose, mat_mul, mat_perspective, mouth_from_landmarks,
+    quat_axis_angle, quat_mul, quat_slerp, BlinkCtl, MouthCtl, Quat, Rig,
 };
 use super::vrm::{parse_vrm, VrmModel};
 use crate::features::face::items3d::face_pose_from_landmarks;
@@ -160,6 +160,7 @@ struct LoadedAvatar {
     cam_dist: f32,
     center_y: f32,
     blink: BlinkCtl,
+    mouth: MouthCtl,
     smooth_quat: Option<Quat>,
 }
 
@@ -714,6 +715,7 @@ impl AvatarOverlay {
             cam_dist: dist,
             center_y,
             blink: BlinkCtl::default(),
+            mouth: MouthCtl::default(),
             smooth_quat: None,
         })
     }
@@ -866,9 +868,9 @@ impl AvatarOverlay {
             ctx.queue.write_buffer(&self.bg_params_buf, 0, bytemuck::cast_slice(&params));
         }
 
-        // 포즈/blink 계산 (가변 차용 블록 — 이후는 불변 참조만)
+        // 포즈/blink/입 계산 (가변 차용 블록 — 이후는 불변 참조만)
         let active = self.active.clone();
-        let blink_w = {
+        let (blink_w, mouth_w) = {
             let m = self.models.get_mut(&active).unwrap();
             let fit = landmarks.and_then(|lm| face_pose_from_landmarks(lm, fw, fh));
             if let Some((q, _pos)) = fit {
@@ -904,7 +906,8 @@ impl AvatarOverlay {
             m.rig.tick_arms();
             m.rig.update_globals();
             let blink_obs = landmarks.and_then(blink_from_landmarks);
-            m.blink.update(blink_obs, t_ms)
+            let mouth_obs = landmarks.and_then(mouth_from_landmarks);
+            (m.blink.update(blink_obs, t_ms), m.mouth.update(mouth_obs))
         };
 
         // uniform 기록
@@ -933,7 +936,8 @@ impl AvatarOverlay {
         ctx.queue.write_buffer(
             &self.morph_w_buf,
             0,
-            bytemuck::cast_slice(&[blink_w, 0.0f32, 0.0, 0.0]),
+            // x=blink(슬롯 0/1), y=입 'a'(슬롯 2/3) — mtoon.wgsl morphed_pos/normal 규약
+            bytemuck::cast_slice(&[blink_w, mouth_w, 0.0, 0.0]),
         );
 
         // 렌더패스
