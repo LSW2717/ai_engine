@@ -6,7 +6,7 @@ documentation = true
 documentation_style = "doxy"
 
 [export]
-include = ["VbResult", "FeHandle"]
+include = ["VbResult", "FeHandle", "RnHandle", "VadHandle"]
 
 [enum]
 rename_variants = "ScreamingSnakeCase"

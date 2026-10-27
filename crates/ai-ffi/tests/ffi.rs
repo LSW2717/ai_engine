@@ -333,6 +333,64 @@ fn extended_surface_smoke() {
     }
 }
 
+/// RNNoise C 표면 — 48k 활성(가중치 내장, 자산 불필요) + 미지원 레이트 passthrough.
+/// 전역 STATE와 무관해 SURFACE_LOCK 불필요.
+#[test]
+fn rn_surface_smoke() {
+    unsafe {
+        let rn = ai_ffi::rn_create_c(48000);
+        assert!(!rn.is_null());
+        assert_eq!(ai_ffi::rn_is_active(rn), 1);
+        assert_eq!(ai_ffi::rn_get_in_frame_len(rn), 480);
+        let inp: Vec<f32> = (0..480).map(|i| ((i as f32) * 0.05).sin() * 0.1).collect();
+        let mut out = vec![0f32; 480];
+        ai_ffi::rn_process_frame(rn, inp.as_ptr(), out.as_mut_ptr());
+        assert!(out.iter().all(|v| v.is_finite()));
+        // in-place (input == output) 허용
+        let mut buf = inp.clone();
+        ai_ffi::rn_process_frame(rn, buf.as_ptr(), buf.as_mut_ptr());
+        assert!(buf.iter().all(|v| v.is_finite()));
+        ai_ffi::rn_free_c(rn);
+
+        let pt = ai_ffi::rn_create_c(16000);
+        assert!(!pt.is_null());
+        assert_eq!(ai_ffi::rn_is_active(pt), 0);
+        assert_eq!(ai_ffi::rn_get_in_frame_len(pt), 480);
+        ai_ffi::rn_process_frame(pt, inp.as_ptr(), out.as_mut_ptr());
+        assert_eq!(out, inp, "passthrough는 무가공");
+        ai_ffi::rn_free_c(pt);
+    }
+}
+
+/// Silero VAD C ABI — 48k 10ms 조각을 넣으면 32ms(16k 512) 마다 확률이 하나 나온다.
+/// 자산(make convert-silero)이 없으면 스킵.
+#[test]
+fn vad_surface_smoke() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/silero");
+    if !std::path::Path::new(dir).join("vad16/graph.json").exists() {
+        eprintln!("models/silero 없음 — 스킵");
+        return;
+    }
+    let cdir = std::ffi::CString::new(dir).unwrap();
+    unsafe {
+        assert!(ai_ffi::vad_create_c(48000, c"/없는/경로".as_ptr()).is_null());
+        let v = ai_ffi::vad_create_c(48000, cdir.as_ptr());
+        assert!(!v.is_null());
+        let frame = vec![0f32; 480];
+        let probs: Vec<f32> = (0..100)
+            .map(|_| ai_ffi::vad_process(v, frame.as_ptr(), frame.len()))
+            .filter(|&p| p >= 0.0)
+            .collect();
+        // 1초 = 16000 / 512 = 31.25 청크 (리샘플러 지연만큼 하나 덜 나올 수 있다)
+        assert!((30..=31).contains(&probs.len()), "청크 수 {}", probs.len());
+        assert!(probs.iter().all(|&p| p < 0.1), "무음에서 음성 판정");
+        ai_ffi::vad_reset_c(v);
+        assert_eq!(ai_ffi::vad_process(v, frame.as_ptr(), 0), -1.0);
+        assert_eq!(ai_ffi::vad_process(std::ptr::null_mut(), frame.as_ptr(), 480), -1.0);
+        ai_ffi::vad_free_c(v);
+    }
+}
+
 /// 웹 diff 픽스처 덤프 — ffi-diff.html이 소비.
 /// 재현: cargo test -p ai-ffi --release → node tools/run_web.mjs demo/ffi-diff.html
 #[test]

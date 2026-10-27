@@ -47,6 +47,12 @@ thread_local! {
     // 오디오 노이즈 제거 (CPU 고정 — AudioWorklet/워커에서 구동)
     static ENHANCERS: RefCell<ai_tasks::Pool<ai_tasks::features::audio::Enhancer>> =
         RefCell::new(ai_tasks::Pool::new());
+    // RNNoise (기본 모드 — 같은 audio 워커, 가중치 내장)
+    static DENOISERS: RefCell<ai_tasks::Pool<ai_tasks::features::audio::Denoiser>> =
+        RefCell::new(ai_tasks::Pool::new());
+    // Silero VAD (음소거 중 발화 감지 — 별도 워커)
+    static VADS: RefCell<ai_tasks::Pool<ai_tasks::features::audio::Vad>> =
+        RefCell::new(ai_tasks::Pool::new());
 }
 
 #[wasm_bindgen(start)]
@@ -1473,6 +1479,96 @@ pub fn enhancer_profile(
     let mut v: Vec<(String, f64)> = acc.into_iter().map(|(k, t)| (k, t / reps as f64)).collect();
     v.sort_by(|a, b| b.1.total_cmp(&a.1));
     serde_wasm_bindgen::to_value(&v).map_err(js_err)
+}
+
+// ───────── 오디오 노이즈 제거 (RNNoise — 기본 모드, CPU 고정) ─────────
+
+/// Denoiser 생성 → 핸들. 가중치 내장이라 받을 자산이 없다.
+/// 48kHz 전용 — 레이트는 호출측이 거른다. init_engine 없이 동작 (audio 워커 규약).
+#[wasm_bindgen]
+pub fn denoiser_new() -> u32 {
+    DENOISERS.with(|p| {
+        p.borrow_mut()
+            .insert(ai_tasks::features::audio::Denoiser::new())
+    })
+}
+
+#[wasm_bindgen]
+pub fn denoiser_free(handle: u32) -> Result<(), JsValue> {
+    DENOISERS
+        .with(|p| p.borrow_mut().remove(handle))
+        .map_err(js_err)?;
+    Ok(())
+}
+
+/// 스트리밍 상태 초기화 (스트림 파기 시)
+#[wasm_bindgen]
+pub fn denoiser_reset(handle: u32) -> Result<(), JsValue> {
+    DENOISERS.with(|p| {
+        let mut b = p.borrow_mut();
+        b.get_mut(handle).map_err(js_err)?.reset();
+        Ok(())
+    })
+}
+
+/// 호출당 기대 샘플 수 (480 = 10ms@48k)
+#[wasm_bindgen]
+pub fn denoiser_frame_len(handle: u32) -> Result<u32, JsValue> {
+    DENOISERS.with(|p| {
+        let b = p.borrow();
+        Ok(b.get(handle).map_err(js_err)?.frame_len() as u32)
+    })
+}
+
+/// frame_len 샘플 처리 (mono f32 [-1,1]) → output 에 기록.
+/// output 을 호출측 버퍼로 받아 프레임마다(10ms) 새 배열을 만들지 않는다.
+#[wasm_bindgen]
+pub fn denoiser_process(handle: u32, input: &[f32], output: &mut [f32]) -> Result<(), JsValue> {
+    DENOISERS.with(|p| {
+        let mut b = p.borrow_mut();
+        b.get_mut(handle).map_err(js_err)?.process_frame(input, output);
+        Ok(())
+    })
+}
+
+// ───────── 음성 감지 (Silero VAD — CPU 고정) ─────────
+
+/// Vad 생성 → 핸들. graph.json + weights.bin (tools/prep_silero.py 산출물),
+/// sample_rate = 넣을 PCM 의 레이트 (16k 그대로, 그 외는 내부에서 16k 로 내린다).
+/// init_engine 없이 동작 (audio 워커 규약).
+#[wasm_bindgen]
+pub fn vad_new(graph_json: Vec<u8>, weights: Vec<u8>, sample_rate: u32) -> Result<u32, JsValue> {
+    let v =
+        ai_tasks::features::audio::Vad::new(&graph_json, &weights, sample_rate).map_err(js_err)?;
+    Ok(VADS.with(|p| p.borrow_mut().insert(v)))
+}
+
+#[wasm_bindgen]
+pub fn vad_free(handle: u32) -> Result<(), JsValue> {
+    VADS.with(|p| p.borrow_mut().remove(handle))
+        .map_err(js_err)?;
+    Ok(())
+}
+
+/// 상태 초기화 (듣기를 새로 시작할 때)
+#[wasm_bindgen]
+pub fn vad_reset(handle: u32) -> Result<(), JsValue> {
+    VADS.with(|p| {
+        let mut b = p.borrow_mut();
+        b.get_mut(handle).map_err(js_err)?.reset();
+        Ok(())
+    })
+}
+
+/// 아무 길이 mono f32 [-1,1] → 이번 호출에서 끝난 청크(32ms@16k)들의 음성 확률 평균.
+/// 끝난 청크가 없으면 −1.
+#[wasm_bindgen]
+pub fn vad_process(handle: u32, input: &[f32]) -> Result<f32, JsValue> {
+    VADS.with(|p| {
+        let mut b = p.borrow_mut();
+        let v = b.get_mut(handle).map_err(js_err)?;
+        Ok(v.process(input).map_err(js_err)?.unwrap_or(-1.0))
+    })
 }
 
 // ───────── studio — VideoPipeline 데모/게이트 (web/demo/studio.html) ─────────

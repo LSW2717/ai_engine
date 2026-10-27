@@ -9,6 +9,32 @@
 #include <stdlib.h>
 
 /**
+ * 한 번에 넘길 수 있는 최대 샘플 수 (40ms@48k) — 오디오 스레드에서 스택 버퍼로 받는다.
+ */
+#define VAD_MAX_FRAME 1920
+
+/**
+ * render_mask_nv12 · render_mask_i420_io 결과.
+ */
+typedef enum FrameResult {
+  /**
+   * 출력 평면에 합성 결과를 썼다
+   */
+  FRAME_RESULT_WRITTEN = 0,
+  /**
+   * 프레임 무가공(passthrough · analyzer-only) — 출력 평면은 건드리지 않았다, 원본을 그대로 내보낸다
+   */
+  FRAME_RESULT_UNCHANGED = 1,
+  /**
+   * 이 프레임은 GPU 평면 경로로 못 한다(B/C 티어 · 태스크 픽셀 틱 · 합성 없는 뒤집기 ·
+   * 홀수 크기 회전) — 엔진 상태를 건드리지 않았으니 호출자는 같은 프레임을 예전 경로
+   * (호스트 회전 + render_mask I420)로 처리한다
+   */
+  FRAME_RESULT_FALLBACK = 2,
+  FRAME_RESULT_FAILURE = -1,
+} FrameResult;
+
+/**
  * 0=Success, -1=Failure (vcxrust_ai VbResult와 동일 값 — 기존 호스트의
  * `== -1` 검사가 조용히 깨지지 않게 -1을 쓴다)
  */
@@ -21,6 +47,16 @@ typedef enum VbResult {
  * 불투명 핸들 — None = 미지원 레이트 passthrough (프레임 480, 무가공)
  */
 typedef struct FeHandle FeHandle;
+
+/**
+ * 불투명 핸들 — None = 미지원 레이트 passthrough (프레임 480, 무가공)
+ */
+typedef struct RnHandle RnHandle;
+
+/**
+ * 불투명 핸들 — 음소거 중 발화 감지용 음성 확률.
+ */
+typedef struct VadHandle VadHandle;
 
 /**
  * 렌더 티어 선언 — 0=A(GPU), 1=B(CPU 추론+GPU 합성), 2=C(GPU 완전 회피).
@@ -114,6 +150,55 @@ enum VbResult render_mask(uint8_t *y,
                           int32_t stride_v);
 
 /**
+ * NV12 입력(iOS 카메라 CVPixelBuffer 형식, 카메라 회전 `rotation` = 0/90/180/270, 시계 방향)
+ * → 세운 NV12 출력 — 호스트의 NV12→I420 변환·회전과 되돌리는 인터리브 복사가 없어진다.
+ * 입력 `width×height` 는 읽기만 하고(카메라 버퍼) 결과(90/270 이면 `height×width`)는 별도
+ * 출력 평면(stride 보존)에 쓴다. 결과 바이트는 같은 프레임을 libyuv 로 세워 I420 으로
+ * render_mask 에 넣은 것과 같다. 회전하는 홀수 크기는 Fallback.
+ *
+ * # Safety
+ * y_in/uv_in 은 |stride_in|×|height| · |stride_uv_in|×⌈|height|/2⌉ 크기의 읽기 평면,
+ * y_out/uv_out 은 세운 크기 기준 같은 규칙의 쓰기 평면이어야 한다(입력과 겹치지 않을 것).
+ */
+enum FrameResult render_mask_nv12(const uint8_t *y_in,
+                                  const uint8_t *uv_in,
+                                  int32_t width,
+                                  int32_t height,
+                                  int32_t stride_y_in,
+                                  int32_t stride_uv_in,
+                                  int32_t rotation,
+                                  uint8_t *y_out,
+                                  uint8_t *uv_out,
+                                  int32_t stride_y_out,
+                                  int32_t stride_uv_out);
+
+/**
+ * I420 입력(카메라 회전 `rotation` = 0/90/180/270, 시계 방향) → 세운 I420 출력 — Android
+ * 호스트의 회전(I420Rotate)·출력 버퍼로 옮기는 복사가 없어진다. 입력 `width×height` 는 읽기만
+ * 하고, 결과(90/270 이면 `height×width`)는 별도 출력 평면(stride 보존)에 쓴다. 결과 바이트는
+ * 같은 프레임을 libyuv 로 세워 render_mask 에 넣은 것과 같다. 회전하는 홀수 크기는 Fallback.
+ *
+ * # Safety
+ * 입력 평면은 |stride|×|height|(크로마 ⌈/2⌉) 크기의 읽기 평면, 출력 평면은 세운 크기 기준
+ * 같은 규칙의 쓰기 평면이어야 한다(입력과 겹치지 않을 것).
+ */
+enum FrameResult render_mask_i420_io(const uint8_t *y_in,
+                                     const uint8_t *u_in,
+                                     const uint8_t *v_in,
+                                     int32_t width,
+                                     int32_t height,
+                                     int32_t stride_y_in,
+                                     int32_t stride_u_in,
+                                     int32_t stride_v_in,
+                                     int32_t rotation,
+                                     uint8_t *y_out,
+                                     uint8_t *u_out,
+                                     uint8_t *v_out,
+                                     int32_t stride_y_out,
+                                     int32_t stride_u_out,
+                                     int32_t stride_v_out);
+
+/**
  * 마지막 집중도 — {"status":"FOCUSED","attentive":true,"score":100,
  * "monitorIndex":0,"yaw":..,"pitch":..} (7상태 — 우리 FocusResult 그대로).
  * 반환 문자열은 `vcx_string_free`로 해제.
@@ -181,5 +266,76 @@ int fe_get_sample_rate(const struct FeHandle *h);
  * input/output은 frame_len 샘플의 유효 버퍼여야 한다.
  */
 float fe_process_frame(struct FeHandle *h, const float *input, float *output);
+
+/**
+ * 생성 — sample_rate 48000이면 RNNoise(가중치 내장 — 모델 파일 없음), 그 외 레이트는
+ * passthrough 핸들 (프레임 480, 무가공 — 호스트가 레이트 스위치 없이도 안전).
+ */
+struct RnHandle *rn_create_c(int sample_rate);
+
+/**
+ * # Safety
+ * `h`는 rn_create_c가 만든 포인터이거나 null이어야 한다.
+ */
+void rn_free_c(struct RnHandle *h);
+
+/**
+ * process_frame 호출당 샘플 수 — 활성·passthrough 모두 480 (10ms@48k)
+ *
+ * # Safety
+ * `h`는 유효한 RnHandle 포인터여야 한다.
+ */
+uintptr_t rn_get_in_frame_len(const struct RnHandle *h);
+
+/**
+ * RNNoise가 실제로 도는 핸들인지 (0 = passthrough)
+ *
+ * # Safety
+ * `h`는 유효한 RnHandle 포인터여야 한다.
+ */
+int rn_is_active(const struct RnHandle *h);
+
+/**
+ * 한 프레임 처리 — input/output은 480 샘플 mono f32 [-1,1] (겹쳐도 안전).
+ * passthrough 핸들은 원음 그대로.
+ *
+ * # Safety
+ * input/output은 480 샘플의 유효 버퍼여야 한다.
+ */
+void rn_process_frame(struct RnHandle *h, const float *input, float *output);
+
+/**
+ * 생성 — `{model_dir}/vad16/graph.json` + `weights.bin` 로드. sample_rate = 넣을 PCM 의
+ * 레이트(16000 그대로, 48000 등은 내부에서 16k 로 내린다). 실패 시 null.
+ *
+ * # Safety
+ * model_dir은 NUL 종료 C 문자열이어야 한다.
+ */
+struct VadHandle *vad_create_c(int sample_rate, const char *model_dir);
+
+/**
+ * # Safety
+ * `h`는 vad_create_c가 만든 포인터이거나 null이어야 한다.
+ */
+void vad_free_c(struct VadHandle *h);
+
+/**
+ * 상태 초기화 (듣기를 새로 시작할 때).
+ *
+ * # Safety
+ * `h`는 유효한 VadHandle 포인터이거나 null이어야 한다.
+ */
+void vad_reset_c(struct VadHandle *h);
+
+/**
+ * mono f32 [-1,1] `len` 샘플(≤ VAD_MAX_FRAME)을 넣는다 — 이번 호출에서 끝난 청크
+ * (32ms@16k)들의 음성 확률 평균. 끝난 청크가 없거나 실패면 −1.
+ *
+ * # Safety
+ * input은 len 샘플의 유효 버퍼여야 한다.
+ */
+float vad_process(struct VadHandle *h,
+                  const float *input,
+                  uintptr_t len);
 
 #endif  /* AI_ENGINE_FFI_H */

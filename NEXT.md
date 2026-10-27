@@ -1268,6 +1268,22 @@ SNR)와 **3트랙 A/B 녹음**(원음/우리/ORT WAV 저장) 추가. 조사 결�
 ②16k 브라우저 게이트(네이티브 오라클은 통과, 픽스처는 48k만) ③텐서 플랜
 최적화 카드 ④ai-ffi 오디오 표면(진짜 vcx-noise 교체 — 모바일 실연결 때).
 
+### 6.1 RNNoise(기본 잡음 제거) + Silero VAD(음성 감지) — 2026-10-26
+
+- **RNNoise** = nnnoiseless 0.5.2(2017 가중치, 순수 Rust, 가중치 내장) — `denoiser.rs`,
+  wasm `denoiser_*` / FFI `rn_*`. 48k 전용, 잡음 제거만(라이브러리의 음성 확률은 버린다).
+- **Silero VAD v6.2**(MIT, 2025-11 가중치 — 릴리스 v6.2.3) — `vad.rs`, wasm `vad_*` / FFI `vad_*`
+  (JNI `vadCreate/Free/Reset/Process`). 용도: 「마이크가 꺼진 채 말하고 있나요?」.
+  - 공개 `silero_vad_16k_op15.onnx` 는 가변 배치·길이용 Shape/If/LSTM 재배열이 섞여 있어
+    `tools/prep_silero.py` 가 **같은 가중치로 정적 1-청크 그래프를 새로 짠다**(STFT conv → |X| →
+    conv+relu×4 → LSTMCell(Gemm+Split) → conv1×1 → sigmoid). 오디오 미니 실행기에 Relu·Sqrt·
+    reflect Pad 를 더했다(pre_post 는 선택 — Silero 는 그래프로 끝난다).
+  - 래퍼(앞 청크 꼬리 64 + LSTM 상태 h,c)와 입력 레이트 → 16k 리샘플(블랙만 창 sinc, 48k 는 정수 1/3)은
+    `vad.rs`. 입력은 아무 길이, 반환 = 그 호출에서 끝난 청크(32ms) 평균 / 없으면 None(바인딩 −1).
+  - 게이트(`tests/audio.rs` ⑤ · `make convert-silero`): 원본 ONNX+공식 래퍼 루프 prob 열 대비
+    max|Δ| 4.4e-6(208청크, 한국어 TTS 6.7초 — 픽스처는 macOS `say` Yuna), 48k 리샘플 경로 판정 일치 100%,
+    백색 잡음 mean 0.009, **0.65ms/청크**(네이티브 release, 예산 32ms의 2%).
+
 ---
 
 ## 경계 결정 (3D 에셋 / 영상처리)

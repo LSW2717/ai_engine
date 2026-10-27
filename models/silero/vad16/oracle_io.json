@@ -1,0 +1,1 @@
+{"inputs": [{"name": "input", "shape": [1, 576]}, {"name": "h", "shape": [1, 128]}, {"name": "c", "shape": [1, 128]}], "outputs": [{"name": "prob", "shape": [1, 1]}, {"name": "h_out", "shape": [1, 128]}, {"name": "c_out", "shape": [1, 128]}]}

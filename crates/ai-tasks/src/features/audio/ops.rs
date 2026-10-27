@@ -236,6 +236,16 @@ pub fn unary(op: &str, a: &Tens) -> Result<Tens, TaskError> {
                 data[j] = fast_tanh(a.data[j]);
             }
         }
+        "Relu" => {
+            for (d, &v) in data.iter_mut().zip(&a.data) {
+                *d = v.max(0.0);
+            }
+        }
+        "Sqrt" => {
+            for (d, &v) in data.iter_mut().zip(&a.data) {
+                *d = v.sqrt();
+            }
+        }
         _ => return Err(err(format!("미지 unary op {op}"))),
     }
     Ok(Tens::new(a.shape.clone(), data))
@@ -946,6 +956,42 @@ pub fn pad_constant(a: &Tens, pads: &[i64], value: f32) -> Result<Tens, TaskErro
             dst += (c + pads[d] as usize) * out_s[d];
         }
         out[dst] = a.data[idx];
+    }
+    Ok(Tens::new(out_shape, out))
+}
+
+/// Pad (reflect, ONNX pads 규약 동일) — 경계 샘플은 반복하지 않는다
+/// ([a b c d] 오른쪽 2 → [a b c d c b]). 패딩은 축 길이보다 짧아야 한다.
+pub fn pad_reflect(a: &Tens, pads: &[i64]) -> Result<Tens, TaskError> {
+    let r = a.shape.len();
+    if pads.len() != 2 * r {
+        return Err(err(format!("pads 길이 {} ≠ 2×{r}", pads.len())));
+    }
+    for d in 0..r {
+        if pads[d] < 0 || pads[r + d] < 0 || pads[d].max(pads[r + d]) as usize >= a.shape[d] {
+            return Err(err(format!("reflect pad 축 {d}: {:?} ≥ 길이 {}", pads, a.shape[d])));
+        }
+    }
+    let out_shape: Vec<usize> = (0..r)
+        .map(|d| a.shape[d] + pads[d] as usize + pads[r + d] as usize)
+        .collect();
+    let in_s = strides(&a.shape);
+    let out_s = strides(&out_shape);
+    let n: usize = out_shape.iter().product::<usize>().max(1);
+    let mut out = vec![0f32; n];
+    for (idx, o) in out.iter_mut().enumerate() {
+        let mut src = 0usize;
+        for d in 0..r {
+            let len = a.shape[d] as i64;
+            let mut c = ((idx / out_s[d]) % out_shape[d]) as i64 - pads[d];
+            if c < 0 {
+                c = -c;
+            } else if c >= len {
+                c = 2 * (len - 1) - c;
+            }
+            src += c as usize * in_s[d];
+        }
+        *o = a.data[src];
     }
     Ok(Tens::new(out_shape, out))
 }

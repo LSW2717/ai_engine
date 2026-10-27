@@ -21,6 +21,13 @@
 //!   feFree(handle: Long) / feFrameLength(handle: Long): Int /
 //!   feSampleRate(handle: Long): Int /
 //!   feProcessFrame(handle: Long, input: FloatArray): FloatArray
+//!   rnCreate(sampleRate: Int): Long
+//!   rnFree(handle: Long) / rnFrameLength(handle: Long): Int /
+//!   rnIsActive(handle: Long): Boolean /
+//!   rnProcessFrame(handle: Long, input: FloatArray, output: FloatArray)
+//!   vadCreate(sampleRate: Int, modelDir: String): Long
+//!   vadFree(handle: Long) / vadReset(handle: Long) /
+//!   vadProcess(handle: Long, input: FloatArray, length: Int): Float (음성 확률, 청크 미완 −1)
 //!
 //! 반환 Int는 VbResult (0=Success, -1=Failure). JNI 문자열 반환은 JVM 소유 —
 //! vcx_string_free는 안드로이드에서 쓰지 않는다.
@@ -28,7 +35,7 @@
 use std::ffi::CString;
 
 use jni::objects::{JByteBuffer, JClass, JFloatArray, JString};
-use jni::sys::{jfloatArray, jint, jlong, jstring};
+use jni::sys::{jboolean, jfloat, jfloatArray, jint, jlong, jstring};
 use jni::JNIEnv;
 
 use crate::VbResult;
@@ -187,6 +194,46 @@ pub extern "system" fn Java_com_cloudwebrtc_webrtc_AiEngine_renderMask(
     (unsafe { crate::render_mask(yp, up, vp, w, h, sy, su, sv) }) as jint
 }
 
+/// render_mask_i420_io — 입력 I420(카메라 회전 포함) → 세운 출력 I420. 반환 = FrameResult 값
+/// (0 Written · 1 Unchanged · 2 Fallback · -1 Failure).
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_com_cloudwebrtc_webrtc_AiEngine_renderMaskI420Io(
+    env: JNIEnv,
+    _cls: JClass,
+    y_in: JByteBuffer,
+    u_in: JByteBuffer,
+    v_in: JByteBuffer,
+    w: jint,
+    h: jint,
+    sy_in: jint,
+    su_in: jint,
+    sv_in: jint,
+    rotation: jint,
+    y_out: JByteBuffer,
+    u_out: JByteBuffer,
+    v_out: JByteBuffer,
+    sy_out: jint,
+    su_out: jint,
+    sv_out: jint,
+) -> jint {
+    let (Ok(yi), Ok(ui), Ok(vi), Ok(yo), Ok(uo), Ok(vo)) = (
+        env.get_direct_buffer_address(&y_in),
+        env.get_direct_buffer_address(&u_in),
+        env.get_direct_buffer_address(&v_in),
+        env.get_direct_buffer_address(&y_out),
+        env.get_direct_buffer_address(&u_out),
+        env.get_direct_buffer_address(&v_out),
+    ) else {
+        return crate::FrameResult::Failure as jint;
+    };
+    (unsafe {
+        crate::render_mask_i420_io(
+            yi, ui, vi, w, h, sy_in, su_in, sv_in, rotation, yo, uo, vo, sy_out, su_out, sv_out,
+        )
+    }) as jint
+}
+
 /// C 문자열 반환을 JVM 문자열로 옮기고 즉시 해제
 fn own_cstring_to_jstring(env: &JNIEnv, ptr: *mut std::os::raw::c_char) -> jstring {
     if ptr.is_null() {
@@ -288,4 +335,117 @@ pub extern "system" fn Java_com_cloudwebrtc_webrtc_AiEngine_feProcessFrame(
         return std::ptr::null_mut();
     }
     arr.into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_cloudwebrtc_webrtc_AiEngine_rnCreate(
+    _env: JNIEnv,
+    _cls: JClass,
+    sample_rate: jint,
+) -> jlong {
+    crate::rn_create_c(sample_rate) as jlong
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_cloudwebrtc_webrtc_AiEngine_rnFree(
+    _env: JNIEnv,
+    _cls: JClass,
+    handle: jlong,
+) {
+    unsafe { crate::rn_free_c(handle as *mut crate::RnHandle) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_cloudwebrtc_webrtc_AiEngine_rnFrameLength(
+    _env: JNIEnv,
+    _cls: JClass,
+    handle: jlong,
+) -> jint {
+    (unsafe { crate::rn_get_in_frame_len(handle as *const crate::RnHandle) }) as jint
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_cloudwebrtc_webrtc_AiEngine_rnIsActive(
+    _env: JNIEnv,
+    _cls: JClass,
+    handle: jlong,
+) -> jboolean {
+    (unsafe { crate::rn_is_active(handle as *const crate::RnHandle) } != 0) as jboolean
+}
+
+/// 출력은 호출측 배열에 기록 — 10ms마다 새 배열을 만들지 않는다 (feProcessFrame과 다른 점).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_cloudwebrtc_webrtc_AiEngine_rnProcessFrame(
+    env: JNIEnv,
+    _cls: JClass,
+    handle: jlong,
+    input: JFloatArray,
+    output: JFloatArray,
+) {
+    let h = handle as *mut crate::RnHandle;
+    if h.is_null() {
+        return;
+    }
+    let mut inp = [0f32; 480];
+    if env.get_float_array_region(&input, 0, &mut inp).is_err() {
+        return;
+    }
+    let mut out = [0f32; 480];
+    unsafe { crate::rn_process_frame(h, inp.as_ptr(), out.as_mut_ptr()) };
+    let _ = env.set_float_array_region(&output, 0, &out);
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_cloudwebrtc_webrtc_AiEngine_vadCreate(
+    mut env: JNIEnv,
+    _cls: JClass,
+    sample_rate: jint,
+    model_dir: JString,
+) -> jlong {
+    let Some(d) = jstr(&mut env, &model_dir).and_then(|v| CString::new(v).ok()) else {
+        return 0;
+    };
+    (unsafe { crate::vad_create_c(sample_rate, d.as_ptr()) }) as jlong
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_cloudwebrtc_webrtc_AiEngine_vadFree(
+    _env: JNIEnv,
+    _cls: JClass,
+    handle: jlong,
+) {
+    unsafe { crate::vad_free_c(handle as *mut crate::VadHandle) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_cloudwebrtc_webrtc_AiEngine_vadReset(
+    _env: JNIEnv,
+    _cls: JClass,
+    handle: jlong,
+) {
+    unsafe { crate::vad_reset_c(handle as *mut crate::VadHandle) }
+}
+
+/// 입력은 스택 버퍼로 받는다 — 오디오 스레드에서 10ms마다 불린다.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_cloudwebrtc_webrtc_AiEngine_vadProcess(
+    env: JNIEnv,
+    _cls: JClass,
+    handle: jlong,
+    input: JFloatArray,
+    length: jint,
+) -> jfloat {
+    let h = handle as *mut crate::VadHandle;
+    if h.is_null() || length <= 0 {
+        return -1.0;
+    }
+    let n = (length as usize).min(crate::VAD_MAX_FRAME);
+    let mut buf = [0f32; crate::VAD_MAX_FRAME];
+    if env
+        .get_float_array_region(&input, 0, &mut buf[..n])
+        .is_err()
+    {
+        return -1.0;
+    }
+    unsafe { crate::vad_process(h, buf.as_ptr(), n) }
 }

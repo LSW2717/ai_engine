@@ -1,5 +1,6 @@
-//! 오디오 그래프 미니 실행기 — tools/prep_fastenhancer.py --export 산출물
-//! (graph.json + weights.bin) 로드·실행.
+//! 오디오 그래프 미니 실행기 — tools/prep_fastenhancer.py · prep_silero.py --export
+//! 산출물 (graph.json + weights.bin) 로드·실행. 소비자: enhancer.rs(fastenhancer) ·
+//! vad.rs(Silero VAD — 정적 1-청크 그래프, pre_post 없음).
 //!
 //! **왜 .sw가 아닌가**: fastenhancer 서브그래프는 rank-4 attention·동적
 //! MatMul(양변 활성)·ConvTranspose1d 등 이미지 IR(NHWC)과 이질적인 계열이고
@@ -60,7 +61,9 @@ struct Manifest {
     nodes: Vec<NodeDecl>,
     consts_f32: Vec<ConstF32>,
     consts_int: HashMap<String, Vec<i64>>,
-    pre_post: PrePost,
+    /// fastenhancer 전/후처리 상수 — 그래프만으로 끝나는 모델(Silero)은 null
+    #[serde(default)]
+    pre_post: Option<PrePost>,
 }
 
 pub struct FeGraph {
@@ -71,7 +74,7 @@ pub struct FeGraph {
     uses: HashMap<String, usize>,
     pub inputs: Vec<(String, Vec<usize>)>,
     pub outputs: Vec<String>,
-    pub pre_post: PrePost,
+    pub pre_post: Option<PrePost>,
 }
 
 fn err(msg: String) -> TaskError {
@@ -267,7 +270,9 @@ impl FeGraph {
                 let b = self.get(env, &n.inputs[1])?;
                 vec![ops::ew_binary(&n.op, a, b)?]
             }
-            "Sigmoid" | "Tanh" => vec![ops::unary(&n.op, self.get(env, &n.inputs[0])?)?],
+            "Sigmoid" | "Tanh" | "Relu" | "Sqrt" => {
+                vec![ops::unary(&n.op, self.get(env, &n.inputs[0])?)?]
+            }
             "Gemm" => {
                 let a = self.get(env, &n.inputs[0])?;
                 let b = self.get(env, &n.inputs[1])?;
@@ -381,12 +386,18 @@ impl FeGraph {
             "Pad" => {
                 let a = self.get(env, &n.inputs[0])?;
                 let pads = self.get_ints(&n.inputs[1])?.to_vec();
-                let value = if n.inputs.len() > 2 && !n.inputs[2].is_empty() {
-                    self.get(env, &n.inputs[2])?.data[0]
-                } else {
-                    0.0
-                };
-                vec![ops::pad_constant(a, &pads, value)?]
+                match n.attrs.get("mode").and_then(|v| v.as_str()).unwrap_or("constant") {
+                    "constant" => {
+                        let value = if n.inputs.len() > 2 && !n.inputs[2].is_empty() {
+                            self.get(env, &n.inputs[2])?.data[0]
+                        } else {
+                            0.0
+                        };
+                        vec![ops::pad_constant(a, &pads, value)?]
+                    }
+                    "reflect" => vec![ops::pad_reflect(a, &pads)?],
+                    mode => return Err(err(format!("{}: Pad mode {mode} 미지원", n.name))),
+                }
             }
             other => return Err(err(format!("{}: 미지원 op {other}", n.name))),
         };

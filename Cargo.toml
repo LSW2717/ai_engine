@@ -34,6 +34,8 @@ wgpu = { version = "30", default-features = false }
 naga = "30"
 # GLB 텍스처 디코드 (items3d) — 순수 Rust 디코더라 wasm 동작
 rustfft = "6"
+# RNNoise(2017 가중치) 순수 Rust 포트 — 기본 잡음제거. 기본 기능(bin/dasp)은 CLI 전용이라 끈다.
+nnnoiseless = { version = "0.5.2", default-features = false }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 
 # 공통

@@ -1,5 +1,5 @@
 # ai_engine 태스크 러너 — 절대경로 금지, 모든 경로는 저장소 루트 기준
-.PHONY: build-native test bench build-wasm build-wasm-dev serve-web web clean setup-wasm ffi-header build-android build-ios convert-rvm-web convert-r11-web convert-fastenhancer
+.PHONY: build-native test bench build-wasm build-wasm-dev serve-web web clean setup-wasm ffi-header build-android build-ios convert-rvm-web convert-r11-web convert-fastenhancer convert-silero
 
 build-native:
 	cargo build --release -p ai-gpu
@@ -137,6 +137,7 @@ vai-gate-assets:
 # fastenhancer (오디오, 로드맵 #6): 공개 wav2wav ONNX → spec2spec 수술+검증+
 # 미니 실행기 포맷 + 브라우저 게이트 자산. 픽스처는 vcxrust_ai vcx-noise에서.
 VCX_RUST ?= ../vcxrust_ai
+PYTHON ?= /usr/bin/python3
 convert-fastenhancer:
 	/usr/bin/python3 tools/prep_fastenhancer.py --src $(V_AI)/assets/models/fastenhancer_b_48k.onnx \
 	  -o models/fastenhancer/fe48_spec2spec.onnx --verify --export models/fastenhancer/fe48
@@ -148,6 +149,15 @@ convert-fastenhancer:
 	cp models/fastenhancer/fe48/graph.json models/fastenhancer/fe48/weights.bin web/models/fastenhancer/fe48/
 	cp models/fastenhancer/fe16/graph.json models/fastenhancer/fe16/weights.bin web/models/fastenhancer/fe16/
 	cp models/fastenhancer/in_48k.f32 models/fastenhancer/ref_48k_wav2wav.f32 web/models/fastenhancer/
+
+# Silero VAD v6.2 (음소거 중 발화 감지): 공개 16k ONNX → 정적 1-청크 그래프 재구성 + 원본 대조 +
+# graph.json/weights.bin export. 음성 픽스처(SILERO_WAV, 16k mono s16)가 있으면 e2e 기준
+# prob 열도 만든다 (models/silero/in_16k.f32 · ref_probs_16k.f32). onnx·onnxruntime 필요.
+SILERO_WAV ?=
+convert-silero:
+	$(PYTHON) tools/prep_silero.py --src $(V_AI)/assets/models/silero_vad_16k_op15.onnx \
+	  -o models/silero/silero16_static.onnx --verify --export models/silero/vad16 \
+	  $(if $(SILERO_WAV),--fixture-wav $(SILERO_WAV))
 
 
 # studio 데모 실제 제품 에셋 (배경 이미지 + 3D GLB) — v-ai/v-room에서 복사 (gitignore)

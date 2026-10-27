@@ -13,7 +13,7 @@
 use rustfft::num_complex::Complex;
 
 use crate::error::TaskError;
-use super::graph::FeGraph;
+use super::graph::{FeGraph, PrePost};
 use super::ops::Tens;
 use super::stft::Stft;
 
@@ -21,6 +21,7 @@ type C32 = Complex<f32>;
 
 pub struct Enhancer {
     graph: FeGraph,
+    pp: PrePost,
     stft: Stft,
     /// n_fft/2 — 넷이 소비하는 빈 수 (Nyquist 드랍)
     bins_used: usize,
@@ -40,7 +41,9 @@ impl Enhancer {
     /// graph.json + weights.bin (tools/prep_fastenhancer.py --export 산출물)
     pub fn new(graph_json: &[u8], weights: &[u8]) -> Result<Self, TaskError> {
         let graph = FeGraph::load(graph_json, weights)?;
-        let pp = graph.pre_post;
+        let pp = graph
+            .pre_post
+            .ok_or_else(|| TaskError::Other("fastenhancer: graph.json 에 pre_post 없음".into()))?;
         let stft = Stft::new(pp.n_fft, pp.hop);
         let caches: Vec<Tens> =
             graph.inputs[1..].iter().map(|(_, s)| Tens::zeros(s.clone())).collect();
@@ -60,6 +63,7 @@ impl Enhancer {
             irf: vec![0.0; pp.n_fft],
             fft_scratch: Vec::with_capacity(pp.n_fft),
             graph,
+            pp,
             stft,
         })
     }
@@ -83,7 +87,7 @@ impl Enhancer {
         let n_fft = self.stft.n_fft;
         let hop = self.stft.hop;
         let cache_len = n_fft - hop;
-        let pp = self.graph.pre_post;
+        let pp = self.pp;
 
         // 분석 프레임 = [in_cache, 새 hop]
         let n = input.len().min(hop);

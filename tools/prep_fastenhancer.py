@@ -306,7 +306,7 @@ def export_runtime(sub_path, out_dir, pre_post):
                 v = int(v)
             elif isinstance(v, (float, np.floating)):
                 v = float(v)
-            else:
+            elif not isinstance(v, str):  # 문자열(Pad mode 등)은 그대로
                 continue  # graph/텐서 attr 없음 (Constant는 위에서 처리)
             attrs[a.name] = v
         nodes.append({"op": n.op_type, "name": n.name,

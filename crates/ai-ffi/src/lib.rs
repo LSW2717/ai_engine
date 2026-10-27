@@ -10,17 +10,21 @@
 //! - 결과는 우리 타입 JSON: `get_focus_state`(FocusResult 7상태 전체),
 //!   `poll_hand_gesture`(FIFO 16). 문자열은 `vcx_string_free`로 해제.
 //! - 오케스트레이션은 전부 `ai_tasks::Director` — 이 크레이트에 남는 것은
-//!   C 타입 변환, fs 조달(모델/GLB 경로), YUV 왕복(yuv.rs), panic 방벽뿐.
+//!   C 타입 변환, fs 조달(모델/GLB 경로), YUV 왕복(gpu_yuv.rs · yuv.rs), panic 방벽뿐.
 //!
 //! render_mask 계약(모바일): I420 in-place, stride 보존, width/height 음수 허용
 //! (|절대값| 사용 — INTEGRATION.md §계약). passthrough(효과 전무)면 변환조차
 //! 하지 않고 즉시 Success — analyzer-only(손/집중도만)면 세그·합성을 건너뛰고
 //! 태스크만 돈다 (프레임 무수정).
 //!
-//! ⚠ YUV↔RGB CPU 왕복은 임시 — GPU 상주 변환이 모바일 필수 카드 (yuv.rs 헤더).
+//! YUV↔RGB 는 GPU 가 평면에서 바로 한다(gpu_yuv.rs) — CPU 변환(yuv.rs)은 CPU 픽셀이
+//! 필요한 프레임(B 티어 세그 · 태스크 픽셀 틱 · 합성 없는 뒤집기)과 C 티어만 쓴다.
 //! ⚠ JNI 래퍼(Android)는 모바일 실연결 때 이 C 표면을 감싼다 (로드맵 E).
 
+mod gpu_yuv;
 pub mod yuv;
+
+use gpu_yuv::{Dst, GpuYuv, Src};
 
 // 안드로이드: C ABI 대신 JNI 심볼 (vcxrust_ai와 같은 플랫폼 분리 — 심볼은
 // 이 크레이트의 C 표면을 그대로 감싼다, 로직 없음)
@@ -38,7 +42,7 @@ use std::sync::atomic::Ordering;
 
 use ai_gpu::wgpu;
 use ai_gpu::GpuContext;
-use ai_tasks::features::audio::Enhancer;
+use ai_tasks::features::audio::{Denoiser, Enhancer, Vad};
 use ai_tasks::features::vb::SoftPipeline;
 use ai_tasks::Director;
 
@@ -52,7 +56,8 @@ pub enum VbResult {
 }
 
 struct Offscreen {
-    tex: wgpu::Texture,
+    /// 뷰의 주인 — 읽고 쓰는 건 뷰로만 한다
+    _tex: wgpu::Texture,
     view: wgpu::TextureView,
     w: u32,
     h: u32,
@@ -71,6 +76,8 @@ struct Ffi {
     degree: f32,
     /// B 티어 CPU 세그 (infer_mask만 사용 — 합성·EMA는 Director/GPU 소유)
     cpu_seg: Option<SoftPipeline>,
+    /// I420 ↔ 프레임/타깃 텍스처 GPU 변환 — 첫 렌더 프레임에 만든다
+    gpu_yuv: Option<GpuYuv>,
 }
 
 static STATE: Mutex<Option<Ffi>> = Mutex::new(None);
@@ -147,6 +154,7 @@ fn ensure_state(guard: &mut Option<Ffi>) -> Result<&mut Ffi, String> {
             mirror: false,
             degree: 0.0,
             cpu_seg: None,
+            gpu_yuv: None,
         });
     }
     Ok(guard.as_mut().unwrap())
@@ -616,17 +624,26 @@ pub unsafe extern "C" fn render_mask(
             return VbResult::Success;
         }
         let t_ms = st.epoch.elapsed().as_secs_f64() * 1e3;
-        st.rgba.resize(w * h * 4, 0);
-        yuv::i420_to_rgba(yb, ub, vb, w, h, sy, su, sv, &mut st.rgba);
-        if flip {
-            yuv::flip_rgba(&mut st.rgba, w, h, flip_h, flip_v);
+        let needs = st.director.needs_render();
+        let wants_pixels = st.director.wants_pixels(t_ms);
+        // CPU 픽셀이 필요한 프레임만 CPU 로 바꾼다 — B 티어 세그 입력 · 태스크 픽셀 틱 ·
+        // 합성 없이 뒤집힌 원본만 되쓰는 프레임. 나머지는 GPU 가 평면에서 바로 프레임
+        // 텍스처를 채우고(gpu_yuv) 합성 결과도 평면으로 바로 내린다.
+        let cpu_pixels = (b_tier() && needs) || wants_pixels || (!needs && flip);
+        if cpu_pixels {
+            st.rgba.resize(w * h * 4, 0);
+            yuv::i420_to_rgba(yb, ub, vb, w, h, sy, su, sv, &mut st.rgba);
+            if flip {
+                yuv::flip_rgba(&mut st.rgba, w, h, flip_h, flip_v);
+            }
         }
 
         // B 티어: 세그를 CPU에서 먼저 — 마스크 해상도가 프레임 리소스 ensure에 필요.
         // 마스크는 EMA 없이 원시로 넘긴다 (시간 상태는 GPU ingest 소유 — A와 동일 규약).
-        let Ffi { ctx, director, rgba, rgb, target, cpu_seg, .. } = st;
+        let Ffi { ctx, director, rgba, rgb, target, cpu_seg, gpu_yuv, .. } = st;
+        let gpu_yuv = gpu_yuv.get_or_insert_with(|| GpuYuv::new(ctx));
         let mut bmask: Option<(&[f32], u32, u32, u32)> = None;
-        if b_tier() && director.needs_render() {
+        if b_tier() && needs {
             let Some(cpu) = cpu_seg.as_mut() else {
                 ffi_log("render_mask(b): CPU 세그 미주입 (set_video_stream_info 먼저)");
                 return VbResult::Failure;
@@ -642,6 +659,12 @@ pub unsafe extern "C" fn render_mask(
 
         // 프레임 텍스처 채우기 (A: 세그 ensure / B: 마스크 해상도 ensure / 태스크: 세션리스)
         let fill = |tex: &wgpu::Texture| {
+            if !cpu_pixels {
+                let strides = [sy as u32, su as u32, sv as u32];
+                let src = Src::I420 { y: yb, u: ub, v: vb, strides };
+                gpu_yuv.upload(ctx, tex, src, w as u32, h as u32, 0, flip_h, flip_v);
+                return;
+            }
             ctx.queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: tex,
@@ -673,7 +696,7 @@ pub unsafe extern "C" fn render_mask(
         }
 
         // 태스크용 u8 RGB — 필요한 틱에만 (알파 제거)
-        let rgb_opt = if director.wants_pixels(t_ms) {
+        let rgb_opt = if wants_pixels {
             rgb.resize(w * h * 3, 0);
             for i in 0..w * h {
                 rgb[i * 3..i * 3 + 3].copy_from_slice(&rgba[i * 4..i * 4 + 3]);
@@ -683,28 +706,8 @@ pub unsafe extern "C" fn render_mask(
             None
         };
 
-        let needs = director.needs_render();
         if needs {
-            let stale = !matches!(target, Some(t) if t.w == w as u32 && t.h == h as u32);
-            if stale {
-                let tex = ctx.device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some("ai-ffi-target"),
-                    size: wgpu::Extent3d {
-                        width: w as u32,
-                        height: h as u32,
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::Rgba8Unorm,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                        | wgpu::TextureUsages::COPY_SRC,
-                    view_formats: &[],
-                });
-                let view = tex.create_view(&Default::default());
-                *target = Some(Offscreen { tex, view, w: w as u32, h: h as u32 });
-            }
+            ensure_target(ctx, target, w as u32, h as u32);
         }
         let view = target.as_ref().filter(|_| needs).map(|t| &t.view);
         let framed = if let Some((mask, mw, mh, ch)) = bmask {
@@ -722,12 +725,10 @@ pub unsafe extern "C" fn render_mask(
         }
         if needs {
             let t = target.as_ref().unwrap();
-            match readback_rgba(ctx, &t.tex, w as u32, h as u32, rgba) {
-                Ok(()) => yuv::rgba_to_i420(rgba, w, h, yb, ub, vb, sy, su, sv),
-                Err(e) => {
-                    ffi_log(&format!("render_mask: 리드백: {e}"));
-                    return VbResult::Failure;
-                }
+            let dst = Dst::I420 { y: yb, u: ub, v: vb, strides: [sy, su, sv] };
+            if let Err(e) = gpu_yuv.download(ctx, &t.view, w as u32, h as u32, dst) {
+                ffi_log(&format!("render_mask: 리드백: {e}"));
+                return VbResult::Failure;
             }
         } else if flip {
             // mirror/180만 켠 경우 — 합성 없이 뒤집힌 원본을 되쓴다
@@ -737,6 +738,257 @@ pub unsafe extern "C" fn render_mask(
         VbResult::Success
     }));
     result.unwrap_or_else(|_| handle_panic())
+}
+
+/// 합성 타깃 확보 — 크기가 바뀔 때만 다시 만든다.
+fn ensure_target(ctx: &GpuContext, target: &mut Option<Offscreen>, w: u32, h: u32) {
+    if matches!(target, Some(t) if t.w == w && t.h == h) {
+        return;
+    }
+    let tex = ctx.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("ai-ffi-target"),
+        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        // TEXTURE_BINDING — gpu_yuv 가 합성 결과를 읽어 평면으로 내린다
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = tex.create_view(&Default::default());
+    *target = Some(Offscreen { _tex: tex, view, w, h });
+}
+
+/// render_mask_nv12 · render_mask_i420_io 결과.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FrameResult {
+    /// 출력 평면에 합성 결과를 썼다
+    Written = 0,
+    /// 프레임 무가공(passthrough · analyzer-only) — 출력 평면은 건드리지 않았다, 원본을 그대로 내보낸다
+    Unchanged = 1,
+    /// 이 프레임은 GPU 평면 경로로 못 한다(B/C 티어 · 태스크 픽셀 틱 · 합성 없는 뒤집기 ·
+    /// 홀수 크기 회전) — 엔진 상태를 건드리지 않았으니 호출자는 같은 프레임을 예전 경로
+    /// (호스트 회전 + render_mask I420)로 처리한다
+    Fallback = 2,
+    Failure = -1,
+}
+
+/// 입력 평면 → (카메라 회전) → 합성 → 출력 평면 — render_mask 의 GPU 경로를 평면 그대로 탄다.
+/// 입력 `sw×sh` 는 읽기만 하고, 결과(회전 90/270 이면 `sh×sw`)는 `dst` 에 쓴다.
+fn render_planes(name: &str, src: Src, sw: usize, sh: usize, rot: u32, dst: Dst) -> FrameResult {
+    // CPU 픽셀이 필요한 티어는 예전 경로 몫
+    if soft_tier() || b_tier() {
+        return FrameResult::Fallback;
+    }
+    let mut guard = STATE.lock().unwrap();
+    let Some(st) = guard.as_mut() else {
+        ffi_log(&format!("{name}: 미초기화 (set_video_stream_info 먼저)"));
+        return FrameResult::Failure;
+    };
+    // mirror/degree — render_mask 와 같은 규칙 (90/270 은 무시)
+    let rot180 = (st.degree - 180.0).abs() < 0.5;
+    let (flip_h, flip_v) = (st.mirror ^ rot180, rot180);
+    let flip = flip_h || flip_v;
+    if st.director.passthrough() {
+        return if flip { FrameResult::Fallback } else { FrameResult::Unchanged };
+    }
+    let t_ms = st.epoch.elapsed().as_secs_f64() * 1e3;
+    let needs = st.director.needs_render();
+    // 아래부터 엔진 상태가 바뀐다 — 넘기는 판정은 전부 여기까지
+    if st.director.wants_pixels(t_ms) || (!needs && flip) {
+        return FrameResult::Fallback;
+    }
+    let (w, h) = if rot == 90 || rot == 270 { (sh as u32, sw as u32) } else { (sw as u32, sh as u32) };
+
+    let Ffi { ctx, director, target, gpu_yuv, .. } = st;
+    let gpu_yuv = gpu_yuv.get_or_insert_with(|| GpuYuv::new(ctx));
+    let fill = |tex: &wgpu::Texture| {
+        gpu_yuv.upload(ctx, tex, src, sw as u32, sh as u32, rot, flip_h, flip_v);
+    };
+    if let Err(e) = pollster::block_on(director.with_frame(ctx, w, h, fill)) {
+        ffi_log(&format!("{name}: 프레임 업로드: {e}"));
+        return FrameResult::Failure;
+    }
+    if needs {
+        ensure_target(ctx, target, w, h);
+    }
+    let view = target.as_ref().filter(|_| needs).map(|t| &t.view);
+    if let Err(e) = pollster::block_on(director.frame(ctx, w, h, view, None, t_ms)) {
+        ffi_log(&format!("{name}: {e}"));
+        return FrameResult::Failure;
+    }
+    if !needs {
+        // analyzer-only: 프레임 무수정
+        return FrameResult::Unchanged;
+    }
+    let t = target.as_ref().unwrap();
+    if let Err(e) = gpu_yuv.download(ctx, &t.view, w, h, dst) {
+        ffi_log(&format!("{name}: 리드백: {e}"));
+        return FrameResult::Failure;
+    }
+    FrameResult::Written
+}
+
+fn frame_panic() -> FrameResult {
+    handle_panic();
+    FrameResult::Failure
+}
+
+/// NV12 입력(iOS 카메라 CVPixelBuffer 형식, 카메라 회전 `rotation` = 0/90/180/270, 시계 방향)
+/// → 세운 NV12 출력 — 호스트의 NV12→I420 변환·회전과 되돌리는 인터리브 복사가 없어진다.
+/// 입력 `width×height` 는 읽기만 하고(카메라 버퍼) 결과(90/270 이면 `height×width`)는 별도
+/// 출력 평면(stride 보존)에 쓴다. 결과 바이트는 같은 프레임을 libyuv 로 세워 I420 으로
+/// render_mask 에 넣은 것과 같다. 회전하는 홀수 크기는 Fallback.
+///
+/// # Safety
+/// y_in/uv_in 은 |stride_in|×|height| · |stride_uv_in|×⌈|height|/2⌉ 크기의 읽기 평면,
+/// y_out/uv_out 은 세운 크기 기준 같은 규칙의 쓰기 평면이어야 한다(입력과 겹치지 않을 것).
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn render_mask_nv12(
+    y_in: *const u8,
+    uv_in: *const u8,
+    width: i32,
+    height: i32,
+    stride_y_in: i32,
+    stride_uv_in: i32,
+    rotation: i32,
+    y_out: *mut u8,
+    uv_out: *mut u8,
+    stride_y_out: i32,
+    stride_uv_out: i32,
+) -> FrameResult {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let dims = (
+            abs_dim(width),
+            abs_dim(height),
+            abs_dim(stride_y_in),
+            abs_dim(stride_uv_in),
+            abs_dim(stride_y_out),
+            abs_dim(stride_uv_out),
+        );
+        let (Some(w), Some(h), Some(syi), Some(suvi), Some(syo), Some(suvo)) = dims else {
+            ffi_log("render_mask_nv12: i32::MIN 치수");
+            return FrameResult::Failure;
+        };
+        let ptrs_ok = !(y_in.is_null() || uv_in.is_null() || y_out.is_null() || uv_out.is_null());
+        if !ptrs_ok || w == 0 || h == 0 || ![0, 90, 180, 270].contains(&rotation) {
+            ffi_log(&format!("render_mask_nv12: bad args (rotation {rotation})"));
+            return FrameResult::Failure;
+        }
+        let rot = rotation as u32;
+        // 크로마를 원본 좌표 절반으로 읽는 회전은 짝수 크기에서만 libyuv 평면 회전과 같다
+        if rot != 0 && (w % 2 == 1 || h % 2 == 1) {
+            return FrameResult::Fallback;
+        }
+        let (ow, oh) = if rot == 90 || rot == 270 { (h, w) } else { (w, h) };
+        if syi < w || suvi < 2 * w.div_ceil(2) || syo < ow || suvo < 2 * ow.div_ceil(2) {
+            ffi_log(&format!(
+                "render_mask_nv12: stride<w ({syi},{suvi} / {syo},{suvo} vs {w}x{h} rot{rot})"
+            ));
+            return FrameResult::Failure;
+        }
+        let (src, dst) = unsafe {
+            (
+                Src::Nv12 {
+                    y: slice::from_raw_parts(y_in, syi * h),
+                    uv: slice::from_raw_parts(uv_in, suvi * h.div_ceil(2)),
+                    strides: [syi as u32, suvi as u32],
+                },
+                Dst::Nv12 {
+                    y: slice::from_raw_parts_mut(y_out, syo * oh),
+                    uv: slice::from_raw_parts_mut(uv_out, suvo * oh.div_ceil(2)),
+                    strides: [syo, suvo],
+                },
+            )
+        };
+        render_planes("render_mask_nv12", src, w, h, rot, dst)
+    }));
+    result.unwrap_or_else(|_| frame_panic())
+}
+
+/// I420 입력(카메라 회전 `rotation` = 0/90/180/270, 시계 방향) → 세운 I420 출력 — Android
+/// 호스트의 회전(I420Rotate)·출력 버퍼로 옮기는 복사가 없어진다. 입력 `width×height` 는 읽기만
+/// 하고, 결과(90/270 이면 `height×width`)는 별도 출력 평면(stride 보존)에 쓴다. 결과 바이트는
+/// 같은 프레임을 libyuv 로 세워 render_mask 에 넣은 것과 같다. 회전하는 홀수 크기는 Fallback.
+///
+/// # Safety
+/// 입력 평면은 |stride|×|height|(크로마 ⌈/2⌉) 크기의 읽기 평면, 출력 평면은 세운 크기 기준
+/// 같은 규칙의 쓰기 평면이어야 한다(입력과 겹치지 않을 것).
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn render_mask_i420_io(
+    y_in: *const u8,
+    u_in: *const u8,
+    v_in: *const u8,
+    width: i32,
+    height: i32,
+    stride_y_in: i32,
+    stride_u_in: i32,
+    stride_v_in: i32,
+    rotation: i32,
+    y_out: *mut u8,
+    u_out: *mut u8,
+    v_out: *mut u8,
+    stride_y_out: i32,
+    stride_u_out: i32,
+    stride_v_out: i32,
+) -> FrameResult {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let dims = (
+            abs_dim(width),
+            abs_dim(height),
+            [abs_dim(stride_y_in), abs_dim(stride_u_in), abs_dim(stride_v_in)],
+            [abs_dim(stride_y_out), abs_dim(stride_u_out), abs_dim(stride_v_out)],
+        );
+        let (Some(w), Some(h), [Some(syi), Some(sui), Some(svi)], [Some(syo), Some(suo), Some(svo)]) =
+            dims
+        else {
+            ffi_log("render_mask_i420_io: i32::MIN 치수");
+            return FrameResult::Failure;
+        };
+        let ptrs_ok = ![y_in, u_in, v_in].iter().any(|p| p.is_null())
+            && ![y_out, u_out, v_out].iter().any(|p| p.is_null());
+        if !ptrs_ok || w == 0 || h == 0 || ![0, 90, 180, 270].contains(&rotation) {
+            ffi_log(&format!("render_mask_i420_io: bad args (rotation {rotation})"));
+            return FrameResult::Failure;
+        }
+        let rot = rotation as u32;
+        // 크로마를 원본 좌표 절반으로 읽는 회전은 짝수 크기에서만 libyuv 평면 회전과 같다
+        if rot != 0 && (w % 2 == 1 || h % 2 == 1) {
+            return FrameResult::Fallback;
+        }
+        let (ow, oh) = if rot == 90 || rot == 270 { (h, w) } else { (w, h) };
+        let (cw, ch, ocw, och) = (w.div_ceil(2), h.div_ceil(2), ow.div_ceil(2), oh.div_ceil(2));
+        if syi < w || sui < cw || svi < cw || syo < ow || suo < ocw || svo < ocw {
+            ffi_log(&format!(
+                "render_mask_i420_io: stride<w ({syi},{sui},{svi} / {syo},{suo},{svo} vs {w}x{h} rot{rot})"
+            ));
+            return FrameResult::Failure;
+        }
+        let (src, dst) = unsafe {
+            (
+                Src::I420 {
+                    y: slice::from_raw_parts(y_in, syi * h),
+                    u: slice::from_raw_parts(u_in, sui * ch),
+                    v: slice::from_raw_parts(v_in, svi * ch),
+                    strides: [syi as u32, sui as u32, svi as u32],
+                },
+                Dst::I420 {
+                    y: slice::from_raw_parts_mut(y_out, syo * oh),
+                    u: slice::from_raw_parts_mut(u_out, suo * och),
+                    v: slice::from_raw_parts_mut(v_out, svo * och),
+                    strides: [syo, suo, svo],
+                },
+            )
+        };
+        render_planes("render_mask_i420_io", src, w, h, rot, dst)
+    }));
+    result.unwrap_or_else(|_| frame_panic())
 }
 
 /// C 티어 프레임 처리 — CPU 추론 + 소프트 합성, GPU 관여 0.
@@ -778,52 +1030,6 @@ fn render_mask_soft(
             VbResult::Failure
         }
     }
-}
-
-/// 타깃 텍스처 → RGBA (256 정렬 패딩 행 제거)
-fn readback_rgba(
-    ctx: &GpuContext,
-    tex: &wgpu::Texture,
-    w: u32,
-    h: u32,
-    out: &mut Vec<u8>,
-) -> Result<(), String> {
-    let bpr = (w * 4).next_multiple_of(256);
-    let staging = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("ai-ffi-staging"),
-        size: (bpr * h) as u64,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    let mut enc = ctx.device.create_command_encoder(&Default::default());
-    enc.copy_texture_to_buffer(
-        wgpu::TexelCopyTextureInfo {
-            texture: tex,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        wgpu::TexelCopyBufferInfo {
-            buffer: &staging,
-            layout: wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(bpr),
-                rows_per_image: Some(h),
-            },
-        },
-        wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-    );
-    ctx.queue.submit([enc.finish()]);
-    let bytes = pollster::block_on(ai_gpu::readback::read_buffers(ctx, &[&staging]))?
-        .remove(0);
-    out.resize((w * h * 4) as usize, 0);
-    for row in 0..h as usize {
-        let src = row * bpr as usize;
-        let dst = row * (w * 4) as usize;
-        out[dst..dst + (w * 4) as usize]
-            .copy_from_slice(&bytes[src..src + (w * 4) as usize]);
-    }
-    Ok(())
 }
 
 // ───────── 결과 폴링 ─────────
@@ -1033,4 +1239,180 @@ pub unsafe extern "C" fn fe_process_frame(
         0.0
     }));
     result.unwrap_or(0.0)
+}
+
+// ───────── 오디오 (RNNoise — 기본 모드, CPU 고정, 비디오와 독립 수명) ─────────
+
+/// 불투명 핸들 — None = 미지원 레이트 passthrough (프레임 480, 무가공)
+pub struct RnHandle {
+    inner: Option<Denoiser>,
+}
+
+const RN_FRAME_LEN: usize = 480;
+
+/// 생성 — sample_rate 48000이면 RNNoise(가중치 내장 — 모델 파일 없음), 그 외 레이트는
+/// passthrough 핸들 (프레임 480, 무가공 — 호스트가 레이트 스위치 없이도 안전).
+#[unsafe(no_mangle)]
+pub extern "C" fn rn_create_c(sample_rate: c_int) -> *mut RnHandle {
+    let result = catch_unwind(|| {
+        let inner = (sample_rate as u32 == ai_tasks::features::audio::denoiser::SAMPLE_RATE)
+            .then(Denoiser::new);
+        Box::into_raw(Box::new(RnHandle { inner }))
+    });
+    result.unwrap_or(std::ptr::null_mut())
+}
+
+/// # Safety
+/// `h`는 rn_create_c가 만든 포인터이거나 null이어야 한다.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rn_free_c(h: *mut RnHandle) {
+    if !h.is_null() {
+        drop(unsafe { Box::from_raw(h) });
+    }
+}
+
+/// process_frame 호출당 샘플 수 — 활성·passthrough 모두 480 (10ms@48k)
+///
+/// # Safety
+/// `h`는 유효한 RnHandle 포인터여야 한다.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rn_get_in_frame_len(h: *const RnHandle) -> usize {
+    if h.is_null() { 0 } else { RN_FRAME_LEN }
+}
+
+/// RNNoise가 실제로 도는 핸들인지 (0 = passthrough)
+///
+/// # Safety
+/// `h`는 유효한 RnHandle 포인터여야 한다.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rn_is_active(h: *const RnHandle) -> c_int {
+    if h.is_null() {
+        return 0;
+    }
+    unsafe { &*h }.inner.is_some() as c_int
+}
+
+/// 한 프레임 처리 — input/output은 480 샘플 mono f32 [-1,1] (겹쳐도 안전).
+/// passthrough 핸들은 원음 그대로.
+///
+/// # Safety
+/// input/output은 480 샘플의 유효 버퍼여야 한다.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rn_process_frame(
+    h: *mut RnHandle,
+    input: *const c_float,
+    output: *mut c_float,
+) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if h.is_null() || input.is_null() || output.is_null() {
+            return;
+        }
+        let handle = unsafe { &mut *h };
+        // 겹침(in-place) 허용 — 입력을 먼저 복사 (스택 — 오디오 스레드에서 10ms마다 불린다)
+        let mut inp = [0f32; RN_FRAME_LEN];
+        inp.copy_from_slice(unsafe { slice::from_raw_parts(input, RN_FRAME_LEN) });
+        let out = unsafe { slice::from_raw_parts_mut(output, RN_FRAME_LEN) };
+        match &mut handle.inner {
+            Some(d) => d.process_frame(&inp, out),
+            None => out.copy_from_slice(&inp),
+        }
+    }));
+}
+
+// ───────── 음성 감지 (Silero VAD — CPU 고정, 비디오와 독립 수명) ─────────
+
+/// 불투명 핸들 — 음소거 중 발화 감지용 음성 확률.
+pub struct VadHandle {
+    inner: Vad,
+}
+
+/// 한 번에 넘길 수 있는 최대 샘플 수 (40ms@48k) — 오디오 스레드에서 스택 버퍼로 받는다.
+pub const VAD_MAX_FRAME: usize = 1920;
+
+/// 생성 — `{model_dir}/vad16/graph.json` + `weights.bin` 로드. sample_rate = 넣을 PCM 의
+/// 레이트(16000 그대로, 48000 등은 내부에서 16k 로 내린다). 실패 시 null.
+///
+/// # Safety
+/// model_dir은 NUL 종료 C 문자열이어야 한다.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vad_create_c(
+    sample_rate: c_int,
+    model_dir: *const c_char,
+) -> *mut VadHandle {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let dir = match unsafe { cstr(model_dir) } {
+            Ok(v) => v,
+            Err(e) => {
+                ffi_log(&format!("vad_create_c: {e}"));
+                return std::ptr::null_mut();
+            }
+        };
+        let read = |name: &str| std::fs::read(format!("{dir}/vad16/{name}"));
+        let (graph, weights) = match (read("graph.json"), read("weights.bin")) {
+            (Ok(g), Ok(w)) => (g, w),
+            (Err(e), _) | (_, Err(e)) => {
+                ffi_log(&format!("vad_create_c: {dir}/vad16: {e}"));
+                return std::ptr::null_mut();
+            }
+        };
+        match Vad::new(&graph, &weights, sample_rate.max(0) as u32) {
+            Ok(inner) => Box::into_raw(Box::new(VadHandle { inner })),
+            Err(e) => {
+                ffi_log(&format!("vad_create_c: {e}"));
+                std::ptr::null_mut()
+            }
+        }
+    }));
+    result.unwrap_or(std::ptr::null_mut())
+}
+
+/// # Safety
+/// `h`는 vad_create_c가 만든 포인터이거나 null이어야 한다.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vad_free_c(h: *mut VadHandle) {
+    if !h.is_null() {
+        drop(unsafe { Box::from_raw(h) });
+    }
+}
+
+/// 상태 초기화 (듣기를 새로 시작할 때).
+///
+/// # Safety
+/// `h`는 유효한 VadHandle 포인터이거나 null이어야 한다.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vad_reset_c(h: *mut VadHandle) {
+    if let Some(handle) = unsafe { h.as_mut() } {
+        handle.inner.reset();
+    }
+}
+
+/// mono f32 [-1,1] `len` 샘플(≤ VAD_MAX_FRAME)을 넣는다 — 이번 호출에서 끝난 청크
+/// (32ms@16k)들의 음성 확률 평균. 끝난 청크가 없거나 실패면 −1.
+///
+/// # Safety
+/// input은 len 샘플의 유효 버퍼여야 한다.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vad_process(
+    h: *mut VadHandle,
+    input: *const c_float,
+    len: usize,
+) -> c_float {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if h.is_null() || input.is_null() {
+            return -1.0;
+        }
+        let handle = unsafe { &mut *h };
+        let n = len.min(VAD_MAX_FRAME);
+        match handle
+            .inner
+            .process(unsafe { slice::from_raw_parts(input, n) })
+        {
+            Ok(p) => p.unwrap_or(-1.0),
+            Err(err) => {
+                ffi_log(&format!("vad_process: {err}"));
+                -1.0
+            }
+        }
+    }));
+    result.unwrap_or(-1.0)
 }
