@@ -165,4 +165,4 @@ V_ROOM ?= ../../vcxreact/packages/v-room
 studio-assets:
 	mkdir -p web/demo/assets/bg web/demo/assets/glb
 	for i in 1 2 3 4 5 6; do cp $(V_ROOM)/assets/images/room/filters/study/$$i.jpg web/demo/assets/bg/ 2>/dev/null || true; done
-	cp $(V_AI)/assets/models/*.glb web/demo/assets/glb/
+	cp $(V_AI)/assets/items3d/*.glb web/demo/assets/glb/
